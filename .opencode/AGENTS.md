@@ -44,17 +44,22 @@ notion-search "database schema"
 
 #### Where to Look
 
-Nico's Notion workspace is organized into these main areas:
-- **Personal**: Nico's personal notes and tasks
-- **RoamingRabbit**: Product specs and features for RoamingRabbit product
-- **TokoBoss**: Inventory ERP product documentation and specs
-- **Operating Rules**: Company processes and standards
+The Notion workspace is organized under **Utama Managed** as the root parent:
+
+**Root:** [Utama Managed](https://app.notion.com/p/3d3af3f002c0808aaa79fdc1b35d8502)
+
+**Product & Context Homes:**
+- **[RoamingRabbit](https://app.notion.com/p/e53af3f002c082acb30f01c871b91a96)**: Product specs and features for RoamingRabbit product
+- **[TokoBoss](https://app.notion.com/p/f11af3f002c08397bcad016963e79a9e)**: Inventory ERP product documentation and specs
+- **[Personal](https://app.notion.com/p/ddfaf3f002c08325bbbc013f343af819)**: Personal notes and tasks
+- **[Operating rules](https://app.notion.com/p/e23af3f002c083fe94cc017563157ed1)**: Company processes and standards
 
 **Key guidelines:**
 - If the issue team is "TokoBoss", prioritize searching the TokoBoss home
 - If the issue is for "RoamingRabbit", search RoamingRabbit documentation
 - Search by feature keywords, not just the team name
 - Look for PRDs, technical specs, API documentation, and architecture diagrams
+- Don't mix contexts: TokoBoss issues should reference TokoBoss docs, RoamingRabbit issues should reference RoamingRabbit docs
 
 #### What to Look For
 
@@ -287,10 +292,13 @@ These should be available in your environment:
 
 ### Notion Workspace Structure
 
-- **Personal**: Nico's personal workspace
-- **RoamingRabbit**: RoamingRabbit product
-- **TokoBoss**: TokoBoss inventory ERP
-- **Operating Rules**: Company standards
+**Root:** [Utama Managed](https://app.notion.com/p/3d3af3f002c0808aaa79fdc1b35d8502)
+
+**Product & Context Homes (under Utama Managed):**
+- **[RoamingRabbit](https://app.notion.com/p/e53af3f002c082acb30f01c871b91a96)**: RoamingRabbit product specs and documentation
+- **[TokoBoss](https://app.notion.com/p/f11af3f002c08397bcad016963e79a9e)**: TokoBoss inventory ERP documentation
+- **[Personal](https://app.notion.com/p/ddfaf3f002c08325bbbc013f343af819)**: Personal workspace
+- **[Operating rules](https://app.notion.com/p/e23af3f002c083fe94cc017563157ed1)**: Company standards and processes
 
 ### Linear Priority Levels
 

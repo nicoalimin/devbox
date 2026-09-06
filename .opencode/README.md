@@ -29,7 +29,7 @@ OpenCode should automatically load these instructions when starting work. If not
 
 Update `AGENTS.md` when:
 - Linear workflow states change
-- New Notion workspaces are added
+- Notion workspace structure changes (new homes added under Utama Managed)
 - Team structure changes
 - Best practices evolve
 
