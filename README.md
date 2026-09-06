@@ -6,14 +6,17 @@ A thin, single-flight adapter that connects Linear issue tracking to a local Ope
 
 This adapter enables automatic assignment of Linear issues to a local OpenCode coding agent. It operates sequentially—**one ticket at a time**—ensuring OpenCode never receives overlapping work.
 
+**IMPORTANT**: OpenCode **only** works on issues **explicitly assigned to the configured devbox/OpenCode Linear user** (`LINEAR_ASSIGNEE_ID`). Issues assigned to other users, unassigned issues, or team-wide issues are **never** picked up.
+
 **Flow:**
 1. n8n polls Linear periodically (default: every 5 minutes)
 2. Checks if OpenCode is healthy and idle
 3. If busy → skip cycle
-4. If idle → fetch assigned Linear issues (filtered by assignee + states)
-5. Pick the **first** issue (by priority)
-6. Create OpenCode session and send task
-7. Optionally transition Linear issue to "In Progress"
+4. If idle → fetch Linear issues **assigned to the configured devbox user** (filtered by assignee ID + states)
+5. **Defensive check**: Verify assignee ID exactly matches configured identity
+6. Pick the **first** matching issue (by priority)
+7. Create OpenCode session and send task
+8. Optionally transition Linear issue to "In Progress"
 
 ## Prerequisites
 
@@ -64,7 +67,7 @@ Edit `.env` with your values:
 
 **Required:**
 - `LINEAR_API_KEY`: Your Linear API key ([get it here](https://linear.app/settings/api))
-- `LINEAR_ASSIGNEE_ID`: User ID of the devbox agent in Linear
+- `LINEAR_ASSIGNEE_ID`: **User ID of the OpenCode/devbox agent in Linear** (CRITICAL: only issues assigned to this exact user will be processed)
 - `OPENCODE_BASE_URL`: OpenCode instance URL (default: `http://localhost:3000`)
 
 **Optional:**
@@ -158,6 +161,36 @@ n8n will start on `http://localhost:5678` by default.
 
 ## How It Works
 
+### Single-Assignee Filtering (Critical)
+
+**OpenCode ONLY processes issues assigned to the configured devbox identity.**
+
+The adapter enforces this through **two layers of protection**:
+
+1. **Server-side filter**: The Linear GraphQL query includes a hard filter:
+   ```graphql
+   filter: {
+     assignee: { id: { eq: $LINEAR_ASSIGNEE_ID } }
+   }
+   ```
+   This ensures Linear only returns issues assigned to the exact configured user.
+
+2. **Defensive client-side check**: After fetching, the workflow verifies:
+   ```javascript
+   if (issue.assignee.id !== LINEAR_ASSIGNEE_ID) {
+     // Skip this issue (no-op, not an error)
+   }
+   ```
+   This prevents any edge cases where the assignee might have changed between query and processing.
+
+**What this means:**
+- ✅ Issues assigned to `LINEAR_ASSIGNEE_ID` → processed
+- ❌ Issues assigned to other users → **never fetched or processed**
+- ❌ Unassigned issues → **never fetched or processed**
+- ❌ Team-wide issues → **never fetched or processed**
+
+To test: Create an issue in Linear and assign it to a **different** user. The workflow will never pick it up.
+
 ### Sequential Single-Flight Execution
 
 The adapter enforces **strict sequential processing**:
@@ -175,11 +208,13 @@ The adapter enforces **strict sequential processing**:
 
 ### Linear Query Behavior
 
-The workflow queries Linear with these filters:
-- **Assignee**: Matches `LINEAR_ASSIGNEE_ID`
+The workflow queries Linear with these **hard server-side filters**:
+- **Assignee**: Exactly matches `LINEAR_ASSIGNEE_ID` (server-side filter, not client-side)
 - **States**: Matches states in `LINEAR_STATES` (default: Todo, Triage, Backlog)
 - **Order**: Priority (highest first)
-- **Limit**: 10 issues (only the first is processed)
+- **Limit**: 10 issues (only the first is processed, after defensive assignee verification)
+
+**After fetching**, a defensive check verifies the assignee ID matches before POSTing to OpenCode. If there's any mismatch, the workflow exits as a no-op (not an error).
 
 ### OpenCode Integration
 
@@ -252,12 +287,19 @@ curl http://localhost:3000/global/health
 
 Expected: `{"healthy":true}`
 
-### 2. Create a Test Issue in Linear
+### 2. Create Test Issues in Linear
 
+**Test Issue 1: Correct Assignee (Should Process)**
 1. Go to your Linear workspace
-2. Create a new issue
-3. Assign it to the user configured in `LINEAR_ASSIGNEE_ID`
+2. Create a new issue (e.g., "Test: OpenCode Integration")
+3. **Assign it to the EXACT user whose ID is in `LINEAR_ASSIGNEE_ID`**
 4. Set the state to one of the states in `LINEAR_STATES` (e.g., "Todo")
+
+**Test Issue 2: Wrong Assignee (Should Skip)**
+1. Create another issue (e.g., "Test: Wrong Assignee")
+2. **Assign it to a DIFFERENT user** (not the devbox user)
+3. Set the state to "Todo"
+4. This issue should NEVER be picked up by OpenCode
 
 ### 3. Manually Trigger the Workflow
 
@@ -266,9 +308,23 @@ In n8n UI:
 2. Click **"Execute Workflow"** button
 3. Watch the execution path
 
+**Expected behavior with Test Issue 1 (correct assignee):**
+- ✅ Query returns the issue
+- ✅ Defensive assignee check passes
+- ✅ Session created
+- ✅ Task sent to OpenCode
+
+**Expected behavior if only Test Issue 2 exists (wrong assignee):**
+- ✅ Query returns empty (server-side filter blocks it)
+- ✅ Workflow exits at "No Issues" check
+- ✅ No session created
+
 ### 4. Verify Task Reached OpenCode
 
-Check OpenCode logs or UI to confirm the session was created and the task was received.
+Check OpenCode logs or UI to confirm:
+- Session was created for Test Issue 1
+- Task message includes Linear context
+- Test Issue 2 was NEVER sent to OpenCode
 
 ### 5. Monitor Workflow Executions
 
@@ -304,16 +360,26 @@ In n8n UI:
 **Problem:** Workflow runs but never picks issues
 
 **Solutions:**
-- Verify `LINEAR_ASSIGNEE_ID` matches the assignee in Linear
+- **VERIFY ASSIGNEE ID MATCHES**: The most common issue is `LINEAR_ASSIGNEE_ID` not matching the actual assignee in Linear
+  - Double-check the Linear issue is assigned to the **exact user ID** in `LINEAR_ASSIGNEE_ID`
+  - If the issue is assigned to a different user, it will NEVER be picked up (by design)
+  - Unassigned issues are NEVER picked up (by design)
 - Check `LINEAR_STATES` includes the state of your test issue
-- Query Linear API directly to verify issues exist:
+- Verify the issue assignee ID with this query:
   ```bash
   curl -X POST https://api.linear.app/graphql \
     -H "Authorization: $LINEAR_API_KEY" \
     -H "Content-Type: application/json" \
-    -d '{"query":"{ viewer { id assignedIssues(first:5) { nodes { identifier title state { name } } } } }"}'
+    -d '{"query":"query { issue(id: \"YOUR_ISSUE_ID\") { identifier assignee { id email } state { name } } }"}'
   ```
-- Review n8n execution logs for the "Query Linear Issues" node
+- Query for all assigned issues:
+  ```bash
+  curl -X POST https://api.linear.app/graphql \
+    -H "Authorization: $LINEAR_API_KEY" \
+    -H "Content-Type: application/json" \
+    -d '{"query":"{ viewer { id assignedIssues(first:5) { nodes { identifier title assignee { id email } state { name } } } } }"}'
+  ```
+- Review n8n execution logs for the "Query Linear Issues (Assigned to Devbox Only)" node
 
 ### OpenCode Always Busy
 
@@ -334,6 +400,23 @@ In n8n UI:
 - Restart n8n after changing `.env`
 - For Docker: verify `--env-file` path is correct
 - For npm: ensure `export $(cat .env | xargs)` was run in the same shell
+
+### Workflow Shows "Assignee Mismatch"
+
+**Problem:** n8n execution shows "No-Op (Assignee Mismatch)" in logs
+
+**Explanation:** This is the defensive check working correctly. The issue's assignee ID does not match `LINEAR_ASSIGNEE_ID`.
+
+**Solutions:**
+- This is **not an error**—it's protection against processing the wrong user's issues
+- Verify the Linear issue is assigned to the correct devbox user
+- Check `LINEAR_ASSIGNEE_ID` in `.env` matches the intended devbox user ID
+- If you see this frequently, audit your Linear issues to ensure proper assignment
+
+**Note:** This should be rare if the server-side filter is working correctly, but it protects against edge cases like:
+- Assignee changed between query and processing
+- Configuration mismatch
+- API caching issues
 
 ### Network Issues (n8n ↔ OpenCode)
 

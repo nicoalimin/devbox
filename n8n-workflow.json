@@ -127,7 +127,7 @@
           "parameters": [
             {
               "name": "query",
-              "value": "query GetAssignedIssues($userId: ID!, $states: [String!]) {\n  issues(\n    first: 10\n    filter: {\n      assignee: { id: { eq: $userId } }\n      state: { name: { in: $states } }\n    }\n    orderBy: priority\n  ) {\n    nodes {\n      id\n      identifier\n      title\n      description\n      url\n      priority\n      priorityLabel\n      state {\n        id\n        name\n        type\n      }\n      team {\n        id\n        name\n        key\n      }\n      labels {\n        nodes {\n          id\n          name\n          color\n        }\n      }\n      project {\n        id\n        name\n      }\n      createdAt\n      updatedAt\n    }\n  }\n}"
+              "value": "query GetAssignedIssues($userId: ID!, $states: [String!]) {\n  issues(\n    first: 10\n    filter: {\n      assignee: { id: { eq: $userId } }\n      state: { name: { in: $states } }\n    }\n    orderBy: priority\n  ) {\n    nodes {\n      id\n      identifier\n      title\n      description\n      url\n      priority\n      priorityLabel\n      state {\n        id\n        name\n        type\n      }\n      assignee {\n        id\n        name\n        email\n      }\n      team {\n        id\n        name\n        key\n      }\n      labels {\n        nodes {\n          id\n          name\n          color\n        }\n      }\n      project {\n        id\n        name\n      }\n      createdAt\n      updatedAt\n    }\n  }\n}"
             },
             {
               "name": "variables",
@@ -144,14 +144,14 @@
         }
       },
       "id": "query-linear-issues",
-      "name": "Query Linear Issues",
+      "name": "Query Linear Issues (Assigned to Devbox Only)",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
       "position": [1450, 100]
     },
     {
       "parameters": {
-        "jsCode": "// Extract the first issue from Linear response\nconst response = $input.first().json;\n\nif (!response.data?.issues?.nodes || response.data.issues.nodes.length === 0) {\n  return { noIssues: true };\n}\n\nconst issue = response.data.issues.nodes[0];\n\n// Format labels\nconst labels = issue.labels?.nodes?.map(l => l.name) || [];\n\n// Prepare payload for OpenCode\nreturn {\n  issue: {\n    id: issue.id,\n    identifier: issue.identifier,\n    title: issue.title,\n    description: issue.description || '',\n    url: issue.url,\n    priority: issue.priority,\n    priorityLabel: issue.priorityLabel,\n    state: issue.state.name,\n    stateType: issue.state.type,\n    stateId: issue.state.id,\n    team: {\n      id: issue.team.id,\n      name: issue.team.name,\n      key: issue.team.key\n    },\n    project: issue.project ? {\n      id: issue.project.id,\n      name: issue.project.name\n    } : null,\n    labels: labels,\n    createdAt: issue.createdAt,\n    updatedAt: issue.updatedAt\n  }\n};"
+        "jsCode": "// Extract the first issue from Linear response\nconst response = $input.first().json;\n\nif (!response.data?.issues?.nodes || response.data.issues.nodes.length === 0) {\n  return { noIssues: true };\n}\n\nconst issue = response.data.issues.nodes[0];\n\n// Format labels\nconst labels = issue.labels?.nodes?.map(l => l.name) || [];\n\n// Prepare payload for OpenCode (includes assignee for defensive check)\nreturn {\n  issue: {\n    id: issue.id,\n    identifier: issue.identifier,\n    title: issue.title,\n    description: issue.description || '',\n    url: issue.url,\n    priority: issue.priority,\n    priorityLabel: issue.priorityLabel,\n    state: issue.state.name,\n    stateType: issue.state.type,\n    stateId: issue.state.id,\n    assignee: {\n      id: issue.assignee?.id || null,\n      name: issue.assignee?.name || 'Unassigned',\n      email: issue.assignee?.email || null\n    },\n    team: {\n      id: issue.team.id,\n      name: issue.team.name,\n      key: issue.team.key\n    },\n    project: issue.project ? {\n      id: issue.project.id,\n      name: issue.project.name\n    } : null,\n    labels: labels,\n    createdAt: issue.createdAt,\n    updatedAt: issue.updatedAt\n  }\n};"
       },
       "id": "pick-first-issue",
       "name": "Pick First Issue",
@@ -334,12 +334,49 @@
       "position": [1450, 300]
     },
     {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "assignee-match",
+              "leftValue": "={{ $json.issue.assignee.id }}",
+              "rightValue": "={{ $env.LINEAR_ASSIGNEE_ID }}",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "verify-assignee-matches",
+      "name": "Verify Assignee Matches (Defensive Check)",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1950, 100]
+    },
+    {
+      "parameters": {},
+      "id": "no-op-assignee-mismatch",
+      "name": "No-Op (Assignee Mismatch)",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [2150, 200]
+    },
+    {
       "parameters": {},
       "id": "no-op-no-issues",
       "name": "No-Op (No Issues)",
       "type": "n8n-nodes-base.noOp",
       "typeVersion": 1,
-      "position": [2050, 200]
+      "position": [2050, 300]
     },
     {
       "parameters": {},
@@ -457,7 +494,7 @@
       "main": [
         [
           {
-            "node": "Create OpenCode Session",
+            "node": "Verify Assignee Matches (Defensive Check)",
             "type": "main",
             "index": 0
           }
@@ -465,6 +502,24 @@
         [
           {
             "node": "No-Op (No Issues)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Verify Assignee Matches (Defensive Check)": {
+      "main": [
+        [
+          {
+            "node": "Create OpenCode Session",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "No-Op (Assignee Mismatch)",
             "type": "main",
             "index": 0
           }
