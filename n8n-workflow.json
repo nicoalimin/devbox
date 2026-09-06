@@ -1,0 +1,601 @@
+{
+  "name": "Linear to OpenCode Adapter",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 5
+            }
+          ]
+        }
+      },
+      "id": "schedule-trigger",
+      "name": "Schedule Trigger",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [250, 300]
+    },
+    {
+      "parameters": {
+        "url": "={{ $env.OPENCODE_BASE_URL }}/global/health",
+        "options": {}
+      },
+      "id": "check-opencode-health",
+      "name": "Check OpenCode Health",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [450, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "healthy-check",
+              "leftValue": "={{ $json.healthy }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "is-opencode-healthy",
+      "name": "Is OpenCode Healthy?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [650, 300]
+    },
+    {
+      "parameters": {
+        "url": "={{ $env.OPENCODE_BASE_URL }}/session/status",
+        "options": {}
+      },
+      "id": "check-opencode-sessions",
+      "name": "Check OpenCode Sessions",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [850, 200]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Check if any sessions are active/running\nconst sessions = $input.first().json;\nconst hasBusySessions = Object.values(sessions).some(session => \n  session.status === 'active' || \n  session.status === 'running' || \n  session.busy === true\n);\n\nreturn { \n  busy: hasBusySessions,\n  sessionCount: Object.keys(sessions).length \n};"
+      },
+      "id": "parse-session-status",
+      "name": "Parse Session Status",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1050, 200]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "busy-check",
+              "leftValue": "={{ $json.busy }}",
+              "rightValue": false,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "is-opencode-idle",
+      "name": "Is OpenCode Idle?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1250, 200]
+    },
+    {
+      "parameters": {
+        "url": "https://api.linear.app/graphql",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "={{ $env.LINEAR_API_KEY }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "query",
+              "value": "query GetAssignedIssues($userId: ID!, $states: [String!]) {\n  issues(\n    first: 10\n    filter: {\n      assignee: { id: { eq: $userId } }\n      state: { name: { in: $states } }\n    }\n    orderBy: priority\n  ) {\n    nodes {\n      id\n      identifier\n      title\n      description\n      url\n      priority\n      priorityLabel\n      state {\n        id\n        name\n        type\n      }\n      assignee {\n        id\n        name\n        email\n      }\n      team {\n        id\n        name\n        key\n      }\n      labels {\n        nodes {\n          id\n          name\n          color\n        }\n      }\n      project {\n        id\n        name\n      }\n      createdAt\n      updatedAt\n    }\n  }\n}"
+            },
+            {
+              "name": "variables",
+              "value": "={\n  \"userId\": \"{{ $env.LINEAR_ASSIGNEE_ID }}\",\n  \"states\": {{ $env.LINEAR_STATES || '[\"Todo\", \"Triage\", \"Backlog\"]' }}\n}"
+            }
+          ]
+        },
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "json"
+            }
+          }
+        }
+      },
+      "id": "query-linear-issues",
+      "name": "Query Linear Issues (Assigned to Devbox Only)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1450, 100]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Extract the first issue from Linear response\nconst response = $input.first().json;\n\nif (!response.data?.issues?.nodes || response.data.issues.nodes.length === 0) {\n  return { noIssues: true };\n}\n\nconst issue = response.data.issues.nodes[0];\n\n// Format labels\nconst labels = issue.labels?.nodes?.map(l => l.name) || [];\n\n// Prepare payload for OpenCode (includes assignee for defensive check)\nreturn {\n  issue: {\n    id: issue.id,\n    identifier: issue.identifier,\n    title: issue.title,\n    description: issue.description || '',\n    url: issue.url,\n    priority: issue.priority,\n    priorityLabel: issue.priorityLabel,\n    state: issue.state.name,\n    stateType: issue.state.type,\n    stateId: issue.state.id,\n    assignee: {\n      id: issue.assignee?.id || null,\n      name: issue.assignee?.name || 'Unassigned',\n      email: issue.assignee?.email || null\n    },\n    team: {\n      id: issue.team.id,\n      name: issue.team.name,\n      key: issue.team.key\n    },\n    project: issue.project ? {\n      id: issue.project.id,\n      name: issue.project.name\n    } : null,\n    labels: labels,\n    createdAt: issue.createdAt,\n    updatedAt: issue.updatedAt\n  }\n};"
+      },
+      "id": "pick-first-issue",
+      "name": "Pick First Issue",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1650, 100]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "has-issue",
+              "leftValue": "={{ $json.noIssues }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "notEquals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "has-issue-to-process",
+      "name": "Has Issue to Process?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1850, 100]
+    },
+    {
+      "parameters": {
+        "url": "={{ $env.OPENCODE_BASE_URL }}/session",
+        "method": "POST",
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "name",
+              "value": "={{ $json.issue.identifier }}: {{ $json.issue.title }}"
+            }
+          ]
+        },
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "json"
+            }
+          }
+        }
+      },
+      "id": "create-opencode-session",
+      "name": "Create OpenCode Session",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2050, 0]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Build the message to send to OpenCode\nconst issue = $input.all()[0].json.issue;\nconst sessionResponse = $input.all()[1].json;\n\nconst message = `Build the following Linear issue:\n\nIdentifier: ${issue.identifier}\nTitle: ${issue.title}\nURL: ${issue.url}\nPriority: ${issue.priorityLabel} (${issue.priority})\nTeam: ${issue.team.name} (${issue.team.key})\nState: ${issue.state}\n${issue.project ? `Project: ${issue.project.name}` : ''}\n${issue.labels.length > 0 ? `Labels: ${issue.labels.join(', ')}` : ''}\n\nDescription:\n${issue.description}\n\nInstructions:\n1. Review the .opencode instructions in this repository\n2. Search Notion for related PRDs, specs, or context using the issue title and team\n3. Implement the required changes\n4. Update Linear status as you progress\n5. Leave a Linear comment with the PR link when complete`;\n\nreturn {\n  sessionId: sessionResponse.id,\n  message: message,\n  issue: issue\n};"
+      },
+      "id": "prepare-task-message",
+      "name": "Prepare Task Message",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2250, 0]
+    },
+    {
+      "parameters": {
+        "url": "={{ $env.OPENCODE_BASE_URL }}/session/{{ $json.sessionId }}/message",
+        "method": "POST",
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "parts",
+              "value": "=[{ \"type\": \"text\", \"text\": \"{{ $json.message }}\" }]"
+            }
+          ]
+        },
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "json"
+            }
+          }
+        }
+      },
+      "id": "send-task-to-opencode",
+      "name": "Send Task to OpenCode",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2450, 0]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "auto-transition",
+              "leftValue": "={{ $env.LINEAR_AUTO_TRANSITION }}",
+              "rightValue": "true",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "should-update-linear",
+      "name": "Should Update Linear?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [2650, 0]
+    },
+    {
+      "parameters": {
+        "url": "https://api.linear.app/graphql",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "={{ $env.LINEAR_API_KEY }}"
+            }
+          ]
+        },
+        "method": "POST",
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "query",
+              "value": "mutation UpdateIssue($id: String!, $stateId: String!) {\n  issueUpdate(id: $id, input: { stateId: $stateId }) {\n    success\n    issue {\n      id\n      identifier\n      state {\n        name\n      }\n    }\n  }\n}"
+            },
+            {
+              "name": "variables",
+              "value": "={\n  \"id\": \"{{ $('Prepare Task Message').item.json.issue.id }}\",\n  \"stateId\": \"{{ $env.LINEAR_IN_PROGRESS_STATE_ID }}\"\n}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "update-linear-status",
+      "name": "Update Linear Status",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2850, -100]
+    },
+    {
+      "parameters": {},
+      "id": "no-op-unhealthy",
+      "name": "No-Op (Unhealthy)",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [850, 400]
+    },
+    {
+      "parameters": {},
+      "id": "no-op-busy",
+      "name": "No-Op (Busy)",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [1450, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "assignee-match",
+              "leftValue": "={{ $json.issue.assignee.id }}",
+              "rightValue": "={{ $env.LINEAR_ASSIGNEE_ID }}",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "verify-assignee-matches",
+      "name": "Verify Assignee Matches (Defensive Check)",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1950, 100]
+    },
+    {
+      "parameters": {},
+      "id": "no-op-assignee-mismatch",
+      "name": "No-Op (Assignee Mismatch)",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [2150, 200]
+    },
+    {
+      "parameters": {},
+      "id": "no-op-no-issues",
+      "name": "No-Op (No Issues)",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [2050, 300]
+    },
+    {
+      "parameters": {},
+      "id": "done",
+      "name": "Done",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [3050, 0]
+    }
+  ],
+  "connections": {
+    "Schedule Trigger": {
+      "main": [
+        [
+          {
+            "node": "Check OpenCode Health",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check OpenCode Health": {
+      "main": [
+        [
+          {
+            "node": "Is OpenCode Healthy?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Is OpenCode Healthy?": {
+      "main": [
+        [
+          {
+            "node": "Check OpenCode Sessions",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "No-Op (Unhealthy)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check OpenCode Sessions": {
+      "main": [
+        [
+          {
+            "node": "Parse Session Status",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Session Status": {
+      "main": [
+        [
+          {
+            "node": "Is OpenCode Idle?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Is OpenCode Idle?": {
+      "main": [
+        [
+          {
+            "node": "Query Linear Issues",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "No-Op (Busy)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Query Linear Issues": {
+      "main": [
+        [
+          {
+            "node": "Pick First Issue",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Pick First Issue": {
+      "main": [
+        [
+          {
+            "node": "Has Issue to Process?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Has Issue to Process?": {
+      "main": [
+        [
+          {
+            "node": "Verify Assignee Matches (Defensive Check)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "No-Op (No Issues)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Verify Assignee Matches (Defensive Check)": {
+      "main": [
+        [
+          {
+            "node": "Create OpenCode Session",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "No-Op (Assignee Mismatch)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create OpenCode Session": {
+      "main": [
+        [
+          {
+            "node": "Prepare Task Message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Task Message": {
+      "main": [
+        [
+          {
+            "node": "Send Task to OpenCode",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Task to OpenCode": {
+      "main": [
+        [
+          {
+            "node": "Should Update Linear?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Should Update Linear?": {
+      "main": [
+        [
+          {
+            "node": "Update Linear Status",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Done",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Update Linear Status": {
+      "main": [
+        [
+          {
+            "node": "Done",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "staticData": null,
+  "tags": [],
+  "triggerCount": 0,
+  "updatedAt": "2026-09-06T11:47:00.000Z",
+  "versionId": "1"
+}
