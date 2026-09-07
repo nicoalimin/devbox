@@ -1,6 +1,6 @@
 # Notion n8n Monitor
 
-This repository contains an n8n workflow that monitors a Notion URL and calls a local port where OpenCode is running.
+This repository contains an n8n workflow that monitors a Notion database and calls a local port where OpenCode is running.
 
 ## Features
 
@@ -20,12 +20,14 @@ This repository contains an n8n workflow that monitors a Notion URL and calls a 
 ### Prerequisites
 
 1. Node.js (v14 or higher)
-2. n8n installed locally
+2. Docker (optional, for containerized setup)
 3. OpenCode platform running on local port
 4. Notion API token
 5. Notion database URL
 
 ### Installation Steps
+
+#### Option 1: Direct Setup
 
 1. Clone the repository:
 ```bash
@@ -55,7 +57,35 @@ n8n
    - The workflow will automatically check for changes in your Notion database
    - When changes are detected, it will make a request to your OpenCode local endpoint
 
-## How It Works
+#### Option 2: Docker Setup (Recommended)
+
+1. Build the Docker image:
+```bash
+docker build -t notion-n8n-monitor .
+```
+
+2. Run the container with necessary environment variables:
+```bash
+docker run -d \
+  --name notion-n8n-monitor \
+  -p 5678:5678 \
+  -v $(pwd)/flows:/app/flows \
+  -v $(pwd)/credentials:/app/credentials \
+  -e NOTION_API_TOKEN="your-notion-token-here" \
+  -e OPENCODE_BASE_URL="http://host.docker.internal:3000" \
+  notion-n8n-monitor
+```
+
+### Environment Configuration
+
+Create a `.env` file by copying the example:
+```bash
+cp .env.example .env
+```
+
+Then update the values in `.env` with your actual configuration.
+
+### How It Works
 
 1. Notion node polls the specified database at regular intervals
 2. When changes are detected, it triggers the workflow
@@ -70,6 +100,7 @@ n8n
 ├── nodes/
 ├── credentials/
 ├── package.json
+├── Dockerfile
 └── README.md
 ```
 
