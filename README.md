@@ -1,547 +1,82 @@
-# Linear n8n OpenCode Adapter
+# Notion n8n Monitor
 
-A thin, single-flight adapter that connects Linear issue tracking to a local OpenCode coding agent instance via n8n workflow automation.
+This repository contains an n8n workflow that monitors a Notion URL and calls a local port where OpenCode is running.
 
-## Overview
+## Features
 
-This adapter enables automatic assignment of Linear issues to a local OpenCode coding agent. It operates sequentially—**one ticket at a time**—ensuring OpenCode never receives overlapping work.
+- Monitors Notion database for changes
+- Calls local endpoint when changes detected
+- Integrates with OpenCode platform
 
-**IMPORTANT**: OpenCode **only** works on issues **explicitly assigned to the configured devbox/OpenCode Linear user** (`LINEAR_ASSIGNEE_ID`). Issues assigned to other users, unassigned issues, or team-wide issues are **never** picked up.
+## Plugin Dependencies
 
-**Flow:**
-1. n8n polls Linear periodically (default: every 5 minutes)
-2. Checks if OpenCode is healthy and idle
-3. If busy → skip cycle
-4. If idle → fetch Linear issues **assigned to the configured devbox user** (filtered by assignee ID + states)
-5. **Defensive check**: Verify assignee ID exactly matches configured identity
-6. Pick the **first** matching issue (by priority)
-7. Create OpenCode session and send task
-8. Optionally transition Linear issue to "In Progress"
+1. n8n-nodes-base
+2. n8n-nodes-notion
+3. n8n-nodes-webhook
+4. n8n-nodes-http-request
 
-## Prerequisites
+## Setup Instructions
 
-- **Node.js** 18+ (for n8n)
-- **OpenCode** running locally with HTTP API exposed (default: `http://localhost:3000`)
-- **Linear workspace** with API access
-- Same machine for both n8n and OpenCode (communicates via localhost)
+### Prerequisites
 
-## Installation
+1. Node.js (v14 or higher)
+2. n8n installed locally
+3. OpenCode platform running on local port
+4. Notion API token
+5. Notion database URL
 
-### 1. Install n8n
+### Installation Steps
 
-Choose one of the following methods:
-
-#### Option A: Using npm (recommended for development)
-
+1. Clone the repository:
 ```bash
-npm install -g n8n
+git clone <repository-url>
 ```
 
-#### Option B: Using Docker
-
+2. Install dependencies:
 ```bash
-docker run -d \
-  --name n8n \
-  --network host \
-  -v ~/.n8n:/home/node/.n8n \
-  n8nio/n8n
+npm install
 ```
 
-**Note:** Using `--network host` allows n8n to access OpenCode on `localhost`.
+3. Set up credentials:
+   - Create a Notion API token in your Notion account settings
+   - Add the token to the n8n credentials
 
-#### Option C: Using npx (no global install)
+4. Configure the workflow:
+   - Open n8n in your browser
+   - Import the flow from `flows/notion-monitor.json`
+   - Update the Notion database URL and local endpoint URL in the webhook node
 
+5. Start n8n:
 ```bash
-npx n8n
+n8n
 ```
 
-### 2. Configure Environment Variables
-
-Copy the example environment file and configure it:
-
-```bash
-cp .env.example .env
-```
-
-Edit `.env` with your values:
-
-**Required:**
-- `LINEAR_API_KEY`: Your Linear API key ([get it here](https://linear.app/settings/api))
-- `LINEAR_ASSIGNEE_ID`: **User ID of the OpenCode/devbox agent in Linear** (CRITICAL: only issues assigned to this exact user will be processed)
-- `OPENCODE_BASE_URL`: OpenCode instance URL (default: `http://localhost:3000`)
-
-**Optional:**
-- `LINEAR_STATES`: Issue states to poll (default: `["Todo", "Triage", "Backlog"]`)
-- `LINEAR_AUTO_TRANSITION`: Auto-update issue to "In Progress" (default: `false`)
-- `LINEAR_IN_PROGRESS_STATE_ID`: State ID for "In Progress" (required if auto-transition enabled)
-
-#### Finding Your Linear Assignee ID
-
-1. Go to [Linear API Settings](https://linear.app/settings/api)
-2. Open the GraphQL explorer
-3. Run this query:
-   ```graphql
-   query {
-     viewer {
-       id
-       name
-       email
-     }
-   }
-   ```
-4. Copy the `id` value to `LINEAR_ASSIGNEE_ID`
-
-#### Finding Linear State IDs (Optional)
-
-If you want to customize which states to monitor or enable auto-transition:
-
-1. Go to [Linear API Settings](https://linear.app/settings/api)
-2. Run this query:
-   ```graphql
-   query {
-     workflowStates {
-       nodes {
-         id
-         name
-         type
-       }
-     }
-   }
-   ```
-3. Find the relevant state IDs
-
-### 3. Start OpenCode
-
-Ensure OpenCode is running with the HTTP API exposed:
-
-```bash
-opencode serve
-```
-
-By default, OpenCode serves on `http://localhost:3000`. Verify it's running:
-
-```bash
-curl http://localhost:3000/global/health
-# Should return: {"healthy":true}
-```
-
-### 4. Start n8n
-
-Load your environment variables and start n8n:
-
-```bash
-# If using npm/npx
-export $(cat .env | xargs)
-n8n start
-
-# If using Docker, update the docker run command:
-docker run -d \
-  --name n8n \
-  --network host \
-  --env-file .env \
-  -v ~/.n8n:/home/node/.n8n \
-  n8nio/n8n
-```
-
-n8n will start on `http://localhost:5678` by default.
-
-### 5. Import the Workflow
-
-1. Open n8n UI: `http://localhost:5678`
-2. Click **"Workflows"** in the sidebar
-3. Click **"Import from File"**
-4. Select `n8n-workflow.json` from this repository
-5. The workflow "Linear to OpenCode Adapter" will be imported
-
-### 6. Activate the Workflow
-
-1. Open the imported workflow
-2. Click **"Active"** toggle in the top-right
-3. The workflow will now run on its schedule
+6. Monitor the workflow:
+   - The workflow will automatically check for changes in your Notion database
+   - When changes are detected, it will make a request to your OpenCode local endpoint
 
 ## How It Works
 
-### Single-Assignee Filtering (Critical)
+1. Notion node polls the specified database at regular intervals
+2. When changes are detected, it triggers the workflow
+3. HTTP Request node sends data to your OpenCode local port
+4. OpenCode receives and processes the data
 
-**OpenCode ONLY processes issues assigned to the configured devbox identity.**
-
-The adapter enforces this through **two layers of protection**:
-
-1. **Server-side filter**: The Linear GraphQL query includes a hard filter:
-   ```graphql
-   filter: {
-     assignee: { id: { eq: $LINEAR_ASSIGNEE_ID } }
-   }
-   ```
-   This ensures Linear only returns issues assigned to the exact configured user.
-
-2. **Defensive client-side check**: After fetching, the workflow verifies:
-   ```javascript
-   if (issue.assignee.id !== LINEAR_ASSIGNEE_ID) {
-     // Skip this issue (no-op, not an error)
-   }
-   ```
-   This prevents any edge cases where the assignee might have changed between query and processing.
-
-**What this means:**
-- ✅ Issues assigned to `LINEAR_ASSIGNEE_ID` → processed
-- ❌ Issues assigned to other users → **never fetched or processed**
-- ❌ Unassigned issues → **never fetched or processed**
-- ❌ Team-wide issues → **never fetched or processed**
-
-To test: Create an issue in Linear and assign it to a **different** user. The workflow will never pick it up.
-
-### Sequential Single-Flight Execution
-
-The adapter enforces **strict sequential processing**:
-
-1. **Health Check**: Before every cycle, verify OpenCode is healthy via `GET /global/health`
-2. **Busy Check**: Query `GET /session/status` to check for active sessions
-3. **Skip if Busy**: If any session is active/running, exit immediately (no-op)
-4. **Poll Linear**: Only when idle, query Linear for assigned issues
-5. **Pick One**: Take the first issue (ordered by priority)
-6. **Create Session**: POST to OpenCode to create a new session
-7. **Send Task**: POST the issue details as a message to the session
-8. **Optional Update**: If `LINEAR_AUTO_TRANSITION=true`, update Linear status
-
-**This guarantees OpenCode never works on multiple tickets simultaneously.**
-
-### Linear Query Behavior
-
-The workflow queries Linear with these **hard server-side filters**:
-- **Assignee**: Exactly matches `LINEAR_ASSIGNEE_ID` (server-side filter, not client-side)
-- **States**: Matches states in `LINEAR_STATES` (default: Todo, Triage, Backlog)
-- **Order**: Priority (highest first)
-- **Limit**: 10 issues (only the first is processed, after defensive assignee verification)
-
-**After fetching**, a defensive check verifies the assignee ID matches before POSTing to OpenCode. If there's any mismatch, the workflow exits as a no-op (not an error).
-
-### OpenCode Integration
-
-The workflow creates an OpenCode session and sends a structured message:
+## Repository Structure
 
 ```
-Build the following Linear issue:
-
-Identifier: ENG-123
-Title: Fix user authentication bug
-URL: https://linear.app/company/issue/ENG-123
-Priority: High (2)
-Team: Engineering (ENG)
-State: Todo
-Project: Q4 Roadmap
-Labels: bug, security
-
-Description:
-[Full issue description from Linear]
-
-Instructions:
-1. Review the .opencode instructions in this repository
-2. Search Notion for related PRDs, specs, or context using the issue title and team
-3. Implement the required changes
-4. Update Linear status as you progress
-5. Leave a Linear comment with the PR link when complete
+├── flows/
+│   └── notion-monitor.json
+├── nodes/
+├── credentials/
+├── package.json
+└── README.md
 ```
-
-## Configuration
-
-### Adjusting Poll Interval
-
-The default poll interval is **5 minutes**. To change:
-
-1. Open the workflow in n8n UI
-2. Click the **"Schedule Trigger"** node
-3. Modify the interval (e.g., 10 minutes, 15 minutes)
-4. Save the workflow
-
-### Customizing Linear States
-
-Edit `LINEAR_STATES` in `.env`:
-
-```bash
-# Example: Include "In Progress" to pick up partially-started tickets
-LINEAR_STATES=["Todo", "Triage", "Backlog", "In Progress"]
-```
-
-### Enabling Auto-Transition
-
-To automatically move issues to "In Progress" when assigned to OpenCode:
-
-1. Find your "In Progress" state ID (see "Finding Linear State IDs" above)
-2. Update `.env`:
-   ```bash
-   LINEAR_AUTO_TRANSITION=true
-   LINEAR_IN_PROGRESS_STATE_ID=your-state-id
-   ```
-3. Restart n8n
-
-**Note:** It's recommended to leave this disabled and let the OpenCode agent manage status updates (see `.opencode` instructions).
-
-## Testing
-
-### 1. Verify OpenCode is Running
-
-```bash
-curl http://localhost:3000/global/health
-```
-
-Expected: `{"healthy":true}`
-
-### 2. Create Test Issues in Linear
-
-**Test Issue 1: Correct Assignee (Should Process)**
-1. Go to your Linear workspace
-2. Create a new issue (e.g., "Test: OpenCode Integration")
-3. **Assign it to the EXACT user whose ID is in `LINEAR_ASSIGNEE_ID`**
-4. Set the state to one of the states in `LINEAR_STATES` (e.g., "Todo")
-
-**Test Issue 2: Wrong Assignee (Should Skip)**
-1. Create another issue (e.g., "Test: Wrong Assignee")
-2. **Assign it to a DIFFERENT user** (not the devbox user)
-3. Set the state to "Todo"
-4. This issue should NEVER be picked up by OpenCode
-
-### 3. Manually Trigger the Workflow
-
-In n8n UI:
-1. Open the workflow
-2. Click **"Execute Workflow"** button
-3. Watch the execution path
-
-**Expected behavior with Test Issue 1 (correct assignee):**
-- ✅ Query returns the issue
-- ✅ Defensive assignee check passes
-- ✅ Session created
-- ✅ Task sent to OpenCode
-
-**Expected behavior if only Test Issue 2 exists (wrong assignee):**
-- ✅ Query returns empty (server-side filter blocks it)
-- ✅ Workflow exits at "No Issues" check
-- ✅ No session created
-
-### 4. Verify Task Reached OpenCode
-
-Check OpenCode logs or UI to confirm:
-- Session was created for Test Issue 1
-- Task message includes Linear context
-- Test Issue 2 was NEVER sent to OpenCode
-
-### 5. Monitor Workflow Executions
-
-In n8n UI:
-1. Click **"Executions"** in the sidebar
-2. View success/failure history
-3. Click an execution to see detailed logs
-
-## Troubleshooting
-
-### OpenCode Not Responding
-
-**Problem:** Workflow shows "Unhealthy" or connection errors
-
-**Solutions:**
-- Verify OpenCode is running: `ps aux | grep opencode`
-- Check OpenCode logs for errors
-- Ensure correct port in `OPENCODE_BASE_URL`
-- Test health endpoint: `curl http://localhost:3000/global/health`
-
-### Linear Authentication Failed
-
-**Problem:** "Invalid API key" or 401 errors
-
-**Solutions:**
-- Verify `LINEAR_API_KEY` format: should start with `lin_api_`
-- Regenerate API key in [Linear Settings](https://linear.app/settings/api)
-- Ensure API key has required permissions
-- Check for extra whitespace in `.env`
-
-### No Issues Being Picked Up
-
-**Problem:** Workflow runs but never picks issues
-
-**Solutions:**
-- **VERIFY ASSIGNEE ID MATCHES**: The most common issue is `LINEAR_ASSIGNEE_ID` not matching the actual assignee in Linear
-  - Double-check the Linear issue is assigned to the **exact user ID** in `LINEAR_ASSIGNEE_ID`
-  - If the issue is assigned to a different user, it will NEVER be picked up (by design)
-  - Unassigned issues are NEVER picked up (by design)
-- Check `LINEAR_STATES` includes the state of your test issue
-- Verify the issue assignee ID with this query:
-  ```bash
-  curl -X POST https://api.linear.app/graphql \
-    -H "Authorization: $LINEAR_API_KEY" \
-    -H "Content-Type: application/json" \
-    -d '{"query":"query { issue(id: \"YOUR_ISSUE_ID\") { identifier assignee { id email } state { name } } }"}'
-  ```
-- Query for all assigned issues:
-  ```bash
-  curl -X POST https://api.linear.app/graphql \
-    -H "Authorization: $LINEAR_API_KEY" \
-    -H "Content-Type: application/json" \
-    -d '{"query":"{ viewer { id assignedIssues(first:5) { nodes { identifier title assignee { id email } state { name } } } } }"}'
-  ```
-- Review n8n execution logs for the "Query Linear Issues (Assigned to Devbox Only)" node
-
-### OpenCode Always Busy
-
-**Problem:** Workflow never starts new work
-
-**Solutions:**
-- Check OpenCode session status: `curl http://localhost:3000/session/status`
-- Review the "Parse Session Status" node logic in n8n
-- Manually abort stuck sessions in OpenCode
-- Verify the busy detection logic matches your OpenCode version
-
-### Environment Variables Not Loading
-
-**Problem:** Workflow shows "undefined" for env vars
-
-**Solutions:**
-- Ensure `.env` file is in the same directory
-- Restart n8n after changing `.env`
-- For Docker: verify `--env-file` path is correct
-- For npm: ensure `export $(cat .env | xargs)` was run in the same shell
-
-### Workflow Shows "Assignee Mismatch"
-
-**Problem:** n8n execution shows "No-Op (Assignee Mismatch)" in logs
-
-**Explanation:** This is the defensive check working correctly. The issue's assignee ID does not match `LINEAR_ASSIGNEE_ID`.
-
-**Solutions:**
-- This is **not an error**—it's protection against processing the wrong user's issues
-- Verify the Linear issue is assigned to the correct devbox user
-- Check `LINEAR_ASSIGNEE_ID` in `.env` matches the intended devbox user ID
-- If you see this frequently, audit your Linear issues to ensure proper assignment
-
-**Note:** This should be rare if the server-side filter is working correctly, but it protects against edge cases like:
-- Assignee changed between query and processing
-- Configuration mismatch
-- API caching issues
-
-### Network Issues (n8n ↔ OpenCode)
-
-**Problem:** n8n cannot reach OpenCode on localhost
-
-**Solutions:**
-- If using Docker for n8n: ensure `--network host` is set
-- Try `OPENCODE_BASE_URL=http://host.docker.internal:3000` (macOS/Windows Docker)
-- For Linux Docker: use `OPENCODE_BASE_URL=http://172.17.0.1:3000`
-- Test connectivity from within n8n container:
-  ```bash
-  docker exec -it n8n curl http://localhost:3000/global/health
-  ```
-
-## OpenCode Agent Instructions
-
-This adapter includes `.opencode` instructions that guide the coding agent's behavior. These instructions tell OpenCode to:
-
-1. **Search Notion proactively** for related PRDs, specs, and context before starting work
-2. **Update Linear status** as work progresses (In Progress → In Review → Done)
-3. **Leave Linear comments** with PR links and summaries when work completes
-4. **Ask for clarification** rather than guessing product requirements
-
-See `.opencode/AGENTS.md` for full details.
-
-## Architecture
-
-```
-┌─────────────────┐
-│  Linear Workspace│
-│  (Issues)       │
-└────────┬────────┘
-         │ GraphQL API
-         │ (poll every 5min)
-         ▼
-┌─────────────────┐
-│   n8n Workflow  │
-│  ┌──────────┐   │
-│  │ 1. Health│   │
-│  │ 2. Busy? │   │
-│  │ 3. Query │   │
-│  │ 4. Pick  │   │
-│  │ 5. POST  │   │
-│  └──────────┘   │
-└────────┬────────┘
-         │ HTTP API
-         │ localhost:3000
-         ▼
-┌─────────────────┐
-│  OpenCode Agent │
-│  (Coding)       │
-│  ┌──────────┐   │
-│  │ Session  │   │
-│  │ Execute  │   │
-│  │ Code     │   │
-│  └──────────┘   │
-└────────┬────────┘
-         │
-         ├──► GitHub (PRs)
-         ├──► Notion (context)
-         └──► Linear (updates)
-```
-
-## Design Principles
-
-1. **Thin adapter**: n8n does minimal work—poll, check, POST
-2. **Single-flight**: Never start ticket B while ticket A is running
-3. **Stateless**: No database; OpenCode session status is the source of truth
-4. **Localhost-first**: OpenCode and n8n share the host (no network latency)
-5. **Configurable**: All critical values in environment variables
-6. **Sequential priority**: Always process highest-priority issue first
-
-## Advanced Usage
-
-### Custom OpenCode API
-
-If your OpenCode instance has a different API structure:
-
-1. Edit the workflow in n8n UI
-2. Modify the "Check OpenCode Sessions" and "Create OpenCode Session" nodes
-3. Adjust the busy-check logic in "Parse Session Status"
-4. Update the message format in "Prepare Task Message"
-
-### Multi-Team Support
-
-To support multiple teams with different assignees:
-
-1. Duplicate the workflow in n8n
-2. Create separate `.env` files or use n8n's credential system
-3. Adjust `LINEAR_ASSIGNEE_ID` per team
-4. Optionally filter by team ID in the Linear query
-
-### Webhook Alternative
-
-For real-time triggering instead of polling:
-
-1. Configure Linear webhooks (requires public endpoint)
-2. Use n8n's webhook trigger instead of schedule trigger
-3. Add filtering logic to ignore non-assigned issues
-4. Maintain busy-check logic to enforce single-flight
-
-## Security Considerations
-
-- **API Keys**: Store `LINEAR_API_KEY` securely; never commit to git
-- **Localhost**: OpenCode API should only be accessible locally (not exposed to internet)
-- **n8n Auth**: Enable authentication in n8n for production use
-- **Secrets**: Use n8n's credential system for sensitive values in production
 
 ## Contributing
 
-To improve this adapter:
-
-1. Fork the repository
-2. Make changes to `n8n-workflow.json` or documentation
-3. Test with a live OpenCode + Linear setup
-4. Submit a pull request with clear description
+Contributions are welcome! Please submit a pull request with any improvements or bug fixes.
 
 ## License
 
-MIT
-
-## Support
-
-For issues or questions:
-- Check the Troubleshooting section above
-- Review n8n execution logs
-- Verify OpenCode API documentation
-- Open an issue in this repository
+This project is licensed under the MIT License.

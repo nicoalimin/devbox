@@ -1,0 +1,51 @@
+type: http_request
+model: http_request
+id: rq_7McDt8ZQji
+createdAt: 2026-09-07T16:38:01.649331
+updatedAt: 2026-09-07T16:39:59.431320
+workspaceId: wk_vfFiK6SEhZ
+folderId: null
+authentication:
+  key: Bearer
+  prefix: ''
+  token: ${[ secure(value=b64'WUVOQ19lVUUwYXpOdVF3RzFUMXNuZzFQL0JBSEFKbFcvWmJRNG1BWWRHTnlCL09ENEhxZnBpTXZJTDRLZzcxN1pqNkdaSHZ1OVFRa3VOcHZDbnVCeGVEYnkzdlk9') ]}
+authenticationType: bearer
+body:
+  query: |-
+    query {
+      viewer {
+        id
+        name
+        email
+      }
+    }
+bodyType: graphql
+description: ''
+headers:
+- enabled: true
+  name: Content-Type
+  value: application/json
+  id: d8CU8XZWAs
+method: POST
+name: ''
+sortPriority: -1788799081645.0
+url: https://api.linear.app/graphql
+urlParameters: []
+settingSendCookies:
+  enabled: false
+  value: true
+settingStoreCookies:
+  enabled: false
+  value: true
+settingValidateCertificates:
+  enabled: false
+  value: true
+settingFollowRedirects:
+  enabled: false
+  value: true
+settingRequestTimeout:
+  enabled: false
+  value: 0
+settingHttpVersion:
+  enabled: false
+  value: auto

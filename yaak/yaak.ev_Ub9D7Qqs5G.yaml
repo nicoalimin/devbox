@@ -1,0 +1,18 @@
+type: environment
+model: environment
+id: ev_Ub9D7Qqs5G
+workspaceId: wk_vfFiK6SEhZ
+createdAt: 2026-09-07T16:37:21.885857
+updatedAt: 2026-09-07T16:40:12.544299
+name: Global Variables
+public: true
+base: true
+parentModel: workspace
+parentId: null
+variables:
+- enabled: true
+  name: AUTH_TOKEN
+  value: ${[ secure(value=b64'WUVOQ19lVUUwYXpOdVF3RjlmM2ttNkZkZ0kvRWdFRmZLU1ZhTzlnSVlzYTZOS2JtZGJ3QXZXQnhzNmp0c3FhRENVcjQwaDhmQ2g3M0tqQ1o1WW1scnNWdUpwcTJYbmo1VlFsSmNLcXFhUXgyeEI3Ulp3QTl2dy9rOXdyL3NKMFozN1JDQw') ]}
+  id: y9KPebcrf6
+color: null
+sortPriority: 0.0

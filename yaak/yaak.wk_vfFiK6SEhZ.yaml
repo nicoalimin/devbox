@@ -1,0 +1,19 @@
+type: workspace
+model: workspace
+id: wk_vfFiK6SEhZ
+createdAt: 2026-09-07T16:37:21.851948
+updatedAt: 2026-09-07T16:37:35.803519
+authentication: {}
+authenticationType: null
+description: ''
+headers: []
+name: Notion N8N Opencode
+encryptionKeyChallenge: eUE0azNuQwHa6ITruDHccgyWmFgKpp0vyM7qVA2wuvvA64015Z9tyREySR8v5d//m0q1eJMQ0a3RRpj78P72JMA2MvmPgHZJIeun652yF2Dd965/ILKRkaf1VPZRS81Nn8U=
+settingValidateCertificates: true
+settingFollowRedirects: true
+settingRequestTimeout: 0
+settingRequestMessageSize: 67108864
+settingDnsOverrides: []
+settingSendCookies: true
+settingStoreCookies: true
+settingHttpVersion: auto
