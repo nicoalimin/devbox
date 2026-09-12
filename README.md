@@ -72,14 +72,50 @@ sudo cp bin/devboxd /usr/local/bin/
 cp devboxd.yaml.example devboxd.yaml
 # Edit devboxd.yaml with your settings (see Configuration section)
 
-# Run the server
+# Run the server (with interactive TUI)
 devboxd --config devboxd.yaml
 ```
 
 The server will:
 - Listen on `0.0.0.0:8080` (configurable)
 - Create `devboxd.db` for persistent state
+- Display an interactive terminal UI dashboard (when run in a TTY)
 - Wait for job assignments via the HTTP API
+
+**Terminal UI Dashboard**
+
+When you run `devboxd --config devboxd.yaml` on a terminal, you'll see an interactive dashboard with:
+
+- **Status Tab (1)**: Current job status, version, running time, statistics
+- **History Tab (2)**: Recent job history with states and timestamps
+- **Errors Tab (3)**: Blocked jobs and error messages
+- **Integrations Tab (4)**: Configured integrations health (Linear, GitHub, OpenCode, repos)
+- **Logs Tab (5)**: Live logs from the current or most recent job
+
+**TUI Keybindings:**
+- `1-5`: Switch between tabs
+- `r`: Refresh data
+- `q` or `Ctrl+C`: Quit
+
+**Headless Mode**
+
+To run without the TUI (e.g., in Docker, systemd, or CI):
+
+```bash
+# Option 1: --no-tui flag
+devboxd --config devboxd.yaml --no-tui
+
+# Option 2: Environment variable
+DEVBOX_NO_TUI=1 devboxd --config devboxd.yaml
+
+# Option 3: Redirect output (auto-detected)
+devboxd --config devboxd.yaml > devboxd.log 2>&1
+```
+
+The server will automatically disable the TUI when:
+- `--no-tui` flag is provided
+- `DEVBOX_NO_TUI` environment variable is set
+- stdout is not a TTY (e.g., piped, redirected, or running as a service)
 
 ### 3. Install the Client (Grok Bot Host)
 
@@ -414,7 +450,7 @@ After=network.target
 Type=simple
 User=devbox
 WorkingDirectory=/home/devbox
-ExecStart=/usr/local/bin/devboxd --config /etc/devboxd/config.yaml --db /var/lib/devboxd/devboxd.db
+ExecStart=/usr/local/bin/devboxd --config /etc/devboxd/config.yaml --db /var/lib/devboxd/devboxd.db --no-tui
 Restart=always
 RestartSec=10
 
@@ -426,12 +462,17 @@ Environment="DEVBOXD_AUTH_TOKEN=..."
 WantedBy=multi-user.target
 ```
 
+**Note:** The `--no-tui` flag disables the interactive dashboard for headless operation.
+
 Enable and start:
 ```bash
 sudo systemctl daemon-reload
 sudo systemctl enable devboxd
 sudo systemctl start devboxd
 sudo systemctl status devboxd
+
+# View logs
+sudo journalctl -u devboxd -f
 ```
 
 ## Development

@@ -110,9 +110,25 @@ func (c *Client) GetIssue(idOrIdentifier string) (*Issue, error) {
 		"id": idOrIdentifier,
 	}
 
+	// Use intermediate struct to handle connection pattern
 	var result struct {
 		Data struct {
-			Issue Issue `json:"issue"`
+			Issue struct {
+				ID          string    `json:"id"`
+				Identifier  string    `json:"identifier"`
+				Title       string    `json:"title"`
+				Description string    `json:"description"`
+				URL         string    `json:"url"`
+				Priority    int       `json:"priority"`
+				State       State     `json:"state"`
+				Team        Team      `json:"team"`
+				Project     *Project  `json:"project"`
+				Labels      struct {
+					Nodes []Label `json:"nodes"`
+				} `json:"labels"`
+				CreatedAt   time.Time `json:"createdAt"`
+				UpdatedAt   time.Time `json:"updatedAt"`
+			} `json:"issue"`
 		} `json:"data"`
 	}
 
@@ -120,7 +136,23 @@ func (c *Client) GetIssue(idOrIdentifier string) (*Issue, error) {
 		return nil, err
 	}
 
-	return &result.Data.Issue, nil
+	// Convert to Issue struct
+	issue := &Issue{
+		ID:          result.Data.Issue.ID,
+		Identifier:  result.Data.Issue.Identifier,
+		Title:       result.Data.Issue.Title,
+		Description: result.Data.Issue.Description,
+		URL:         result.Data.Issue.URL,
+		Priority:    result.Data.Issue.Priority,
+		State:       result.Data.Issue.State,
+		Team:        result.Data.Issue.Team,
+		Project:     result.Data.Issue.Project,
+		Labels:      result.Data.Issue.Labels.Nodes,
+		CreatedAt:   result.Data.Issue.CreatedAt,
+		UpdatedAt:   result.Data.Issue.UpdatedAt,
+	}
+
+	return issue, nil
 }
 
 // UpdateIssueState updates the state of an issue
