@@ -1,0 +1,41 @@
+server:
+  listen: "0.0.0.0:8080"
+  # auth_token: "your-secret-token-here"  # or set DEVBOXD_AUTH_TOKEN env var
+
+linear:
+  # api_key: "lin_api_your_key_here"     # or set LINEAR_API_KEY env var
+  assignee_id: ""                         # Optional: only process issues assigned to this user
+  workspace_id: ""                        # Optional: workspace ID
+
+opencode:
+  base_url: "http://localhost:3000"
+  timeout: "30m"                          # Mark blocked after this timeout
+  # username: ""                          # Optional auth
+  # password: ""                          # Optional auth
+
+github:
+  default_base_branch: "main"
+
+# Map Linear issue attributes to repository paths
+repos:
+  - match:
+      team: "ENG"
+    repo:
+      path: "/path/to/your/backend"
+      base_branch: "main"
+  
+  - match:
+      project: "Frontend Redesign"
+    repo:
+      path: "/path/to/your/frontend"
+      base_branch: "develop"
+  
+  - match:
+      label: "infrastructure"
+    repo:
+      path: "/path/to/your/infra"
+      base_branch: "main"
+
+queue:
+  enabled: false  # Default: reject when busy
+  max_depth: 1    # Only if enabled
