@@ -1,0 +1,54 @@
+{
+  "version": 1,
+  "nodes": [
+    {
+      "name": "Notion",
+      "type": "notion",
+      "parameters": {
+        "databaseId": "",
+        "polling": {
+          "interval": 60
+        }
+      },
+      "id": "notion-node-id"
+    },
+    {
+      "name": "Webhook",
+      "type": "webhook",
+      "parameters": {
+        "path": "/notion-change"
+      },
+      "id": "webhook-node-id"
+    },
+    {
+      "name": "HTTP Request",
+      "type": "http-request",
+      "parameters": {
+        "url": "http://localhost:3000/opencode-endpoint",
+        "method": "POST",
+        "body": "{{ $json }}"
+      },
+      "id": "http-request-node-id"
+    }
+  ],
+  "connections": {
+    "Notion": [
+      {
+        "output": {
+          "node": "Webhook",
+          "type": "main",
+          "index": 0
+        }
+      }
+    ],
+    "Webhook": [
+      {
+        "output": {
+          "node": "HTTP Request",
+          "type": "main",
+          "index": 0
+        }
+      }
+    ]
+  }
+}
