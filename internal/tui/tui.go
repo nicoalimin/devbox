@@ -557,11 +557,25 @@ func (m Model) refreshData() tea.Cmd {
 		recentJobs, _ := m.database.ListJobs(50)
 		blockedJobs, _ := m.database.GetBlockedJobs()
 
+		// Get logs from the global log buffer (live daemon logs)
+		// This includes HTTP access logs, job logs, etc.
 		var recentLogs []*db.JobLog
-		if currentJob != nil {
-			recentLogs, _ = m.database.GetLogs(currentJob.ID, 200)
-		} else if len(recentJobs) > 0 {
-			recentLogs, _ = m.database.GetLogs(recentJobs[0].ID, 200)
+		if globalLogBuffer != nil {
+			bufferLogs := globalLogBuffer.GetRecent(200)
+			for _, entry := range bufferLogs {
+				recentLogs = append(recentLogs, &db.JobLog{
+					Timestamp: entry.Timestamp,
+					Level:     entry.Level,
+					Message:   entry.Message,
+				})
+			}
+		} else {
+			// Fallback to database logs if buffer not initialized
+			if currentJob != nil {
+				recentLogs, _ = m.database.GetLogs(currentJob.ID, 200)
+			} else if len(recentJobs) > 0 {
+				recentLogs, _ = m.database.GetLogs(recentJobs[0].ID, 200)
+			}
 		}
 
 		return dataRefreshMsg{

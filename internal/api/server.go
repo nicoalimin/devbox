@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
@@ -33,10 +34,38 @@ func NewServer(cfg *config.Config, database *db.DB, orch *job.Orchestrator) *Ser
 
 // Start starts the HTTP server
 func (s *Server) Start() error {
+	return s.StartWithLogger(nil)
+}
+
+// StartWithLogger starts the HTTP server with optional custom logger
+func (s *Server) StartWithLogger(customLogger func(string, ...interface{})) error {
 	r := chi.NewRouter()
 
 	// Middleware
-	r.Use(middleware.Logger)
+	if customLogger != nil {
+		// Custom logger middleware that goes to the log buffer
+		r.Use(func(next http.Handler) http.Handler {
+			return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				ww := middleware.NewWrapResponseWriter(w, r.ProtoMajor)
+				t1 := time.Now()
+				
+				defer func() {
+					elapsed := time.Since(t1)
+					customLogger("%s %s %s from %s - %d in %s",
+						r.Method,
+						r.URL.String(),
+						r.Proto,
+						r.RemoteAddr,
+						ww.Status(),
+						elapsed)
+				}()
+				
+				next.ServeHTTP(ww, r)
+			})
+		})
+	} else {
+		r.Use(middleware.Logger)
+	}
 	r.Use(middleware.Recoverer)
 	r.Use(middleware.RequestID)
 
@@ -57,7 +86,11 @@ func (s *Server) Start() error {
 		r.Get("/v1/jobs/{id}/logs", s.handleGetLogs)
 	})
 
-	fmt.Printf("Starting devboxd server on %s\n", s.cfg.Server.Listen)
+	if customLogger == nil {
+		fmt.Printf("Starting devboxd server on %s\n", s.cfg.Server.Listen)
+	} else {
+		customLogger("Starting devboxd server on %s", s.cfg.Server.Listen)
+	}
 	return http.ListenAndServe(s.cfg.Server.Listen, r)
 }
 

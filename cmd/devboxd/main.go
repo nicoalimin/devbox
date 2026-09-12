@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"time"
 
 	"golang.org/x/term"
 
@@ -37,24 +38,44 @@ func main() {
 	// Create orchestrator
 	orchestrator := job.NewOrchestrator(cfg, database)
 
-	// Create and start server in background
+	// Create server
 	server := api.NewServer(cfg, database, orchestrator)
 	
 	// Decide whether to show TUI
 	useTUI := shouldUseTUI(*noTUI)
 	
 	if useTUI {
-		// Start server in background goroutine
+		// Initialize log buffer for capturing logs in TUI
+		tui.InitGlobalLogBuffer(1000) // 1000 log entries
+		
+		// Redirect standard logging to buffer
+		tui.RedirectStdLog()
+		
+		// Log startup message to buffer
+		tui.LogInfo("devboxd version %s", api.Version)
+		tui.LogInfo("Configuration loaded from: %s", *configPath)
+		tui.LogInfo("Database: %s", *dbPath)
+		
+		// Start server in background with custom logger
 		go func() {
-			if err := server.Start(); err != nil {
-				log.Fatalf("Server failed: %v", err)
+			if err := server.StartWithLogger(tui.LogInfo); err != nil {
+				tui.LogError("Server failed: %v", err)
+				os.Exit(1)
 			}
 		}()
 		
+		// Give server a moment to start
+		time.Sleep(100 * time.Millisecond)
+		
 		// Run TUI in foreground
 		if err := tui.Run(cfg, database); err != nil {
+			// Restore standard logging before exiting
+			tui.RestoreStdLog(os.Stdout)
 			log.Fatalf("TUI failed: %v", err)
 		}
+		
+		// Restore standard logging after TUI exits
+		tui.RestoreStdLog(os.Stdout)
 	} else {
 		// Traditional headless mode - log to stdout
 		fmt.Printf("devboxd version %s\n", api.Version)

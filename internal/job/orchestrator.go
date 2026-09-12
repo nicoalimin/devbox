@@ -2,6 +2,7 @@ package job
 
 import (
 	"fmt"
+	"log"
 	"strings"
 	"time"
 
@@ -408,10 +409,16 @@ func (o *Orchestrator) buildCodingPrompt(issue *linear.Issue) string {
 
 // log adds a log entry
 func (o *Orchestrator) log(jobID, level, message string) {
+	// Add to database
 	if err := o.db.AddLog(jobID, level, message); err != nil {
-		// Log to stderr if DB logging fails
+		// Log to stderr if DB logging fails (will be captured by TUI if active)
 		fmt.Printf("[%s] %s: %s (failed to write to DB: %v)\n", jobID, level, message, err)
 	}
+	
+	// Also add to TUI log buffer if it exists (for live display)
+	// Format: [jobID] message
+	formattedMsg := fmt.Sprintf("[%s] %s", jobID, message)
+	log.Printf("[%s] %s", level, formattedMsg)
 }
 
 // CancelJob cancels a running job
