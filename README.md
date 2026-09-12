@@ -82,20 +82,61 @@ The server will:
 - Display an interactive terminal UI dashboard (when run in a TTY)
 - Wait for job assignments via the HTTP API
 
-**Terminal UI Dashboard**
+**Full-Screen Interactive TUI**
 
-When you run `devboxd --config devboxd.yaml` on a terminal, you'll see an interactive dashboard with:
+When you run `devboxd --config devboxd.yaml` on a terminal, it launches an immersive full-screen interface:
 
-- **Status Tab (1)**: Current job status, version, running time, statistics
-- **History Tab (2)**: Recent job history with states and timestamps
-- **Errors Tab (3)**: Blocked jobs and error messages
-- **Integrations Tab (4)**: Configured integrations health (Linear, GitHub, OpenCode, repos)
-- **Logs Tab (5)**: Live logs from the current or most recent job
+```
+┌─────────────────────────────────────────────────────────────────┐
+│ devboxd v0.1.0 │ BUSY │ Job: ENG-123 (coding) │ 2m15s          │ ← Status Bar
+├──────────────────────┬──────────────────────────────────────────┤
+│ JOBS (12)            │ LIVE LOGS                                │
+│ ┌──────────────────┐ │ ┌────────────────────────────────────┐  │
+│ │ ▸ ENG-123 coding │ │ │ [15:04:03] [INFO] Starting job     │  │
+│ │   ENG-124 done   │ │ │ [15:04:04] [INFO] Fetching Linear  │  │
+│ │   ENG-125 failed │ │ │ [15:04:05] [INFO] Creating branch  │  │ ← Main Logs
+│ │   ...            │ │ │ ...                                │  │   (scrollable)
+│ └──────────────────┘ │ │ (streaming, auto-follow)           │  │
+│                      │ └────────────────────────────────────┘  │
+│ ERRORS (2)           │                                          │
+│ ┌──────────────────┐ │                                          │
+│ │ • ENG-120        │ │                                          │
+│ │   needs input    │ │                                          │
+│ └──────────────────┘ │                                          │
+│                      │                                          │
+│ INTEGRATIONS         │                                          │
+│ ✓ Linear ✓ GitHub   │                                          │
+│ ✓ OpenCode          │                                          │
+├──────────────────────┴──────────────────────────────────────────┤
+│ Tab: switch | ↑↓/jk: nav | Enter: logs | r: refresh | q: quit  │ ← Help Bar
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**Layout:**
+- **Header**: Real-time status (BUSY/IDLE), current job, elapsed time
+- **Sidebar** (left):
+  - **Jobs**: Recent job list with states (done/busy/failed/blocked)
+  - **Errors**: Blocked jobs requiring attention
+  - **Integrations**: Health of Linear, GitHub, OpenCode, configured repos
+- **Main Pane** (right): Live streaming logs with auto-scroll
+- **Footer**: Keybindings help
 
 **TUI Keybindings:**
-- `1-5`: Switch between tabs
-- `r`: Refresh data
-- `q` or `Ctrl+C`: Quit
+- `Tab` / `Shift+Tab`: Switch focus between panes (Jobs → Logs → Integrations)
+- `↑` `↓` or `j` `k`: Navigate within focused pane
+- `g` / `G`: Jump to top/bottom
+- `Enter`: View logs for selected job (when in Jobs pane)
+- `r`: Force refresh data
+- `q` or `Ctrl+C`: Quit and restore terminal
+
+**Features:**
+- **Full-screen immersive**: Uses alternate screen buffer (like vim/htop)
+- **Vim-like navigation**: j/k, arrow keys, g/G for movement
+- **Focus highlighting**: Active pane has colored border
+- **Auto-refresh**: Updates every 2 seconds
+- **Scrollable logs**: Navigate through job history with viewport
+- **Color-coded states**: Green (done), red (failed), yellow (blocked), blue (active)
+- **Responsive**: Handles terminal resize gracefully
 
 **Headless Mode**
 
