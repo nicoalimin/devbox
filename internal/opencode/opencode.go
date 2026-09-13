@@ -59,6 +59,7 @@ type Session struct {
 // V2SessionResponse wraps the session info in OpenCode2 format
 type V2SessionResponse struct {
 	Data SessionData `json:"data"`
+	ID   interface{} `json:"id"` // Some responses may have top-level ID
 }
 
 // SessionData represents OpenCode2 session data
@@ -145,29 +146,58 @@ func (c *Client) createSessionV2(title, directory string) (*Session, error) {
 		return nil, fmt.Errorf("failed to create OpenCode2 session: %w", err)
 	}
 
-	// Extract session ID from V2 response
-	sessionID := ""
-	if idMap, ok := response.Data.ID.(map[string]interface{}); ok {
-		// Session ID might be in various formats, try common fields
-		if id, ok := idMap["value"].(string); ok {
-			sessionID = id
-		} else if id, ok := idMap["id"].(string); ok {
-			sessionID = id
-		} else {
-			// Fallback: serialize the whole ID object
-			idBytes, _ := json.Marshal(response.Data.ID)
-			sessionID = string(idBytes)
-		}
-	}
+	// Extract session ID robustly from various OpenCode2 response formats
+	sessionID := c.extractSessionID(response)
 
 	if sessionID == "" {
-		return nil, fmt.Errorf("OpenCode2 returned empty session ID")
+		// Include raw response body in error for debugging
+		responseBytes, _ := json.Marshal(response)
+		responseStr := string(responseBytes)
+		if len(responseStr) > 200 {
+			responseStr = responseStr[:200] + "..."
+		}
+		return nil, fmt.Errorf("OpenCode2 returned empty session ID (response: %s)", responseStr)
 	}
 
 	return &Session{
 		ID:     sessionID,
 		Status: "active",
 	}, nil
+}
+
+// extractSessionID extracts session ID from various OpenCode2 response formats
+func (c *Client) extractSessionID(response V2SessionResponse) string {
+	// Try 1: data.id as plain string (most common)
+	if idStr, ok := response.Data.ID.(string); ok && idStr != "" {
+		return idStr
+	}
+
+	// Try 2: data.id as object with "value" or "id" field
+	if idMap, ok := response.Data.ID.(map[string]interface{}); ok {
+		if id, ok := idMap["value"].(string); ok && id != "" {
+			return id
+		}
+		if id, ok := idMap["id"].(string); ok && id != "" {
+			return id
+		}
+	}
+
+	// Try 3: top-level id (no data wrapper)
+	if idStr, ok := response.ID.(string); ok && idStr != "" {
+		return idStr
+	}
+
+	// Try 4: top-level id as object
+	if idMap, ok := response.ID.(map[string]interface{}); ok {
+		if id, ok := idMap["value"].(string); ok && id != "" {
+			return id
+		}
+		if id, ok := idMap["id"].(string); ok && id != "" {
+			return id
+		}
+	}
+
+	return ""
 }
 
 // createSessionClassic creates a session using classic OpenCode API
