@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"time"
 )
 
@@ -74,13 +75,19 @@ func (c *Client) GetSessionStatus() (SessionStatus, error) {
 }
 
 // CreateSession creates a new OpenCode session
-func (c *Client) CreateSession(name string) (*Session, error) {
+func (c *Client) CreateSession(title, directory string) (*Session, error) {
 	body := map[string]interface{}{
-		"name": name,
+		"title": title,
+	}
+
+	// Add directory query parameter if provided
+	query := ""
+	if directory != "" {
+		query = "?directory=" + url.QueryEscape(directory)
 	}
 
 	var session Session
-	if err := c.post("/session", body, &session); err != nil {
+	if err := c.post("/session"+query, body, &session); err != nil {
 		return nil, err
 	}
 
@@ -88,15 +95,21 @@ func (c *Client) CreateSession(name string) (*Session, error) {
 }
 
 // SendMessage sends a message to a session
-func (c *Client) SendMessage(sessionID, message string) error {
+func (c *Client) SendMessage(sessionID, message, directory string) error {
 	body := map[string]interface{}{
 		"parts": []MessagePart{
 			{Type: "text", Text: message},
 		},
 	}
 
+	// Add directory query parameter if provided
+	query := ""
+	if directory != "" {
+		query = "?directory=" + url.QueryEscape(directory)
+	}
+
 	var result map[string]interface{}
-	return c.post(fmt.Sprintf("/session/%s/message", sessionID), body, &result)
+	return c.post(fmt.Sprintf("/session/%s/message", sessionID)+query, body, &result)
 }
 
 // get performs a GET request
