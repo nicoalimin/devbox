@@ -108,9 +108,15 @@ func TestCreateSessionV2IDFormats(t *testing.T) {
 		wantError    bool
 	}{
 		{
-			name:         "data.id as plain string",
+			name:         "data.id as plain string (simple)",
 			responseBody: `{"data": {"id": "ses_abc123"}}`,
 			wantID:       "ses_abc123",
+			wantError:    false,
+		},
+		{
+			name:         "data.id as plain string (real OpenCode2 beta-19135 response)",
+			responseBody: `{"data":{"id":"ses_f6569f945ffeSs3ilx8iMGAHto","projectID":"bb7b415881da8d795e39037bf3fd0477118b918f","cost":0,"tokens":{"input":0,"output":0,"reasoning":0,"cache":{"read":0,"write":0}},"time":{"created":1789299918592,"updated":1789299918592},"title":"probe","location":{"directory":"/Users/nicoalimin/code/tokoboss"}}}`,
+			wantID:       "ses_f6569f945ffeSs3ilx8iMGAHto",
 			wantError:    false,
 		},
 		{
