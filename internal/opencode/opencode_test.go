@@ -5,7 +5,9 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
+	"time"
 )
 
 func TestCreateSessionV2(t *testing.T) {
@@ -365,4 +367,155 @@ func containsHelper(s, substr string) bool {
 		}
 	}
 	return false
+}
+
+func TestIsSessionBusy(t *testing.T) {
+	tests := []struct {
+		name      string
+		sessionID string
+		status    SessionStatus
+		wantBusy  bool
+		wantError bool
+	}{
+		{
+			name:      "session is busy",
+			sessionID: "session-123",
+			status: SessionStatus{
+				"session-123": SessionInfo{Status: "active", Busy: true},
+			},
+			wantBusy:  true,
+			wantError: false,
+		},
+		{
+			name:      "session is idle",
+			sessionID: "session-123",
+			status: SessionStatus{
+				"session-123": SessionInfo{Status: "idle", Busy: false},
+			},
+			wantBusy:  false,
+			wantError: false,
+		},
+		{
+			name:      "session not found",
+			sessionID: "session-456",
+			status: SessionStatus{
+				"session-123": SessionInfo{Status: "idle", Busy: false},
+			},
+			wantBusy:  false,
+			wantError: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != "/session/status" {
+					t.Errorf("Expected path /session/status, got %s", r.URL.Path)
+				}
+
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusOK)
+				json.NewEncoder(w).Encode(tt.status)
+			}))
+			defer server.Close()
+
+			client := NewClient(server.URL, "", "", "v2")
+			busy, err := client.IsSessionBusy(tt.sessionID)
+
+			if tt.wantError && err == nil {
+				t.Fatal("Expected error but got nil")
+			}
+			if !tt.wantError && err != nil {
+				t.Fatalf("Unexpected error: %v", err)
+			}
+			if busy != tt.wantBusy {
+				t.Errorf("Expected busy=%v, got %v", tt.wantBusy, busy)
+			}
+		})
+	}
+}
+
+func TestWaitForSessionIdle(t *testing.T) {
+	tests := []struct {
+		name        string
+		sessionID   string
+		statusSeq   []SessionStatus
+		timeout     time.Duration
+		wantError   bool
+		wantTimeout bool
+	}{
+		{
+			name:      "session becomes idle immediately",
+			sessionID: "session-123",
+			statusSeq: []SessionStatus{
+				{"session-123": SessionInfo{Status: "idle", Busy: false}},
+			},
+			timeout:     10 * time.Second,
+			wantError:   false,
+			wantTimeout: false,
+		},
+		{
+			name:      "session transitions from busy to idle",
+			sessionID: "session-123",
+			statusSeq: []SessionStatus{
+				{"session-123": SessionInfo{Status: "active", Busy: true}},
+				{"session-123": SessionInfo{Status: "active", Busy: true}},
+				{"session-123": SessionInfo{Status: "idle", Busy: false}},
+			},
+			timeout:     10 * time.Second,
+			wantError:   false,
+			wantTimeout: false,
+		},
+		{
+			name:      "timeout waiting for idle",
+			sessionID: "session-123",
+			statusSeq: []SessionStatus{
+				{"session-123": SessionInfo{Status: "active", Busy: true}},
+				{"session-123": SessionInfo{Status: "active", Busy: true}},
+				{"session-123": SessionInfo{Status: "active", Busy: true}},
+			},
+			timeout:     3 * time.Second,
+			wantError:   true,
+			wantTimeout: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			callCount := 0
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != "/session/status" {
+					t.Errorf("Expected path /session/status, got %s", r.URL.Path)
+				}
+
+				// Return status based on call count
+				var status SessionStatus
+				if callCount < len(tt.statusSeq) {
+					status = tt.statusSeq[callCount]
+				} else {
+					// Keep returning last status
+					status = tt.statusSeq[len(tt.statusSeq)-1]
+				}
+				callCount++
+
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusOK)
+				json.NewEncoder(w).Encode(status)
+			}))
+			defer server.Close()
+
+			client := NewClient(server.URL, "", "", "v2")
+			err := client.WaitForSessionIdle(tt.sessionID, tt.timeout)
+
+			if tt.wantError && err == nil {
+				t.Fatal("Expected error but got nil")
+			}
+			if !tt.wantError && err != nil {
+				t.Fatalf("Unexpected error: %v", err)
+			}
+			if tt.wantTimeout && err != nil && !strings.Contains(err.Error(), "timeout") {
+				t.Errorf("Expected timeout error, got: %v", err)
+			}
+		})
+	}
 }

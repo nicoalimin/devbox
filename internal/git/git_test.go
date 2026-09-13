@@ -281,3 +281,80 @@ func TestFindUniqueBranchName(t *testing.T) {
 		})
 	}
 }
+
+func TestHasCommitsAheadOfBase(t *testing.T) {
+	repoPath := setupTestRepo(t)
+	defer os.RemoveAll(repoPath)
+
+	mgr := NewManager(repoPath, "main")
+
+	// Create a worktree
+	worktree, err := mgr.CreateWorktree("TEST-COMMIT")
+	if err != nil {
+		t.Fatalf("CreateWorktree failed: %v", err)
+	}
+	defer mgr.RemoveWorktree(worktree.Path)
+
+	// Test: No commits yet (freshly created worktree)
+	hasCommits, err := mgr.HasCommitsAheadOfBase(worktree.Path)
+	if err != nil {
+		t.Fatalf("HasCommitsAheadOfBase failed: %v", err)
+	}
+	if hasCommits {
+		t.Error("Expected no commits ahead of base for fresh worktree")
+	}
+
+	// Add a commit to the worktree
+	testFile := filepath.Join(worktree.Path, "test.txt")
+	if err := os.WriteFile(testFile, []byte("test content\n"), 0644); err != nil {
+		t.Fatalf("Failed to create test file: %v", err)
+	}
+
+	cmd := exec.Command("git", "add", "test.txt")
+	cmd.Dir = worktree.Path
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("Failed to add test file: %v", err)
+	}
+
+	cmd = exec.Command("git", "commit", "-m", "Add test file")
+	cmd.Dir = worktree.Path
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("Failed to commit: %v", err)
+	}
+
+	// Test: Should now have commits ahead
+	hasCommits, err = mgr.HasCommitsAheadOfBase(worktree.Path)
+	if err != nil {
+		t.Fatalf("HasCommitsAheadOfBase failed: %v", err)
+	}
+	if !hasCommits {
+		t.Error("Expected commits ahead of base after adding commit")
+	}
+
+	// Add another commit
+	testFile2 := filepath.Join(worktree.Path, "test2.txt")
+	if err := os.WriteFile(testFile2, []byte("more content\n"), 0644); err != nil {
+		t.Fatalf("Failed to create second test file: %v", err)
+	}
+
+	cmd = exec.Command("git", "add", "test2.txt")
+	cmd.Dir = worktree.Path
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("Failed to add second test file: %v", err)
+	}
+
+	cmd = exec.Command("git", "commit", "-m", "Add second test file")
+	cmd.Dir = worktree.Path
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("Failed to commit second file: %v", err)
+	}
+
+	// Test: Should still have commits ahead
+	hasCommits, err = mgr.HasCommitsAheadOfBase(worktree.Path)
+	if err != nil {
+		t.Fatalf("HasCommitsAheadOfBase failed: %v", err)
+	}
+	if !hasCommits {
+		t.Error("Expected commits ahead of base after adding multiple commits")
+	}
+}

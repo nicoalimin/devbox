@@ -197,6 +197,54 @@ func (c *Client) SendMessage(sessionID, message, directory string) error {
 	return c.sendMessageClassic(sessionID, message, directory)
 }
 
+// IsSessionBusy checks if a specific session is busy
+func (c *Client) IsSessionBusy(sessionID string) (bool, error) {
+	status, err := c.GetSessionStatus()
+	if err != nil {
+		return false, err
+	}
+	
+	sessionInfo, exists := status[sessionID]
+	if !exists {
+		return false, fmt.Errorf("session %s not found in status", sessionID)
+	}
+	
+	return sessionInfo.Busy, nil
+}
+
+// WaitForSessionIdle polls the session status until it becomes idle or timeout
+func (c *Client) WaitForSessionIdle(sessionID string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	backoff := 2 * time.Second
+	maxBackoff := 30 * time.Second
+	
+	for {
+		if time.Now().After(deadline) {
+			return fmt.Errorf("timeout waiting for session %s to become idle after %v", sessionID, timeout)
+		}
+		
+		busy, err := c.IsSessionBusy(sessionID)
+		if err != nil {
+			// Session might not exist yet, wait and retry
+			time.Sleep(backoff)
+			if backoff < maxBackoff {
+				backoff *= 2
+			}
+			continue
+		}
+		
+		if !busy {
+			return nil
+		}
+		
+		// Wait before next check
+		time.Sleep(backoff)
+		if backoff < maxBackoff {
+			backoff *= 2
+		}
+	}
+}
+
 // sendMessageV2 sends a message using OpenCode2 /api/session/{sessionID}/prompt
 func (c *Client) sendMessageV2(sessionID, message, directory string) error {
 	body := map[string]interface{}{
