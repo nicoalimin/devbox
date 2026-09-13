@@ -229,20 +229,27 @@ func (c *Client) SendMessage(sessionID, message, directory string) error {
 
 // sendMessageV2 sends a message using OpenCode2 /api/session/{sessionID}/prompt
 func (c *Client) sendMessageV2(sessionID, message, directory string) error {
-	// OpenCode2 v2 API expects: {prompt: {text: "..."}}
-	// NOT: {parts: [...]}
+	// OpenCode2 beta-19135 expects FLAT structure with text at root level:
+	//   {"text": "message"}
+	// NOT nested: {"prompt": {"text": "message"}}
+	// NOT parts: {"parts": [{"type": "text", "text": "message"}]}
 	body := map[string]interface{}{
-		"prompt": map[string]interface{}{
-			"text": message,
-		},
+		"text": message,
 	}
 
 	// Directory is NOT sent in prompt body - it's set at session creation
-	// and routed via middleware/headers
 	
 	var result map[string]interface{}
 	path := fmt.Sprintf("/api/session/%s/prompt", sessionID)
-	return c.post(path, body, &result)
+	err := c.post(path, body, &result)
+	
+	// Log request body on failure for debugging
+	if err != nil {
+		bodyBytes, _ := json.Marshal(body)
+		return fmt.Errorf("%w (request body: %s)", err, string(bodyBytes))
+	}
+	
+	return nil
 }
 
 // sendMessageClassic sends a message using classic OpenCode API

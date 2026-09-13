@@ -205,11 +205,16 @@ func TestSendMessageV2(t *testing.T) {
 			sessionID: "session-456",
 			message:   "Add tests\n\nInclude edge cases",
 		},
+		{
+			name:      "send long coding prompt",
+			sessionID: "ses_abc123",
+			message:   "Build the Linear issue:\n\nTitle: Fix auth\nDescription: Update middleware",
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			// Create test server for OpenCode2 API
+			// Create test server for OpenCode2 beta-19135 API
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				// Verify request method and path
 				if r.Method != "POST" {
@@ -220,33 +225,28 @@ func TestSendMessageV2(t *testing.T) {
 					t.Errorf("Expected path %s, got %s", expectedPath, r.URL.Path)
 				}
 
-				// Verify request body matches OpenCode2 v2 API
+				// Verify request body matches OpenCode2 beta-19135 flat structure
 				var body map[string]interface{}
 				if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 					t.Fatalf("Failed to decode request body: %v", err)
 				}
 
-				// Verify prompt object exists
-				prompt, ok := body["prompt"].(map[string]interface{})
+				// Verify text field at ROOT level (beta-19135 format)
+				text, ok := body["text"].(string)
 				if !ok {
-					t.Fatalf("Expected 'prompt' object in body, got %v", body)
-				}
-
-				// Verify text field
-				text, ok := prompt["text"].(string)
-				if !ok {
-					t.Fatalf("Expected 'text' field in prompt, got %v", prompt)
+					t.Fatalf("Expected 'text' field at root level, got %v", body)
 				}
 				if text != tt.message {
 					t.Errorf("Expected text %q, got %q", tt.message, text)
 				}
 
-				// Verify old 'parts' format is NOT used
+				// Verify OLD formats are NOT used
+				if _, hasPrompt := body["prompt"]; hasPrompt {
+					t.Error("Body should not contain 'prompt' field (wrong nesting)")
+				}
 				if _, hasParts := body["parts"]; hasParts {
 					t.Error("Body should not contain 'parts' field (old format)")
 				}
-
-				// Verify location is NOT in body (set at session creation)
 				if _, hasLocation := body["location"]; hasLocation {
 					t.Error("Body should not contain 'location' field (set at session creation)")
 				}
@@ -256,9 +256,7 @@ func TestSendMessageV2(t *testing.T) {
 				w.WriteHeader(http.StatusOK)
 				json.NewEncoder(w).Encode(map[string]interface{}{
 					"data": map[string]interface{}{
-						"id": map[string]interface{}{
-							"value": "msg-123",
-						},
+						"id": "msg-123",
 					},
 				})
 			}))
