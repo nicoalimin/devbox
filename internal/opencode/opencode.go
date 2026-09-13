@@ -97,7 +97,14 @@ func (e *HTTPError) Error() string {
 // HealthCheck checks if OpenCode is healthy
 func (c *Client) HealthCheck() (bool, error) {
 	var health HealthResponse
-	if err := c.get("/global/health", &health); err != nil {
+	
+	// OpenCode2 uses /api/health, classic uses /global/health
+	healthPath := "/global/health"
+	if c.version == "v2" {
+		healthPath = "/api/health"
+	}
+	
+	if err := c.get(healthPath, &health); err != nil {
 		return false, err
 	}
 	return health.Healthy, nil
