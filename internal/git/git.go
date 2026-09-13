@@ -35,11 +35,22 @@ func (m *Manager) CreateWorktree(identifier string) (*WorktreeInfo, error) {
 		return nil, fmt.Errorf("failed to fetch base branch: %w", err)
 	}
 
-	// Generate branch name (e.g., devbox/ENG-123)
-	branchName := fmt.Sprintf("devbox/%s", strings.ToLower(identifier))
+	// Generate base branch name (e.g., devbox/eng-123)
+	baseBranchName := fmt.Sprintf("devbox/%s", strings.ToLower(identifier))
+	
+	// Find a unique branch name by adding suffix if needed
+	branchName, err := m.findUniqueBranchName(baseBranchName)
+	if err != nil {
+		return nil, fmt.Errorf("failed to find unique branch name: %w", err)
+	}
 
-	// Generate worktree path
+	// Generate worktree path, adding same suffix if branch name was modified
 	worktreePath := filepath.Join(m.repoPath, ".devbox-worktrees", identifier)
+	if branchName != baseBranchName {
+		// Extract suffix from branch name (e.g., "-2" from "devbox/eng-123-2")
+		suffix := strings.TrimPrefix(branchName, baseBranchName)
+		worktreePath = filepath.Join(m.repoPath, ".devbox-worktrees", identifier+suffix)
+	}
 
 	// Ensure parent directory exists
 	if err := os.MkdirAll(filepath.Dir(worktreePath), 0755); err != nil {
@@ -58,6 +69,43 @@ func (m *Manager) CreateWorktree(identifier string) (*WorktreeInfo, error) {
 		Path:       worktreePath,
 		BranchName: branchName,
 	}, nil
+}
+
+// findUniqueBranchName finds a unique branch name by adding numeric suffixes if needed
+func (m *Manager) findUniqueBranchName(baseName string) (string, error) {
+	// Check if base name is available
+	if !m.branchExists(baseName) {
+		return baseName, nil
+	}
+
+	// Try suffixed names: baseName-2, baseName-3, etc.
+	for i := 2; i <= 100; i++ {
+		candidate := fmt.Sprintf("%s-%d", baseName, i)
+		if !m.branchExists(candidate) {
+			return candidate, nil
+		}
+	}
+
+	return "", fmt.Errorf("could not find unique branch name after 100 attempts (base: %s)", baseName)
+}
+
+// branchExists checks if a branch exists locally or remotely
+func (m *Manager) branchExists(branchName string) bool {
+	// Check local branches
+	cmd := exec.Command("git", "show-ref", "--verify", "--quiet", fmt.Sprintf("refs/heads/%s", branchName))
+	cmd.Dir = m.repoPath
+	if err := cmd.Run(); err == nil {
+		return true
+	}
+
+	// Check remote branches
+	cmd = exec.Command("git", "show-ref", "--verify", "--quiet", fmt.Sprintf("refs/remotes/origin/%s", branchName))
+	cmd.Dir = m.repoPath
+	if err := cmd.Run(); err == nil {
+		return true
+	}
+
+	return false
 }
 
 // RemoveWorktree removes a git worktree
