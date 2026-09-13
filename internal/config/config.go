@@ -34,6 +34,7 @@ type LinearConfig struct {
 // OpenCodeConfig defines OpenCode integration settings
 type OpenCodeConfig struct {
 	BaseURL  string        `yaml:"base_url"`
+	Version  string        `yaml:"version"`  // "v2" or "classic" (default: v2)
 	Username string        `yaml:"username"` // Optional
 	Password string        `yaml:"password"` // Optional
 	Timeout  time.Duration `yaml:"timeout"`  // Session timeout before marking blocked
@@ -101,6 +102,9 @@ func LoadConfig(path string) (*Config, error) {
 	}
 	if cfg.OpenCode.BaseURL == "" {
 		cfg.OpenCode.BaseURL = "http://localhost:3000"
+	}
+	if cfg.OpenCode.Version == "" {
+		cfg.OpenCode.Version = "v2"
 	}
 	if cfg.OpenCode.Timeout == 0 {
 		cfg.OpenCode.Timeout = 30 * time.Minute
