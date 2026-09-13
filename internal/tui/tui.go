@@ -151,20 +151,59 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width = msg.Width
 		m.height = msg.Height
 
+		// Calculate viewport heights to fit layout exactly:
+		// Layout: Header (1) + newline (1) + Main Content + newline (1) + Footer (1) = height
+		// So: Main Content must be exactly (height - 4)
+		//
+		// Sidebar (stacked vertically):
+		//   - Jobs section: content + 2 borders
+		//   - Errors section: content + 2 borders  
+		//   - Integrations bar: ~5 lines (3 content + 2 borders)
+		//   Total sidebar = jobs_content + errors_content + 9
+		//
+		// For sidebar to equal (height - 4):
+		//   jobs_content + errors_content + 9 = height - 4
+		//   jobs_content + errors_content = height - 13
+		//   Split equally: each = (height - 13) / 2
+		//
+		// Logs pane (with borders):
+		//   logs_content + 2 = height - 4
+		//   logs_content = height - 6
+
+		sidebarWidth := 30
+		availableContentHeight := msg.Height - 4 // For the entire main content area
+		
+		// Jobs and errors split the available height, accounting for integrations bar (~5 lines)
+		sidebarJobsErrors := availableContentHeight - 5 // 5 for integrations bar
+		jobsHeight := sidebarJobsErrors/2 - 2           // -2 for each section's borders
+		errorsHeight := sidebarJobsErrors/2 - 2
+		logsHeight := availableContentHeight - 2        // -2 for logs border
+
+		// Ensure minimum heights
+		if jobsHeight < 3 {
+			jobsHeight = 3
+		}
+		if errorsHeight < 3 {
+			errorsHeight = 3
+		}
+		if logsHeight < 5 {
+			logsHeight = 5
+		}
+
 		if !m.ready {
 			// Initialize viewports with proper sizes
-			m.logsViewport = viewport.New(msg.Width-32, msg.Height-6)
-			m.jobsViewport = viewport.New(28, msg.Height/2-4)
-			m.errorsViewport = viewport.New(28, msg.Height/2-4)
+			m.logsViewport = viewport.New(msg.Width-sidebarWidth-2, logsHeight)
+			m.jobsViewport = viewport.New(sidebarWidth-2, jobsHeight)
+			m.errorsViewport = viewport.New(sidebarWidth-2, errorsHeight)
 			m.ready = true
 		} else {
 			// Update viewport sizes on resize
-			m.logsViewport.Width = msg.Width - 32
-			m.logsViewport.Height = msg.Height - 6
-			m.jobsViewport.Width = 28
-			m.jobsViewport.Height = msg.Height/2 - 4
-			m.errorsViewport.Width = 28
-			m.errorsViewport.Height = msg.Height/2 - 4
+			m.logsViewport.Width = msg.Width - sidebarWidth - 2
+			m.logsViewport.Height = logsHeight
+			m.jobsViewport.Width = sidebarWidth - 2
+			m.jobsViewport.Height = jobsHeight
+			m.errorsViewport.Width = sidebarWidth - 2
+			m.errorsViewport.Height = errorsHeight
 		}
 
 		return m, nil
@@ -300,10 +339,10 @@ func (m Model) renderMainContent() string {
 func (m Model) renderSidebar() string {
 	sidebarWidth := 30
 
-	// Jobs section
+	// Jobs section - use viewport height for consistency
 	jobsStyle := lipgloss.NewStyle().
 		Width(sidebarWidth).
-		Height(m.height/2 - 3).
+		Height(m.jobsViewport.Height).
 		BorderStyle(lipgloss.RoundedBorder()).
 		BorderForeground(m.getBorderColor(JobsPane))
 
@@ -321,10 +360,10 @@ func (m Model) renderSidebar() string {
 		m.jobsViewport.View(),
 	)
 
-	// Errors section
+	// Errors section - use viewport height for consistency
 	errorsStyle := lipgloss.NewStyle().
 		Width(sidebarWidth).
-		Height(m.height/2 - 3).
+		Height(m.errorsViewport.Height).
 		BorderStyle(lipgloss.RoundedBorder()).
 		BorderForeground(lipgloss.Color("241"))
 
@@ -464,7 +503,7 @@ func (m Model) renderIntegrationsBar() string {
 func (m Model) renderLogsPane() string {
 	logsStyle := lipgloss.NewStyle().
 		Width(m.width - 32).
-		Height(m.height - 4).
+		Height(m.logsViewport.Height).
 		BorderStyle(lipgloss.RoundedBorder()).
 		BorderForeground(m.getBorderColor(LogsPane))
 
