@@ -11,7 +11,7 @@ GOFLAGS=-ldflags="-s -w"
 all: build
 
 # Build both binaries
-build: $(SERVER_BINARY) $(CLIENT_BINARY)
+build: clean $(SERVER_BINARY) $(CLIENT_BINARY)
 
 $(SERVER_BINARY):
 	@echo "Building devboxd..."
