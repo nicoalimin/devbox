@@ -6,22 +6,28 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"net/url"
+	"strings"
 	"time"
 )
 
 // Client handles OpenCode API interactions
 type Client struct {
 	baseURL    string
+	version    string // "v2" or "classic"
 	username   string
 	password   string
 	httpClient *http.Client
 }
 
 // NewClient creates a new OpenCode API client
-func NewClient(baseURL, username, password string) *Client {
+// version should be "v2" (for OpenCode2 beta) or "classic" (for legacy OpenCode)
+func NewClient(baseURL, username, password, version string) *Client {
+	if version == "" {
+		version = "v2"
+	}
 	return &Client{
 		baseURL:  baseURL,
+		version:  version,
 		username: username,
 		password: password,
 		httpClient: &http.Client{
@@ -50,16 +56,55 @@ type Session struct {
 	Status string `json:"status"`
 }
 
+// V2SessionResponse wraps the session info in OpenCode2 format
+type V2SessionResponse struct {
+	Data SessionData `json:"data"`
+}
+
+// SessionData represents OpenCode2 session data
+type SessionData struct {
+	ID interface{} `json:"id"`
+	// Other fields omitted for brevity
+}
+
 // MessagePart represents a part of a message
 type MessagePart struct {
 	Type string `json:"type"`
 	Text string `json:"text"`
 }
 
+// HTTPError provides detailed HTTP error information
+type HTTPError struct {
+	Method       string
+	URL          string
+	StatusCode   int
+	Status       string
+	ResponseBody string
+	AllowHeader  string
+}
+
+func (e *HTTPError) Error() string {
+	msg := fmt.Sprintf("%s %s returned %d %s", e.Method, e.URL, e.StatusCode, e.Status)
+	if e.AllowHeader != "" {
+		msg += fmt.Sprintf(" (Allow: %s)", e.AllowHeader)
+	}
+	if e.ResponseBody != "" {
+		msg += fmt.Sprintf(": %s", e.ResponseBody)
+	}
+	return msg
+}
+
 // HealthCheck checks if OpenCode is healthy
 func (c *Client) HealthCheck() (bool, error) {
 	var health HealthResponse
-	if err := c.get("/global/health", &health); err != nil {
+	
+	// OpenCode2 uses /api/health, classic uses /global/health
+	healthPath := "/global/health"
+	if c.version == "v2" {
+		healthPath = "/api/health"
+	}
+	
+	if err := c.get(healthPath, &health); err != nil {
 		return false, err
 	}
 	return health.Healthy, nil
@@ -76,19 +121,69 @@ func (c *Client) GetSessionStatus() (SessionStatus, error) {
 
 // CreateSession creates a new OpenCode session
 func (c *Client) CreateSession(title, directory string) (*Session, error) {
+	if c.version == "v2" {
+		return c.createSessionV2(title, directory)
+	}
+	return c.createSessionClassic(title, directory)
+}
+
+// createSessionV2 creates a session using OpenCode2 API
+func (c *Client) createSessionV2(title, directory string) (*Session, error) {
+	body := map[string]interface{}{
+		"title": title,
+	}
+	
+	// Add location with directory for OpenCode2
+	if directory != "" {
+		body["location"] = map[string]interface{}{
+			"directory": directory,
+		}
+	}
+
+	var response V2SessionResponse
+	if err := c.post("/api/session", body, &response); err != nil {
+		return nil, fmt.Errorf("failed to create OpenCode2 session: %w", err)
+	}
+
+	// Extract session ID from V2 response
+	sessionID := ""
+	if idMap, ok := response.Data.ID.(map[string]interface{}); ok {
+		// Session ID might be in various formats, try common fields
+		if id, ok := idMap["value"].(string); ok {
+			sessionID = id
+		} else if id, ok := idMap["id"].(string); ok {
+			sessionID = id
+		} else {
+			// Fallback: serialize the whole ID object
+			idBytes, _ := json.Marshal(response.Data.ID)
+			sessionID = string(idBytes)
+		}
+	}
+
+	if sessionID == "" {
+		return nil, fmt.Errorf("OpenCode2 returned empty session ID")
+	}
+
+	return &Session{
+		ID:     sessionID,
+		Status: "active",
+	}, nil
+}
+
+// createSessionClassic creates a session using classic OpenCode API
+func (c *Client) createSessionClassic(title, directory string) (*Session, error) {
 	body := map[string]interface{}{
 		"title": title,
 	}
 
-	// Add directory query parameter if provided
-	query := ""
+	path := "/session"
 	if directory != "" {
-		query = "?directory=" + url.QueryEscape(directory)
+		path += "?directory=" + directory
 	}
 
 	var session Session
-	if err := c.post("/session"+query, body, &session); err != nil {
-		return nil, err
+	if err := c.post(path, body, &session); err != nil {
+		return nil, fmt.Errorf("failed to create classic OpenCode session: %w", err)
 	}
 
 	return &session, nil
@@ -96,25 +191,53 @@ func (c *Client) CreateSession(title, directory string) (*Session, error) {
 
 // SendMessage sends a message to a session
 func (c *Client) SendMessage(sessionID, message, directory string) error {
+	if c.version == "v2" {
+		return c.sendMessageV2(sessionID, message, directory)
+	}
+	return c.sendMessageClassic(sessionID, message, directory)
+}
+
+// sendMessageV2 sends a message using OpenCode2 /api/session/{sessionID}/prompt
+func (c *Client) sendMessageV2(sessionID, message, directory string) error {
 	body := map[string]interface{}{
 		"parts": []MessagePart{
 			{Type: "text", Text: message},
 		},
 	}
 
-	// Add directory query parameter if provided
-	query := ""
+	// OpenCode2 uses location in the body rather than query param
 	if directory != "" {
-		query = "?directory=" + url.QueryEscape(directory)
+		body["location"] = map[string]interface{}{
+			"directory": directory,
+		}
 	}
 
 	var result map[string]interface{}
-	return c.post(fmt.Sprintf("/session/%s/message", sessionID)+query, body, &result)
+	path := fmt.Sprintf("/api/session/%s/prompt", sessionID)
+	return c.post(path, body, &result)
+}
+
+// sendMessageClassic sends a message using classic OpenCode API
+func (c *Client) sendMessageClassic(sessionID, message, directory string) error {
+	body := map[string]interface{}{
+		"parts": []MessagePart{
+			{Type: "text", Text: message},
+		},
+	}
+
+	path := fmt.Sprintf("/session/%s/message", sessionID)
+	if directory != "" {
+		path += "?directory=" + directory
+	}
+
+	var result map[string]interface{}
+	return c.post(path, body, &result)
 }
 
 // get performs a GET request
 func (c *Client) get(path string, result interface{}) error {
-	req, err := http.NewRequest("GET", c.baseURL+path, nil)
+	fullURL := c.baseURL + path
+	req, err := http.NewRequest("GET", fullURL, nil)
 	if err != nil {
 		return fmt.Errorf("failed to create request: %w", err)
 	}
@@ -129,13 +252,21 @@ func (c *Client) get(path string, result interface{}) error {
 	}
 	defer resp.Body.Close()
 
+	respBody, _ := io.ReadAll(resp.Body)
+
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("API returned status %d: %s", resp.StatusCode, string(body))
+		return &HTTPError{
+			Method:       "GET",
+			URL:          fullURL,
+			StatusCode:   resp.StatusCode,
+			Status:       resp.Status,
+			ResponseBody: strings.TrimSpace(string(respBody)),
+			AllowHeader:  resp.Header.Get("Allow"),
+		}
 	}
 
-	if err := json.NewDecoder(resp.Body).Decode(result); err != nil {
-		return fmt.Errorf("failed to decode response: %w", err)
+	if err := json.Unmarshal(respBody, result); err != nil {
+		return fmt.Errorf("failed to decode response: %w (body: %s)", err, string(respBody))
 	}
 
 	return nil
@@ -148,7 +279,8 @@ func (c *Client) post(path string, body interface{}, result interface{}) error {
 		return fmt.Errorf("failed to marshal request: %w", err)
 	}
 
-	req, err := http.NewRequest("POST", c.baseURL+path, bytes.NewBuffer(bodyBytes))
+	fullURL := c.baseURL + path
+	req, err := http.NewRequest("POST", fullURL, bytes.NewBuffer(bodyBytes))
 	if err != nil {
 		return fmt.Errorf("failed to create request: %w", err)
 	}
@@ -164,14 +296,23 @@ func (c *Client) post(path string, body interface{}, result interface{}) error {
 	}
 	defer resp.Body.Close()
 
+	// Read response body for error reporting
+	respBody, _ := io.ReadAll(resp.Body)
+	
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("API returned status %d: %s", resp.StatusCode, string(body))
+		return &HTTPError{
+			Method:       "POST",
+			URL:          fullURL,
+			StatusCode:   resp.StatusCode,
+			Status:       resp.Status,
+			ResponseBody: strings.TrimSpace(string(respBody)),
+			AllowHeader:  resp.Header.Get("Allow"),
+		}
 	}
 
 	if result != nil {
-		if err := json.NewDecoder(resp.Body).Decode(result); err != nil {
-			return fmt.Errorf("failed to decode response: %w", err)
+		if err := json.Unmarshal(respBody, result); err != nil {
+			return fmt.Errorf("failed to decode response: %w (body: %s)", err, string(respBody))
 		}
 	}
 

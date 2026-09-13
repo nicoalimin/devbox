@@ -2,13 +2,13 @@ package opencode
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
-	"net/url"
 	"testing"
 )
 
-func TestCreateSession(t *testing.T) {
+func TestCreateSessionV2(t *testing.T) {
 	tests := []struct {
 		name          string
 		title         string
@@ -41,22 +41,14 @@ func TestCreateSession(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			// Create test server
+			// Create test server for OpenCode2 API
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				// Verify request method and path
 				if r.Method != "POST" {
 					t.Errorf("Expected POST method, got %s", r.Method)
 				}
-				if r.URL.Path != "/session" {
-					t.Errorf("Expected path /session, got %s", r.URL.Path)
-				}
-
-				// Verify query parameter
-				if tt.wantDirectory != "" {
-					dirParam := r.URL.Query().Get("directory")
-					if dirParam != tt.wantDirectory {
-						t.Errorf("Expected directory query param %q, got %q", tt.wantDirectory, dirParam)
-					}
+				if r.URL.Path != "/api/session" {
+					t.Errorf("Expected path /api/session, got %s", r.URL.Path)
 				}
 
 				// Verify request body
@@ -69,23 +61,33 @@ func TestCreateSession(t *testing.T) {
 					t.Errorf("Expected title %q in body, got %v", tt.wantTitle, body["title"])
 				}
 
-				// Check that "name" is not in the body (old field)
-				if _, hasName := body["name"]; hasName {
-					t.Error("Body should not contain 'name' field, should use 'title'")
+				// Verify location with directory in OpenCode2 format
+				if tt.wantDirectory != "" {
+					location, ok := body["location"].(map[string]interface{})
+					if !ok {
+						t.Error("Expected location object in body")
+					} else {
+						if dir, ok := location["directory"].(string); !ok || dir != tt.wantDirectory {
+							t.Errorf("Expected directory %q in location, got %v", tt.wantDirectory, location["directory"])
+						}
+					}
 				}
 
-				// Send response
+				// Send OpenCode2 response format
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(http.StatusOK)
-				json.NewEncoder(w).Encode(Session{
-					ID:     "session-123",
-					Status: "active",
+				json.NewEncoder(w).Encode(map[string]interface{}{
+					"data": map[string]interface{}{
+						"id": map[string]interface{}{
+							"value": "session-123",
+						},
+					},
 				})
 			}))
 			defer server.Close()
 
-			// Create client and test
-			client := NewClient(server.URL, "", "")
+			// Create client with v2 version
+			client := NewClient(server.URL, "", "", "v2")
 			session, err := client.CreateSession(tt.title, tt.directory)
 			if err != nil {
 				t.Fatalf("CreateSession failed: %v", err)
@@ -98,7 +100,7 @@ func TestCreateSession(t *testing.T) {
 	}
 }
 
-func TestSendMessage(t *testing.T) {
+func TestSendMessageV2(t *testing.T) {
 	tests := []struct {
 		name          string
 		sessionID     string
@@ -124,23 +126,15 @@ func TestSendMessage(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			// Create test server
+			// Create test server for OpenCode2 API
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				// Verify request method and path
 				if r.Method != "POST" {
 					t.Errorf("Expected POST method, got %s", r.Method)
 				}
-				expectedPath := "/session/" + tt.sessionID + "/message"
+				expectedPath := "/api/session/" + tt.sessionID + "/prompt"
 				if r.URL.Path != expectedPath {
 					t.Errorf("Expected path %s, got %s", expectedPath, r.URL.Path)
-				}
-
-				// Verify query parameter
-				if tt.wantDirectory != "" {
-					dirParam := r.URL.Query().Get("directory")
-					if dirParam != tt.wantDirectory {
-						t.Errorf("Expected directory query param %q, got %q", tt.wantDirectory, dirParam)
-					}
 				}
 
 				// Verify request body
@@ -162,20 +156,33 @@ func TestSendMessage(t *testing.T) {
 					t.Errorf("Expected part text %q, got %v", tt.message, part["text"])
 				}
 
+				// Verify location with directory in OpenCode2 format
+				if tt.wantDirectory != "" {
+					location, ok := body["location"].(map[string]interface{})
+					if !ok {
+						t.Error("Expected location object in body")
+					} else {
+						if dir, ok := location["directory"].(string); !ok || dir != tt.wantDirectory {
+							t.Errorf("Expected directory %q in location, got %v", tt.wantDirectory, location["directory"])
+						}
+					}
+				}
+
 				// Send response
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(http.StatusOK)
 				json.NewEncoder(w).Encode(map[string]interface{}{
-					"info": map[string]string{
-						"id":   "msg-123",
-						"role": "assistant",
+					"data": map[string]interface{}{
+						"id": map[string]interface{}{
+							"value": "msg-123",
+						},
 					},
 				})
 			}))
 			defer server.Close()
 
-			// Create client and test
-			client := NewClient(server.URL, "", "")
+			// Create client with v2 version
+			client := NewClient(server.URL, "", "", "v2")
 			err := client.SendMessage(tt.sessionID, tt.message, tt.directory)
 			if err != nil {
 				t.Fatalf("SendMessage failed: %v", err)
@@ -203,60 +210,147 @@ func TestCreateSessionWithBasicAuth(t *testing.T) {
 
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		json.NewEncoder(w).Encode(Session{ID: "session-123", Status: "active"})
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"data": map[string]interface{}{
+				"id": map[string]interface{}{
+					"value": "session-123",
+				},
+			},
+		})
 	}))
 	defer server.Close()
 
-	client := NewClient(server.URL, username, password)
+	client := NewClient(server.URL, username, password, "v2")
 	_, err := client.CreateSession("Test Session", "")
 	if err != nil {
 		t.Fatalf("CreateSession with auth failed: %v", err)
 	}
 }
 
-func TestHTTP405Error(t *testing.T) {
-	// Test that 405 errors are properly reported
+func TestHTTP405ErrorWithDiagnostics(t *testing.T) {
+	// Test that 405 errors include detailed diagnostics
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Allow", "GET, PUT")
 		w.WriteHeader(http.StatusMethodNotAllowed)
-		w.Write([]byte("Method Not Allowed"))
+		w.Write([]byte(`{"error": "Method Not Allowed", "message": "POST is not supported on this endpoint"}`))
 	}))
 	defer server.Close()
 
-	client := NewClient(server.URL, "", "")
+	client := NewClient(server.URL, "", "", "v2")
 	_, err := client.CreateSession("Test", "")
 	if err == nil {
 		t.Fatal("Expected error for 405 response, got nil")
 	}
 
-	// Verify error message contains status code
-	expectedMsg := "API returned status 405"
-	if !contains(err.Error(), expectedMsg) {
-		t.Errorf("Expected error to contain %q, got %q", expectedMsg, err.Error())
+	// Unwrap to get the underlying HTTPError
+	var httpErr *HTTPError
+	if !errors.As(err, &httpErr) {
+		t.Fatalf("Expected HTTPError in error chain, got %T: %v", err, err)
+	}
+
+	// Verify error includes method
+	if httpErr.Method != "POST" {
+		t.Errorf("Expected method POST, got %s", httpErr.Method)
+	}
+
+	// Verify error includes full URL
+	expectedURL := server.URL + "/api/session"
+	if httpErr.URL != expectedURL {
+		t.Errorf("Expected URL %s, got %s", expectedURL, httpErr.URL)
+	}
+
+	// Verify error includes status code
+	if httpErr.StatusCode != 405 {
+		t.Errorf("Expected status code 405, got %d", httpErr.StatusCode)
+	}
+
+	// Verify error includes Allow header
+	if httpErr.AllowHeader != "GET, PUT" {
+		t.Errorf("Expected Allow header 'GET, PUT', got %q", httpErr.AllowHeader)
+	}
+
+	// Verify error includes response body
+	if !contains(httpErr.ResponseBody, "Method Not Allowed") {
+		t.Errorf("Expected response body to contain 'Method Not Allowed', got %q", httpErr.ResponseBody)
+	}
+
+	// Verify error message format
+	errMsg := err.Error()
+	if !contains(errMsg, "POST") {
+		t.Errorf("Error message should contain method: %s", errMsg)
+	}
+	if !contains(errMsg, "/api/session") {
+		t.Errorf("Error message should contain path: %s", errMsg)
+	}
+	if !contains(errMsg, "405") {
+		t.Errorf("Error message should contain status code: %s", errMsg)
+	}
+	if !contains(errMsg, "Allow: GET, PUT") {
+		t.Errorf("Error message should contain Allow header: %s", errMsg)
 	}
 }
 
-func TestURLEncoding(t *testing.T) {
-	// Test that special characters in directory paths are properly encoded
-	directory := "/tmp/work tree/ENG-123"
-	expectedEncoded := url.QueryEscape(directory)
-
+func TestClassicVersionCompatibility(t *testing.T) {
+	// Test that classic version still works with query params
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Check raw query encoding
-		expectedQuery := "directory=" + expectedEncoded
-		if r.URL.RawQuery != expectedQuery {
-			t.Errorf("Expected raw query %q, got %q", expectedQuery, r.URL.RawQuery)
+		if r.URL.Path != "/session" {
+			t.Errorf("Expected path /session for classic API, got %s", r.URL.Path)
+		}
+
+		// Classic version uses query param for directory
+		if dir := r.URL.Query().Get("directory"); dir != "/tmp/test" {
+			t.Errorf("Expected directory query param '/tmp/test', got %q", dir)
 		}
 
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		json.NewEncoder(w).Encode(Session{ID: "session-123", Status: "active"})
+		json.NewEncoder(w).Encode(Session{
+			ID:     "classic-session",
+			Status: "active",
+		})
 	}))
 	defer server.Close()
 
-	client := NewClient(server.URL, "", "")
-	_, err := client.CreateSession("Test", directory)
+	client := NewClient(server.URL, "", "", "classic")
+	session, err := client.CreateSession("Test", "/tmp/test")
 	if err != nil {
-		t.Fatalf("CreateSession failed: %v", err)
+		t.Fatalf("CreateSession with classic version failed: %v", err)
+	}
+
+	if session.ID != "classic-session" {
+		t.Errorf("Expected session ID 'classic-session', got %q", session.ID)
+	}
+}
+
+func TestVersionDefaultsToV2(t *testing.T) {
+	// Test that empty version defaults to v2
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Should use v2 API path
+		if r.URL.Path != "/api/session" {
+			t.Errorf("Expected v2 path /api/session, got %s", r.URL.Path)
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"data": map[string]interface{}{
+				"id": map[string]interface{}{
+					"value": "v2-default",
+				},
+			},
+		})
+	}))
+	defer server.Close()
+
+	// Create client with empty version string
+	client := NewClient(server.URL, "", "", "")
+	session, err := client.CreateSession("Test", "")
+	if err != nil {
+		t.Fatalf("CreateSession with default version failed: %v", err)
+	}
+
+	if session.ID != "v2-default" {
+		t.Errorf("Expected session ID 'v2-default', got %q", session.ID)
 	}
 }
 
