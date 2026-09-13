@@ -1,0 +1,283 @@
+package git
+
+import (
+	"os"
+	"os/exec"
+	"path/filepath"
+	"testing"
+)
+
+// setupTestRepo creates a temporary git repository for testing
+func setupTestRepo(t *testing.T) string {
+	t.Helper()
+	
+	// Create a "remote" repo first
+	remoteDir, err := os.MkdirTemp("", "devbox-git-remote-*")
+	if err != nil {
+		t.Fatalf("failed to create temp remote dir: %v", err)
+	}
+
+	cmd := exec.Command("git", "init", "--bare")
+	cmd.Dir = remoteDir
+	if err := cmd.Run(); err != nil {
+		os.RemoveAll(remoteDir)
+		t.Fatalf("failed to init bare remote repo: %v", err)
+	}
+
+	// Create a local repo
+	tmpDir, err := os.MkdirTemp("", "devbox-git-test-*")
+	if err != nil {
+		os.RemoveAll(remoteDir)
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+
+	// Initialize git repo
+	cmd = exec.Command("git", "init")
+	cmd.Dir = tmpDir
+	if err := cmd.Run(); err != nil {
+		os.RemoveAll(tmpDir)
+		os.RemoveAll(remoteDir)
+		t.Fatalf("failed to init git repo: %v", err)
+	}
+
+	// Configure git
+	cmd = exec.Command("git", "config", "user.name", "Test User")
+	cmd.Dir = tmpDir
+	cmd.Run()
+	cmd = exec.Command("git", "config", "user.email", "test@example.com")
+	cmd.Dir = tmpDir
+	cmd.Run()
+
+	// Add origin remote
+	cmd = exec.Command("git", "remote", "add", "origin", remoteDir)
+	cmd.Dir = tmpDir
+	if err := cmd.Run(); err != nil {
+		os.RemoveAll(tmpDir)
+		os.RemoveAll(remoteDir)
+		t.Fatalf("failed to add remote: %v", err)
+	}
+
+	// Create initial commit
+	readmePath := filepath.Join(tmpDir, "README.md")
+	if err := os.WriteFile(readmePath, []byte("# Test Repo\n"), 0644); err != nil {
+		os.RemoveAll(tmpDir)
+		os.RemoveAll(remoteDir)
+		t.Fatalf("failed to create README: %v", err)
+	}
+
+	cmd = exec.Command("git", "add", "README.md")
+	cmd.Dir = tmpDir
+	if err := cmd.Run(); err != nil {
+		os.RemoveAll(tmpDir)
+		os.RemoveAll(remoteDir)
+		t.Fatalf("failed to add README: %v", err)
+	}
+
+	cmd = exec.Command("git", "commit", "-m", "Initial commit")
+	cmd.Dir = tmpDir
+	if err := cmd.Run(); err != nil {
+		os.RemoveAll(tmpDir)
+		os.RemoveAll(remoteDir)
+		t.Fatalf("failed to create initial commit: %v", err)
+	}
+
+	// Rename default branch to main (in case it's master)
+	cmd = exec.Command("git", "branch", "-M", "main")
+	cmd.Dir = tmpDir
+	cmd.Run()
+
+	// Push to remote
+	cmd = exec.Command("git", "push", "-u", "origin", "main")
+	cmd.Dir = tmpDir
+	if err := cmd.Run(); err != nil {
+		os.RemoveAll(tmpDir)
+		os.RemoveAll(remoteDir)
+		t.Fatalf("failed to push to remote: %v", err)
+	}
+
+	// Store remote path for cleanup
+	t.Cleanup(func() {
+		os.RemoveAll(remoteDir)
+	})
+
+	return tmpDir
+}
+
+// createBranch creates a branch in the test repo
+func createBranch(t *testing.T, repoPath, branchName string) {
+	t.Helper()
+	
+	cmd := exec.Command("git", "branch", branchName)
+	cmd.Dir = repoPath
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("failed to create branch %s: %v", branchName, err)
+	}
+}
+
+func TestCreateWorktree_Success(t *testing.T) {
+	repoPath := setupTestRepo(t)
+	defer os.RemoveAll(repoPath)
+
+	mgr := NewManager(repoPath, "main")
+	
+	worktree, err := mgr.CreateWorktree("TEST-123")
+	if err != nil {
+		t.Fatalf("CreateWorktree failed: %v", err)
+	}
+
+	if worktree.BranchName != "devbox/test-123" {
+		t.Errorf("expected branch name 'devbox/test-123', got '%s'", worktree.BranchName)
+	}
+
+	expectedPath := filepath.Join(repoPath, ".devbox-worktrees", "TEST-123")
+	if worktree.Path != expectedPath {
+		t.Errorf("expected path '%s', got '%s'", expectedPath, worktree.Path)
+	}
+
+	// Verify worktree exists
+	if _, err := os.Stat(worktree.Path); os.IsNotExist(err) {
+		t.Error("worktree path does not exist")
+	}
+
+	// Cleanup
+	mgr.RemoveWorktree(worktree.Path)
+}
+
+func TestCreateWorktree_CollisionHandling(t *testing.T) {
+	repoPath := setupTestRepo(t)
+	defer os.RemoveAll(repoPath)
+
+	mgr := NewManager(repoPath, "main")
+	
+	// Create a branch that will conflict
+	createBranch(t, repoPath, "devbox/test-456")
+
+	// Now try to create a worktree with the same identifier
+	worktree, err := mgr.CreateWorktree("TEST-456")
+	if err != nil {
+		t.Fatalf("CreateWorktree failed with collision: %v", err)
+	}
+
+	// Should have created with suffix
+	if worktree.BranchName != "devbox/test-456-2" {
+		t.Errorf("expected branch name 'devbox/test-456-2', got '%s'", worktree.BranchName)
+	}
+
+	expectedPath := filepath.Join(repoPath, ".devbox-worktrees", "TEST-456-2")
+	if worktree.Path != expectedPath {
+		t.Errorf("expected path '%s', got '%s'", expectedPath, worktree.Path)
+	}
+
+	// Verify worktree exists
+	if _, err := os.Stat(worktree.Path); os.IsNotExist(err) {
+		t.Error("worktree path does not exist")
+	}
+
+	// Cleanup
+	mgr.RemoveWorktree(worktree.Path)
+}
+
+func TestCreateWorktree_MultipleCollisions(t *testing.T) {
+	repoPath := setupTestRepo(t)
+	defer os.RemoveAll(repoPath)
+
+	mgr := NewManager(repoPath, "main")
+	
+	// Create branches that will conflict
+	createBranch(t, repoPath, "devbox/test-789")
+	createBranch(t, repoPath, "devbox/test-789-2")
+	createBranch(t, repoPath, "devbox/test-789-3")
+
+	// Now try to create a worktree with the same identifier
+	worktree, err := mgr.CreateWorktree("TEST-789")
+	if err != nil {
+		t.Fatalf("CreateWorktree failed with multiple collisions: %v", err)
+	}
+
+	// Should have created with suffix -4
+	if worktree.BranchName != "devbox/test-789-4" {
+		t.Errorf("expected branch name 'devbox/test-789-4', got '%s'", worktree.BranchName)
+	}
+
+	expectedPath := filepath.Join(repoPath, ".devbox-worktrees", "TEST-789-4")
+	if worktree.Path != expectedPath {
+		t.Errorf("expected path '%s', got '%s'", expectedPath, worktree.Path)
+	}
+
+	// Cleanup
+	mgr.RemoveWorktree(worktree.Path)
+}
+
+func TestBranchExists(t *testing.T) {
+	repoPath := setupTestRepo(t)
+	defer os.RemoveAll(repoPath)
+
+	mgr := NewManager(repoPath, "main")
+	
+	// Test non-existent branch
+	if mgr.branchExists("devbox/nonexistent") {
+		t.Error("branchExists returned true for non-existent branch")
+	}
+
+	// Create a branch and test
+	createBranch(t, repoPath, "devbox/exists")
+	if !mgr.branchExists("devbox/exists") {
+		t.Error("branchExists returned false for existing branch")
+	}
+}
+
+func TestFindUniqueBranchName(t *testing.T) {
+	repoPath := setupTestRepo(t)
+	defer os.RemoveAll(repoPath)
+
+	mgr := NewManager(repoPath, "main")
+	
+	tests := []struct {
+		name           string
+		baseName       string
+		existingBranches []string
+		expected       string
+	}{
+		{
+			name:           "no collision",
+			baseName:       "devbox/test-1",
+			existingBranches: []string{},
+			expected:       "devbox/test-1",
+		},
+		{
+			name:           "one collision",
+			baseName:       "devbox/test-2",
+			existingBranches: []string{"devbox/test-2"},
+			expected:       "devbox/test-2-2",
+		},
+		{
+			name:           "multiple collisions",
+			baseName:       "devbox/test-3",
+			existingBranches: []string{"devbox/test-3", "devbox/test-3-2", "devbox/test-3-3"},
+			expected:       "devbox/test-3-4",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Create existing branches
+			for _, branch := range tt.existingBranches {
+				createBranch(t, repoPath, branch)
+			}
+
+			result, err := mgr.findUniqueBranchName(tt.baseName)
+			if err != nil {
+				t.Fatalf("findUniqueBranchName failed: %v", err)
+			}
+
+			if result != tt.expected {
+				t.Errorf("expected '%s', got '%s'", tt.expected, result)
+			}
+
+			// Cleanup branches for next test
+			for _, branch := range tt.existingBranches {
+				exec.Command("git", "branch", "-D", branch).Run()
+			}
+		})
+	}
+}
