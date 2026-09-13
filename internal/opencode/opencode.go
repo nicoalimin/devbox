@@ -229,19 +229,17 @@ func (c *Client) SendMessage(sessionID, message, directory string) error {
 
 // sendMessageV2 sends a message using OpenCode2 /api/session/{sessionID}/prompt
 func (c *Client) sendMessageV2(sessionID, message, directory string) error {
+	// OpenCode2 v2 API expects: {prompt: {text: "..."}}
+	// NOT: {parts: [...]}
 	body := map[string]interface{}{
-		"parts": []MessagePart{
-			{Type: "text", Text: message},
+		"prompt": map[string]interface{}{
+			"text": message,
 		},
 	}
 
-	// OpenCode2 uses location in the body rather than query param
-	if directory != "" {
-		body["location"] = map[string]interface{}{
-			"directory": directory,
-		}
-	}
-
+	// Directory is NOT sent in prompt body - it's set at session creation
+	// and routed via middleware/headers
+	
 	var result map[string]interface{}
 	path := fmt.Sprintf("/api/session/%s/prompt", sessionID)
 	return c.post(path, body, &result)

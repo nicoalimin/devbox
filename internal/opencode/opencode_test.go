@@ -191,25 +191,19 @@ func TestCreateSessionV2IDFormats(t *testing.T) {
 
 func TestSendMessageV2(t *testing.T) {
 	tests := []struct {
-		name          string
-		sessionID     string
-		message       string
-		directory     string
-		wantDirectory string
+		name      string
+		sessionID string
+		message   string
 	}{
 		{
-			name:          "send message with directory",
-			sessionID:     "session-123",
-			message:       "Fix the authentication bug",
-			directory:     "/tmp/worktree/ENG-123",
-			wantDirectory: "/tmp/worktree/ENG-123",
+			name:      "send message",
+			sessionID: "session-123",
+			message:   "Fix the authentication bug",
 		},
 		{
-			name:          "send message without directory",
-			sessionID:     "session-456",
-			message:       "Add tests",
-			directory:     "",
-			wantDirectory: "",
+			name:      "send message with newlines",
+			sessionID: "session-456",
+			message:   "Add tests\n\nInclude edge cases",
 		},
 	}
 
@@ -226,35 +220,35 @@ func TestSendMessageV2(t *testing.T) {
 					t.Errorf("Expected path %s, got %s", expectedPath, r.URL.Path)
 				}
 
-				// Verify request body
+				// Verify request body matches OpenCode2 v2 API
 				var body map[string]interface{}
 				if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 					t.Fatalf("Failed to decode request body: %v", err)
 				}
 
-				parts, ok := body["parts"].([]interface{})
-				if !ok || len(parts) != 1 {
-					t.Fatalf("Expected parts array with 1 element, got %v", body["parts"])
+				// Verify prompt object exists
+				prompt, ok := body["prompt"].(map[string]interface{})
+				if !ok {
+					t.Fatalf("Expected 'prompt' object in body, got %v", body)
 				}
 
-				part := parts[0].(map[string]interface{})
-				if part["type"] != "text" {
-					t.Errorf("Expected part type 'text', got %v", part["type"])
+				// Verify text field
+				text, ok := prompt["text"].(string)
+				if !ok {
+					t.Fatalf("Expected 'text' field in prompt, got %v", prompt)
 				}
-				if part["text"] != tt.message {
-					t.Errorf("Expected part text %q, got %v", tt.message, part["text"])
+				if text != tt.message {
+					t.Errorf("Expected text %q, got %q", tt.message, text)
 				}
 
-				// Verify location with directory in OpenCode2 format
-				if tt.wantDirectory != "" {
-					location, ok := body["location"].(map[string]interface{})
-					if !ok {
-						t.Error("Expected location object in body")
-					} else {
-						if dir, ok := location["directory"].(string); !ok || dir != tt.wantDirectory {
-							t.Errorf("Expected directory %q in location, got %v", tt.wantDirectory, location["directory"])
-						}
-					}
+				// Verify old 'parts' format is NOT used
+				if _, hasParts := body["parts"]; hasParts {
+					t.Error("Body should not contain 'parts' field (old format)")
+				}
+
+				// Verify location is NOT in body (set at session creation)
+				if _, hasLocation := body["location"]; hasLocation {
+					t.Error("Body should not contain 'location' field (set at session creation)")
 				}
 
 				// Send response
@@ -272,7 +266,8 @@ func TestSendMessageV2(t *testing.T) {
 
 			// Create client with v2 version
 			client := NewClient(server.URL, "", "", "v2")
-			err := client.SendMessage(tt.sessionID, tt.message, tt.directory)
+			// Directory parameter is ignored in v2 (set at session creation)
+			err := client.SendMessage(tt.sessionID, tt.message, "/ignored/directory")
 			if err != nil {
 				t.Fatalf("SendMessage failed: %v", err)
 			}
