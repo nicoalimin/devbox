@@ -100,6 +100,95 @@ func TestCreateSessionV2(t *testing.T) {
 	}
 }
 
+func TestCreateSessionV2IDFormats(t *testing.T) {
+	tests := []struct {
+		name         string
+		responseBody string
+		wantID       string
+		wantError    bool
+	}{
+		{
+			name:         "data.id as plain string (simple)",
+			responseBody: `{"data": {"id": "ses_abc123"}}`,
+			wantID:       "ses_abc123",
+			wantError:    false,
+		},
+		{
+			name:         "data.id as plain string (real OpenCode2 beta-19135 response)",
+			responseBody: `{"data":{"id":"ses_f6569f945ffeSs3ilx8iMGAHto","projectID":"bb7b415881da8d795e39037bf3fd0477118b918f","cost":0,"tokens":{"input":0,"output":0,"reasoning":0,"cache":{"read":0,"write":0}},"time":{"created":1789299918592,"updated":1789299918592},"title":"probe","location":{"directory":"/Users/nicoalimin/code/tokoboss"}}}`,
+			wantID:       "ses_f6569f945ffeSs3ilx8iMGAHto",
+			wantError:    false,
+		},
+		{
+			name:         "data.id with value field",
+			responseBody: `{"data": {"id": {"value": "ses_xyz789"}}}`,
+			wantID:       "ses_xyz789",
+			wantError:    false,
+		},
+		{
+			name:         "data.id with id field",
+			responseBody: `{"data": {"id": {"id": "ses_nested123"}}}`,
+			wantID:       "ses_nested123",
+			wantError:    false,
+		},
+		{
+			name:         "top-level id as string",
+			responseBody: `{"id": "ses_toplevel"}`,
+			wantID:       "ses_toplevel",
+			wantError:    false,
+		},
+		{
+			name:         "top-level id with value",
+			responseBody: `{"id": {"value": "ses_topvalue"}}`,
+			wantID:       "ses_topvalue",
+			wantError:    false,
+		},
+		{
+			name:         "empty id returns error with response",
+			responseBody: `{"data": {"id": ""}}`,
+			wantID:       "",
+			wantError:    true,
+		},
+		{
+			name:         "missing id returns error with response",
+			responseBody: `{"data": {"status": "active"}}`,
+			wantID:       "",
+			wantError:    true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusOK)
+				w.Write([]byte(tt.responseBody))
+			}))
+			defer server.Close()
+
+			client := NewClient(server.URL, "", "", "v2")
+			session, err := client.CreateSession("Test", "/tmp/test")
+
+			if tt.wantError {
+				if err == nil {
+					t.Fatal("Expected error, got nil")
+				}
+				// Verify error includes response body
+				if !contains(err.Error(), "response:") {
+					t.Errorf("Error should include response body, got: %v", err)
+				}
+			} else {
+				if err != nil {
+					t.Fatalf("Unexpected error: %v", err)
+				}
+				if session.ID != tt.wantID {
+					t.Errorf("Expected session ID %q, got %q", tt.wantID, session.ID)
+				}
+			}
+		})
+	}
+}
+
 func TestSendMessageV2(t *testing.T) {
 	tests := []struct {
 		name          string
