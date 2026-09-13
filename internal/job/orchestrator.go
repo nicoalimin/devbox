@@ -203,7 +203,7 @@ func (o *Orchestrator) executeCoding(job *db.Job) error {
 
 	// Create OpenCode session
 	sessionName := fmt.Sprintf("%s: %s", issue.Identifier, issue.Title)
-	session, err := o.opencode.CreateSession(sessionName)
+	session, err := o.opencode.CreateSession(sessionName, job.WorktreePath)
 	if err != nil {
 		return err
 	}
@@ -217,7 +217,7 @@ func (o *Orchestrator) executeCoding(job *db.Job) error {
 	prompt := o.buildCodingPrompt(issue)
 
 	// Send task to OpenCode
-	if err := o.opencode.SendMessage(session.ID, prompt); err != nil {
+	if err := o.opencode.SendMessage(session.ID, prompt, job.WorktreePath); err != nil {
 		return err
 	}
 
@@ -248,7 +248,7 @@ func (o *Orchestrator) reviewCode(job *db.Job) error {
 
 If you find issues, fix them now. If everything looks good, confirm the changes are ready.`
 
-	if err := o.opencode.SendMessage(job.OpenCodeSessionID, reviewPrompt); err != nil {
+	if err := o.opencode.SendMessage(job.OpenCodeSessionID, reviewPrompt, job.WorktreePath); err != nil {
 		return err
 	}
 
@@ -473,7 +473,7 @@ func (o *Orchestrator) ReplyToJob(jobID, message string) error {
 
 	// Send reply to OpenCode
 	if job.OpenCodeSessionID != "" {
-		if err := o.opencode.SendMessage(job.OpenCodeSessionID, message); err != nil {
+		if err := o.opencode.SendMessage(job.OpenCodeSessionID, message, job.WorktreePath); err != nil {
 			return fmt.Errorf("failed to send message to OpenCode: %w", err)
 		}
 	}
