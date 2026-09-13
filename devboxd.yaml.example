@@ -8,6 +8,7 @@ linear:
   workspace_id: ""                        # Optional: workspace ID
 
 opencode:
+  version: v2
   base_url: "http://localhost:3000"
   timeout: "30m"                          # Mark blocked after this timeout
   # username: ""                          # Optional auth
