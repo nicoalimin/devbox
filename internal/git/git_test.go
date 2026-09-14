@@ -622,6 +622,12 @@ https://github.com/owner/repo/pull/15`,
 			expected: "https://github.com/owner/repo/pull/15",
 		},
 		{
+			name: "exact production error format from UTA-12",
+			output: `a pull request for branch "devbox/uta-12-2" into branch "main" already exists:
+https://github.com/nicoalimin/tokoboss/pull/9`,
+			expected: "https://github.com/nicoalimin/tokoboss/pull/9",
+		},
+		{
 			name:     "error with extra whitespace",
 			output:   "a pull request for branch ... already exists:    https://github.com/owner/repo/pull/42   ",
 			expected: "https://github.com/owner/repo/pull/42",
