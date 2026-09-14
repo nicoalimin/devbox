@@ -2,6 +2,7 @@ package db
 
 import (
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -644,5 +645,173 @@ func TestGetCurrentJobWithMultipleStates(t *testing.T) {
 		t.Errorf("Expected job-coding, got nil")
 	} else if current.ID != "job-coding" {
 		t.Errorf("Expected job-coding, got %s", current.ID)
+	}
+}
+
+// TestMigrationEmptyDatabase tests that migrations work on a fresh database
+func TestMigrationEmptyDatabase(t *testing.T) {
+	dbPath := "test_migration_empty.db"
+	defer os.Remove(dbPath)
+	defer os.Remove(dbPath + "-shm")
+	defer os.Remove(dbPath + "-wal")
+
+	// Open database - should run migrations
+	db, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Failed to open empty database: %v", err)
+	}
+	defer db.Close()
+
+	// Verify schema exists by creating a job with all columns
+	now := time.Now()
+	codingWaitStarted := now.Add(-5 * time.Minute)
+	reviewingWaitStarted := now.Add(-2 * time.Minute)
+	
+	job := &Job{
+		ID:                     "migration-test-1",
+		LinearIssueID:          "ENG-MIGRATE-1",
+		LinearURL:              "https://linear.app/test/ENG-MIGRATE-1",
+		State:                  StateCoding,
+		RepoPath:               "/test/repo",
+		BranchName:             "eng-migrate-1",
+		WorktreePath:           "/test/worktree",
+		PRURL:                  "",
+		BlockerReason:          "",
+		OpenCodeSessionID:      "session-123",
+		OperatorContext:        "test context",
+		ReviewFeedback:         "",
+		CodingWaitStartedAt:    &codingWaitStarted,
+		ReviewingWaitStartedAt: &reviewingWaitStarted,
+		CreatedAt:              now,
+		UpdatedAt:              now,
+		CompletedAt:            nil,
+	}
+
+	if err := db.CreateJob(job); err != nil {
+		t.Fatalf("Failed to create job after migration: %v", err)
+	}
+
+	// Retrieve and verify all fields including wait timestamps
+	retrieved, err := db.GetJob(job.ID)
+	if err != nil {
+		t.Fatalf("Failed to retrieve job: %v", err)
+	}
+
+	if retrieved == nil {
+		t.Fatal("Retrieved job is nil")
+	}
+
+	if retrieved.CodingWaitStartedAt == nil {
+		t.Error("CodingWaitStartedAt should not be nil")
+	} else if !retrieved.CodingWaitStartedAt.Equal(codingWaitStarted) {
+		t.Errorf("CodingWaitStartedAt mismatch: expected %v, got %v", codingWaitStarted, *retrieved.CodingWaitStartedAt)
+	}
+
+	if retrieved.ReviewingWaitStartedAt == nil {
+		t.Error("ReviewingWaitStartedAt should not be nil")
+	} else if !retrieved.ReviewingWaitStartedAt.Equal(reviewingWaitStarted) {
+		t.Errorf("ReviewingWaitStartedAt mismatch: expected %v, got %v", reviewingWaitStarted, *retrieved.ReviewingWaitStartedAt)
+	}
+}
+
+// TestMigrationIdempotent tests that reopening a database is idempotent
+func TestMigrationIdempotent(t *testing.T) {
+	dbPath := "test_migration_idempotent.db"
+	defer os.Remove(dbPath)
+	defer os.Remove(dbPath + "-shm")
+	defer os.Remove(dbPath + "-wal")
+
+	// Open database first time
+	db1, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Failed to open database (first time): %v", err)
+	}
+
+	// Create a job
+	job := &Job{
+		ID:            "idempotent-test",
+		LinearIssueID: "ENG-IDEM-1",
+		State:         StateCoding,
+		CreatedAt:     time.Now(),
+		UpdatedAt:     time.Now(),
+	}
+	if err := db1.CreateJob(job); err != nil {
+		t.Fatalf("Failed to create job: %v", err)
+	}
+	db1.Close()
+
+	// Reopen database - migrations should be idempotent (no error)
+	db2, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Failed to reopen database: %v", err)
+	}
+	defer db2.Close()
+
+	// Verify job still exists
+	retrieved, err := db2.GetJob(job.ID)
+	if err != nil {
+		t.Fatalf("Failed to retrieve job after reopen: %v", err)
+	}
+	if retrieved == nil {
+		t.Fatal("Job was lost after reopen")
+	}
+	if retrieved.ID != job.ID {
+		t.Errorf("Job ID mismatch: expected %s, got %s", job.ID, retrieved.ID)
+	}
+
+	// Close and reopen a third time to ensure idempotency
+	db2.Close()
+	db3, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Failed to reopen database (third time): %v", err)
+	}
+	defer db3.Close()
+
+	// Verify job still exists
+	retrieved3, err := db3.GetJob(job.ID)
+	if err != nil {
+		t.Fatalf("Failed to retrieve job after third reopen: %v", err)
+	}
+	if retrieved3 == nil {
+		t.Fatal("Job was lost after third reopen")
+	}
+}
+
+// TestDirectoryCreation tests that parent directories are created automatically
+func TestDirectoryCreation(t *testing.T) {
+	testDir := "test_subdir/nested/path"
+	dbPath := filepath.Join(testDir, "jobs.db")
+	
+	// Clean up before and after
+	defer os.RemoveAll("test_subdir")
+	os.RemoveAll("test_subdir")
+
+	// Open database in nested directory
+	db, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Failed to open database in nested directory: %v", err)
+	}
+	defer db.Close()
+
+	// Verify directory was created
+	if _, err := os.Stat(testDir); os.IsNotExist(err) {
+		t.Errorf("Parent directory was not created: %s", testDir)
+	}
+
+	// Verify database file exists
+	if _, err := os.Stat(dbPath); os.IsNotExist(err) {
+		t.Errorf("Database file was not created: %s", dbPath)
+	}
+
+	// Verify we can use the database
+	job := &Job{
+		ID:            "dir-test",
+		LinearIssueID: "ENG-DIR-1",
+		State:         StateQueued,
+		CreatedAt:     time.Now(),
+		UpdatedAt:     time.Now(),
+	}
+	if err := db.CreateJob(job); err != nil {
+		t.Fatalf("Failed to create job in nested database: %v", err)
 	}
 }

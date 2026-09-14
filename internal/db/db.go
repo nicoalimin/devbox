@@ -4,13 +4,19 @@ import (
 	"database/sql"
 	"embed"
 	"fmt"
+	"io/fs"
+	"os"
+	"path/filepath"
 	"time"
 
+	"github.com/golang-migrate/migrate/v4"
+	"github.com/golang-migrate/migrate/v4/database/sqlite3"
+	"github.com/golang-migrate/migrate/v4/source/iofs"
 	_ "github.com/mattn/go-sqlite3"
 )
 
-//go:embed schema.sql
-var schemaFS embed.FS
+//go:embed migrations/*.sql
+var migrationsFS embed.FS
 
 // JobState represents the state of a job
 type JobState string
@@ -75,8 +81,14 @@ type DB struct {
 	conn *sql.DB
 }
 
-// Open opens a database connection and initializes the schema
+// Open opens a database connection and runs migrations
 func Open(path string) (*DB, error) {
+	// Ensure parent directory exists
+	dir := filepath.Dir(path)
+	if err := createDirIfNotExist(dir); err != nil {
+		return nil, fmt.Errorf("failed to create database directory: %w", err)
+	}
+
 	conn, err := sql.Open("sqlite3", path)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open database: %w", err)
@@ -90,16 +102,60 @@ func Open(path string) (*DB, error) {
 		return nil, fmt.Errorf("failed to enable WAL mode: %w", err)
 	}
 
-	// Initialize schema
-	schema, err := schemaFS.ReadFile("schema.sql")
-	if err != nil {
-		return nil, fmt.Errorf("failed to read schema: %w", err)
-	}
-	if _, err := conn.Exec(string(schema)); err != nil {
-		return nil, fmt.Errorf("failed to initialize schema: %w", err)
+	// Run migrations
+	if err := runMigrations(conn); err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("failed to run migrations: %w", err)
 	}
 
 	return &DB{conn: conn}, nil
+}
+
+// runMigrations runs database migrations using golang-migrate
+func runMigrations(conn *sql.DB) error {
+	// Create the migrations source from embedded filesystem
+	migrations, err := fs.Sub(migrationsFS, "migrations")
+	if err != nil {
+		return fmt.Errorf("failed to get migrations subdirectory: %w", err)
+	}
+
+	sourceDriver, err := iofs.New(migrations, ".")
+	if err != nil {
+		return fmt.Errorf("failed to create migrations source: %w", err)
+	}
+
+	// Create the database driver
+	dbDriver, err := sqlite3.WithInstance(conn, &sqlite3.Config{})
+	if err != nil {
+		return fmt.Errorf("failed to create database driver: %w", err)
+	}
+
+	// Create the migrator
+	m, err := migrate.NewWithInstance("iofs", sourceDriver, "sqlite3", dbDriver)
+	if err != nil {
+		return fmt.Errorf("failed to create migrator: %w", err)
+	}
+
+	// Run migrations to latest version
+	if err := m.Up(); err != nil && err != migrate.ErrNoChange {
+		return fmt.Errorf("failed to apply migrations: %w", err)
+	}
+
+	return nil
+}
+
+// createDirIfNotExist creates a directory if it doesn't exist
+func createDirIfNotExist(dir string) error {
+	if dir == "" || dir == "." {
+		return nil
+	}
+	if _, err := os.Stat(dir); err != nil {
+		if !os.IsNotExist(err) {
+			return err
+		}
+		return os.MkdirAll(dir, 0755)
+	}
+	return nil
 }
 
 // Close closes the database connection

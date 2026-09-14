@@ -148,20 +148,9 @@ func LoadConfig(path string) (*Config, error) {
 	return &cfg, nil
 }
 
-// GetDefaultDBPath returns the default database path using XDG conventions
+// GetDefaultDBPath returns the default database path (in-repo .devbox/jobs.db)
 func GetDefaultDBPath() string {
-	// Check XDG_DATA_HOME first (Linux/BSD convention)
-	if dataHome := os.Getenv("XDG_DATA_HOME"); dataHome != "" {
-		return filepath.Join(dataHome, "devbox", "jobs.db")
-	}
-
-	// Fall back to ~/.local/share on Unix-like systems
-	if home := os.Getenv("HOME"); home != "" {
-		return filepath.Join(home, ".local", "share", "devbox", "jobs.db")
-	}
-
-	// Final fallback to current directory
-	return "devboxd.db"
+	return filepath.Join(".devbox", "jobs.db")
 }
 
 // GetDBPath returns the configured database path or the default
