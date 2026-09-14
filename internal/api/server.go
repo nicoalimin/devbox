@@ -273,14 +273,13 @@ func (s *Server) handleReviewJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := s.orchestrator.ReviewJob(jobID, req.Feedback); err != nil {
-		s.writeError(w, http.StatusBadRequest, err.Error())
-		return
-	}
+	// Start review processing asynchronously (like CreateJob does)
+	go s.orchestrator.ReviewJob(jobID, req.Feedback)
 
-	s.writeJSON(w, http.StatusOK, map[string]interface{}{
+	// Return 202 Accepted immediately
+	s.writeJSON(w, http.StatusAccepted, map[string]interface{}{
 		"success": true,
-		"message": "review feedback sent",
+		"message": "review feedback accepted and processing",
 	})
 }
 

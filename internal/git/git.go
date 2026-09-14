@@ -108,6 +108,47 @@ func (m *Manager) branchExists(branchName string) bool {
 	return false
 }
 
+// RecreateWorktree recreates a worktree for an existing branch
+// This is useful when the worktree was cleaned up but we need it again for the branch
+func (m *Manager) RecreateWorktree(identifier, branchName string) (*WorktreeInfo, error) {
+	// Verify the branch exists
+	if !m.branchExists(branchName) {
+		return nil, fmt.Errorf("branch %s does not exist", branchName)
+	}
+
+	// Generate worktree path using the same logic as CreateWorktree
+	baseBranchName := fmt.Sprintf("devbox/%s", strings.ToLower(identifier))
+	worktreePath := filepath.Join(m.repoPath, ".devbox-worktrees", identifier)
+	if branchName != baseBranchName {
+		// Extract suffix from branch name
+		suffix := strings.TrimPrefix(branchName, baseBranchName)
+		worktreePath = filepath.Join(m.repoPath, ".devbox-worktrees", identifier+suffix)
+	}
+
+	// Remove worktree if it exists (in case of stale entries)
+	if _, err := os.Stat(worktreePath); err == nil {
+		_ = m.RemoveWorktree(worktreePath)
+	}
+
+	// Ensure parent directory exists
+	if err := os.MkdirAll(filepath.Dir(worktreePath), 0755); err != nil {
+		return nil, fmt.Errorf("failed to create worktree directory: %w", err)
+	}
+
+	// Create worktree from existing branch (no -b flag, just checkout)
+	cmd := exec.Command("git", "worktree", "add", worktreePath, branchName)
+	cmd.Dir = m.repoPath
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return nil, fmt.Errorf("failed to recreate worktree: %w\nOutput: %s", err, string(output))
+	}
+
+	return &WorktreeInfo{
+		Path:       worktreePath,
+		BranchName: branchName,
+	}, nil
+}
+
 // RemoveWorktree removes a git worktree
 func (m *Manager) RemoveWorktree(worktreePath string) error {
 	cmd := exec.Command("git", "worktree", "remove", worktreePath, "--force")
