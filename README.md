@@ -78,7 +78,7 @@ devboxd --config devboxd.yaml
 
 The server will:
 - Listen on `0.0.0.0:8080` (configurable)
-- Create `devboxd.db` for persistent state
+- Create a persistent SQLite database (default: `~/.local/share/devbox/jobs.db`)
 - Display an interactive terminal UI dashboard (when run in a TTY)
 - Wait for job assignments via the HTTP API
 
@@ -202,6 +202,11 @@ server:
   listen: "0.0.0.0:8080"
   # auth_token: "your-secret-token"  # or set DEVBOXD_AUTH_TOKEN env var
 
+database:
+  # path: ""  # Path to SQLite database file
+              # Default: ~/.local/share/devbox/jobs.db (or $XDG_DATA_HOME/devbox/jobs.db)
+              # Can also set DEVBOXD_DB_PATH env var or use --db CLI flag
+
 linear:
   # api_key: "lin_api_your_key_here"     # or set LINEAR_API_KEY env var
   assignee_id: ""                         # Optional: only process issues assigned to this user
@@ -241,6 +246,7 @@ queue:
 
 **Environment Variable Overrides:**
 - `DEVBOXD_AUTH_TOKEN` - Server authentication token
+- `DEVBOXD_DB_PATH` - Database file path
 - `LINEAR_API_KEY` - Linear API key
 - `LINEAR_ASSIGNEE_ID` - Linear user ID filter
 - `OPENCODE_BASE_URL` - OpenCode server URL
@@ -568,6 +574,55 @@ make build-all
 # Creates binaries for linux/amd64, darwin/amd64, darwin/arm64
 ```
 
+## Database & Persistence
+
+### Storage Location
+
+Devboxd uses SQLite for persistent job storage. The database survives server restarts and contains:
+- All job records (current, completed, failed, blocked)
+- Job metadata (Linear issue, PR URL, branch, worktree path, OpenCode session)
+- Operator context and review feedback
+- Complete job logs
+
+**Default location:**
+- `~/.local/share/devbox/jobs.db` (Linux/macOS)
+- `$XDG_DATA_HOME/devbox/jobs.db` (if `XDG_DATA_HOME` is set)
+- `devboxd.db` (current directory, as fallback)
+
+**Override options:**
+1. **Config file**: Set `database.path` in `devboxd.yaml`
+2. **Environment**: Set `DEVBOXD_DB_PATH`
+3. **CLI flag**: Use `--db /path/to/database.db`
+
+Priority: CLI flag > Environment variable > Config file > Default
+
+### After Restart
+
+When devboxd restarts:
+- ✅ All jobs are preserved with full state
+- ✅ `devbox jobs` shows historical jobs
+- ✅ `devbox review <linear-id>` can resume PR reviews
+- ✅ Blocked jobs remain in the queue
+- ⚠️ Active OpenCode sessions are not automatically resumed (mark job as blocked)
+
+### Backup & Migration
+
+The database is a single SQLite file. To backup or migrate:
+
+```bash
+# Backup
+cp ~/.local/share/devbox/jobs.db ~/backups/jobs-$(date +%Y%m%d).db
+
+# Restore
+cp ~/backups/jobs-20240115.db ~/.local/share/devbox/jobs.db
+
+# Migrate to new location
+mv ~/.local/share/devbox/jobs.db /var/lib/devboxd/jobs.db
+# Update devboxd.yaml:
+#   database:
+#     path: "/var/lib/devboxd/jobs.db"
+```
+
 ## Troubleshooting
 
 ### Server Won't Start
@@ -578,7 +633,9 @@ make build-all
 
 **Error**: `failed to open database`
 - Check file permissions on the database path
-- Ensure the parent directory exists
+- The default database location is `~/.local/share/devbox/jobs.db`
+- You can override it with the `--db` flag or `database.path` in the config file
+- The parent directory is automatically created, but ensure you have write permissions
 
 ### Client Can't Connect
 

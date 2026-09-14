@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -11,6 +12,7 @@ import (
 // Config represents the server configuration
 type Config struct {
 	Server   ServerConfig   `yaml:"server"`
+	Database DatabaseConfig `yaml:"database"`
 	Linear   LinearConfig   `yaml:"linear"`
 	OpenCode OpenCodeConfig `yaml:"opencode"`
 	GitHub   GitHubConfig   `yaml:"github"`
@@ -22,6 +24,11 @@ type Config struct {
 type ServerConfig struct {
 	Listen    string `yaml:"listen"`
 	AuthToken string `yaml:"auth_token"`
+}
+
+// DatabaseConfig defines database settings
+type DatabaseConfig struct {
+	Path string `yaml:"path"` // Path to SQLite database file
 }
 
 // LinearConfig defines Linear API settings
@@ -86,6 +93,9 @@ func LoadConfig(path string) (*Config, error) {
 	if token := os.Getenv("DEVBOXD_AUTH_TOKEN"); token != "" {
 		cfg.Server.AuthToken = token
 	}
+	if dbPath := os.Getenv("DEVBOXD_DB_PATH"); dbPath != "" {
+		cfg.Database.Path = dbPath
+	}
 	if apiKey := os.Getenv("LINEAR_API_KEY"); apiKey != "" {
 		cfg.Linear.APIKey = apiKey
 	}
@@ -125,6 +135,30 @@ func LoadConfig(path string) (*Config, error) {
 	}
 
 	return &cfg, nil
+}
+
+// GetDefaultDBPath returns the default database path using XDG conventions
+func GetDefaultDBPath() string {
+	// Check XDG_DATA_HOME first (Linux/BSD convention)
+	if dataHome := os.Getenv("XDG_DATA_HOME"); dataHome != "" {
+		return filepath.Join(dataHome, "devbox", "jobs.db")
+	}
+
+	// Fall back to ~/.local/share on Unix-like systems
+	if home := os.Getenv("HOME"); home != "" {
+		return filepath.Join(home, ".local", "share", "devbox", "jobs.db")
+	}
+
+	// Final fallback to current directory
+	return "devboxd.db"
+}
+
+// GetDBPath returns the configured database path or the default
+func (c *Config) GetDBPath() string {
+	if c.Database.Path != "" {
+		return c.Database.Path
+	}
+	return GetDefaultDBPath()
 }
 
 // FindRepo finds the matching repository for a Linear issue
