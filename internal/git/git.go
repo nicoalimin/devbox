@@ -186,6 +186,7 @@ func (m *Manager) fetchBaseBranch() error {
 }
 
 // CreatePR creates a pull request using gh CLI
+// If a PR already exists for the branch, returns the existing PR URL instead of failing
 func CreatePR(worktreePath, title, body, baseBranch string) (string, error) {
 	args := []string{
 		"pr", "create",
@@ -198,6 +199,21 @@ func CreatePR(worktreePath, title, body, baseBranch string) (string, error) {
 	cmd.Dir = worktreePath
 	output, err := cmd.CombinedOutput()
 	if err != nil {
+		// Check if error is due to PR already existing
+		outputStr := string(output)
+		if strings.Contains(outputStr, "already exists") {
+			// Try to extract PR URL from error message
+			// Format: "a pull request for branch ... already exists: https://..."
+			if prURL := extractPRURLFromError(outputStr); prURL != "" {
+				return prURL, nil
+			}
+			
+			// Fallback: use gh pr view to get existing PR URL
+			if prURL, viewErr := getExistingPRURL(worktreePath); viewErr == nil {
+				return prURL, nil
+			}
+		}
+		
 		return "", fmt.Errorf("failed to create PR: %w\nOutput: %s", err, string(output))
 	}
 
@@ -211,6 +227,54 @@ func CreatePR(worktreePath, title, body, baseBranch string) (string, error) {
 	}
 
 	return string(output), nil
+}
+
+// extractPRURLFromError attempts to extract a PR URL from gh CLI error output
+func extractPRURLFromError(output string) string {
+	// Look for URL pattern in error message
+	// Example: "a pull request for branch ... already exists: https://github.com/owner/repo/pull/123"
+	lines := strings.Split(output, "\n")
+	foundAlreadyExists := false
+	
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		
+		if strings.Contains(line, "already exists:") {
+			// Find URL after "already exists:"
+			parts := strings.SplitN(line, "already exists:", 2)
+			if len(parts) == 2 {
+				url := strings.TrimSpace(parts[1])
+				if strings.HasPrefix(url, "http") {
+					return url
+				}
+			}
+			foundAlreadyExists = true
+		} else if foundAlreadyExists && strings.HasPrefix(line, "http") {
+			// URL is on the next line after "already exists"
+			return line
+		} else if strings.Contains(line, "already exists") && !strings.Contains(line, "already exists:") {
+			// "already exists" without colon, URL might be on next line
+			foundAlreadyExists = true
+		}
+	}
+	return ""
+}
+
+// getExistingPRURL retrieves the URL of an existing PR for the current branch
+func getExistingPRURL(worktreePath string) (string, error) {
+	cmd := exec.Command("gh", "pr", "view", "--json", "url", "--jq", ".url")
+	cmd.Dir = worktreePath
+	output, err := cmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("failed to get existing PR URL: %w", err)
+	}
+	
+	url := strings.TrimSpace(string(output))
+	if url == "" || !strings.HasPrefix(url, "http") {
+		return "", fmt.Errorf("invalid PR URL: %s", url)
+	}
+	
+	return url, nil
 }
 
 // GetRepoURL gets the repository URL for a worktree
