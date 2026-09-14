@@ -98,6 +98,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case JobsPane:
 				if m.selectedJobIdx < len(m.recentJobs)-1 {
 					m.selectedJobIdx++
+					// Scroll to bottom immediately when selecting a different job
+					if m.ready {
+						m.jobLogsViewport.GotoBottom()
+					}
 					cmds = append(cmds, m.refreshJobLogs())
 				}
 			case ServerLogsPane:
@@ -113,6 +117,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case JobsPane:
 				if m.selectedJobIdx > 0 {
 					m.selectedJobIdx--
+					// Scroll to bottom immediately when selecting a different job
+					if m.ready {
+						m.jobLogsViewport.GotoBottom()
+					}
 					cmds = append(cmds, m.refreshJobLogs())
 				}
 			case ServerLogsPane:
@@ -128,6 +136,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			switch m.focusedPane {
 			case JobsPane:
 				m.selectedJobIdx = 0
+				// Scroll to bottom immediately when selecting a different job
+				if m.ready {
+					m.jobLogsViewport.GotoBottom()
+				}
 				cmds = append(cmds, m.refreshJobLogs())
 			case ServerLogsPane:
 				m.serverLogsViewport.GotoTop()
@@ -142,6 +154,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case JobsPane:
 				if len(m.recentJobs) > 0 {
 					m.selectedJobIdx = len(m.recentJobs) - 1
+					// Scroll to bottom immediately when selecting a different job
+					if m.ready {
+						m.jobLogsViewport.GotoBottom()
+					}
 					cmds = append(cmds, m.refreshJobLogs())
 				}
 			case ServerLogsPane:
@@ -156,6 +172,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// Switch focus to job logs pane
 			if m.focusedPane == JobsPane {
 				m.focusedPane = JobLogsPane
+				// Immediately scroll to bottom when entering job logs
+				if m.ready {
+					m.jobLogsViewport.GotoBottom()
+				}
 			}
 			return m, nil
 		}
@@ -186,11 +206,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		//   jobsViewport + errorsViewport = availableContentHeight - 11
 		//   Split equally: each = (availableContentHeight - 11) / 2
 		//
-		// Logs pane (split into server logs + job logs, stacked vertically):
+		// Logs pane (split into job logs + server logs, stacked vertically):
 		//   Each log section: title (1) + subtitle (1) + viewport + borders (2) = viewport + 4
-		//   Total = (serverLogsViewport + 4) + (jobLogsViewport + 4) = availableContentHeight
-		//   serverLogsViewport + jobLogsViewport = availableContentHeight - 8
-		//   Split equally: each = (availableContentHeight - 8) / 2
+		//   Total = (jobLogsViewport + 4) + (serverLogsViewport + 4) = availableContentHeight
+		//   jobLogsViewport + serverLogsViewport = availableContentHeight - 8
+		//   Split with 2:1 ratio (Job Logs taller): jobLogs = 2/3, serverLogs = 1/3
 
 		sidebarWidth := 30
 		
@@ -201,12 +221,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		jobsHeight := (sidebarJobsErrors - 6) / 2       // -6 for titles (2) and borders (4) across both sections
 		errorsHeight := (sidebarJobsErrors - 6) / 2
 		
-		// Split logs pane into two sections (server logs + job logs)
+		// Split logs pane into two sections (job logs above, server logs beneath)
 		// Each section renders as: title (1) + subtitle (1) + viewport + borders (2) = viewport + 4
-		// Total: (serverLogsViewport + 4) + (jobLogsViewport + 4) = availableContentHeight
-		// So: serverLogsViewport + jobLogsViewport = availableContentHeight - 8
-		serverLogsHeight := (availableContentHeight - 8) / 2
-		jobLogsHeight := (availableContentHeight - 8) / 2
+		// Total: (jobLogsViewport + 4) + (serverLogsViewport + 4) = availableContentHeight
+		// So: jobLogsViewport + serverLogsViewport = availableContentHeight - 8
+		// Allocate 2:1 ratio (Job Logs get ~67%, Server Logs get ~33%)
+		logsAvailable := availableContentHeight - 8
+		jobLogsHeight := (logsAvailable * 2) / 3
+		serverLogsHeight := logsAvailable - jobLogsHeight
 
 		// Ensure minimum heights
 		if jobsHeight < 3 {
@@ -265,8 +287,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.jobsViewport.SetContent(m.renderJobsContent())
 			m.errorsViewport.SetContent(m.renderErrorsContent())
 			
-			// Auto-scroll server logs to bottom
+			// Auto-scroll both logs to bottom to see latest activity
 			m.serverLogsViewport.GotoBottom()
+			m.jobLogsViewport.GotoBottom()
 		}
 		return m, nil
 	
@@ -274,6 +297,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.jobLogs = msg.jobLogs
 		if m.ready {
 			m.jobLogsViewport.SetContent(m.renderJobLogsContent())
+			// Auto-scroll to see latest job logs
+			m.jobLogsViewport.GotoBottom()
 		}
 		return m, nil
 	}
@@ -330,7 +355,7 @@ func (m Model) renderHeader() string {
 		Bold(true).
 		Foreground(lipgloss.Color("15")).
 		Background(lipgloss.Color("62")).
-		Padding(0, 1).
+		Padding(1, 1, 0, 1). // Top, Right, Bottom, Left padding (add top padding to prevent clipping)
 		Width(m.width)
 
 	var status string
@@ -548,37 +573,11 @@ func (m Model) renderIntegrationsBar() string {
 	return barStyle.Render(content)
 }
 
-// renderLogsPane renders the main logs pane with both server and job logs
+// renderLogsPane renders the main logs pane with both job logs and server logs
 func (m Model) renderLogsPane() string {
 	logsWidth := m.width - 32
 	
-	// Server Logs Section - height includes title (1) + subtitle (1) + viewport + borders (2) = viewport + 4
-	serverLogsStyle := lipgloss.NewStyle().
-		Width(logsWidth).
-		Height(m.serverLogsViewport.Height + 4).
-		BorderStyle(lipgloss.RoundedBorder()).
-		BorderForeground(m.getBorderColor(ServerLogsPane))
-
-	serverTitle := lipgloss.NewStyle().
-		Bold(true).
-		Foreground(lipgloss.Color("117")).
-		Render("LIVE SERVER LOGS")
-
-	serverSubtitle := dimStyle.Render("(daemon orchestration logs)")
-
-	serverHeader := lipgloss.JoinVertical(
-		lipgloss.Left,
-		serverTitle,
-		serverSubtitle,
-	)
-
-	serverContent := lipgloss.JoinVertical(
-		lipgloss.Left,
-		serverHeader,
-		m.serverLogsViewport.View(),
-	)
-
-	// Job Logs Section - height includes title (1) + subtitle (1) + viewport + borders (2) = viewport + 4
+	// Job Logs Section (TOP) - height includes title (1) + subtitle (1) + viewport + borders (2) = viewport + 4
 	jobLogsStyle := lipgloss.NewStyle().
 		Width(logsWidth).
 		Height(m.jobLogsViewport.Height + 4).
@@ -612,11 +611,37 @@ func (m Model) renderLogsPane() string {
 		m.jobLogsViewport.View(),
 	)
 
-	// Stack both sections vertically
+	// Server Logs Section (BOTTOM) - height includes title (1) + subtitle (1) + viewport + borders (2) = viewport + 4
+	serverLogsStyle := lipgloss.NewStyle().
+		Width(logsWidth).
+		Height(m.serverLogsViewport.Height + 4).
+		BorderStyle(lipgloss.RoundedBorder()).
+		BorderForeground(m.getBorderColor(ServerLogsPane))
+
+	serverTitle := lipgloss.NewStyle().
+		Bold(true).
+		Foreground(lipgloss.Color("117")).
+		Render("LIVE SERVER LOGS")
+
+	serverSubtitle := dimStyle.Render("(daemon orchestration logs)")
+
+	serverHeader := lipgloss.JoinVertical(
+		lipgloss.Left,
+		serverTitle,
+		serverSubtitle,
+	)
+
+	serverContent := lipgloss.JoinVertical(
+		lipgloss.Left,
+		serverHeader,
+		m.serverLogsViewport.View(),
+	)
+
+	// Stack both sections vertically: Job Logs above, Server Logs beneath
 	return lipgloss.JoinVertical(
 		lipgloss.Left,
-		serverLogsStyle.Render(serverContent),
 		jobLogsStyle.Render(jobContent),
+		serverLogsStyle.Render(serverContent),
 	)
 }
 
@@ -838,7 +863,7 @@ func calculateRenderedHeight(text string, width int, horizontalPadding int) int 
 // Uses worst-case text length to ensure we never under-allocate.
 func (m Model) getHeaderHeight() int {
 	if m.width <= 0 {
-		return 1
+		return 2 // Minimum with top padding
 	}
 	
 	// Worst-case header text (with a running job):
@@ -846,8 +871,9 @@ func (m Model) getHeaderHeight() int {
 	// This is approximately 75 characters in the worst case
 	worstCaseHeaderLen := 75
 	
-	// Header has padding of 1 on each side
-	return calculateRenderedHeight(strings.Repeat("X", worstCaseHeaderLen), m.width, 1)
+	// Header has horizontal padding of 1 on each side, plus 1 line of top padding
+	textHeight := calculateRenderedHeight(strings.Repeat("X", worstCaseHeaderLen), m.width, 1)
+	return textHeight + 1 // Add 1 for top padding line
 }
 
 // getFooterHeight estimates the height of the footer including wrapping.

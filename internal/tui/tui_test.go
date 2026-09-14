@@ -84,22 +84,22 @@ func TestGetHeaderHeight(t *testing.T) {
 		{
 			name:           "Wide terminal (160 cols) - header fits on 1 line",
 			width:          160,
-			expectedHeight: 1,
+			expectedHeight: 2, // 1 line text + 1 line top padding
 		},
 		{
 			name:           "Medium terminal (120 cols) - header fits on 1 line",
 			width:          120,
-			expectedHeight: 1,
+			expectedHeight: 2, // 1 line text + 1 line top padding
 		},
 		{
 			name:           "Narrow terminal (80 cols) - header may wrap",
 			width:          80,
-			expectedHeight: 1, // 75 chars should still fit at 80 cols with padding
+			expectedHeight: 2, // 1 line text (75 chars fit at 80 cols) + 1 line top padding
 		},
 		{
 			name:           "Very narrow terminal (60 cols) - header wraps",
 			width:          60,
-			expectedHeight: 2, // 75 chars / 58 effective width = 2 lines
+			expectedHeight: 3, // 2 lines text (75 chars / 58 effective width) + 1 line top padding
 		},
 	}
 
@@ -172,21 +172,21 @@ func TestAvailableContentHeight(t *testing.T) {
 			name:                     "80x24 terminal (standard)",
 			terminalHeight:           24,
 			terminalWidth:            80,
-			expectedAvailableContent: 19, // 24 - 1 (header) - 2 (footer wraps) - 2 (newlines) = 19
+			expectedAvailableContent: 18, // 24 - 2 (header with top padding) - 2 (footer wraps) - 2 (newlines) = 18
 			description:              "Footer wraps to 2 lines at 80 cols",
 		},
 		{
 			name:                     "120x30 terminal",
 			terminalHeight:           30,
 			terminalWidth:            120,
-			expectedAvailableContent: 26, // 30 - 1 (header) - 1 (footer) - 2 (newlines) = 26
+			expectedAvailableContent: 25, // 30 - 2 (header with top padding) - 1 (footer) - 2 (newlines) = 25
 			description:              "Footer fits on 1 line at 120 cols",
 		},
 		{
 			name:                     "160x40 terminal (wide)",
 			terminalHeight:           40,
 			terminalWidth:            160,
-			expectedAvailableContent: 36, // 40 - 1 (header) - 1 (footer) - 2 (newlines) = 36
+			expectedAvailableContent: 35, // 40 - 2 (header with top padding) - 1 (footer) - 2 (newlines) = 35
 			description:              "Footer fits on 1 line at 160 cols",
 		},
 	}
