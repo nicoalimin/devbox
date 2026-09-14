@@ -17,21 +17,27 @@ import (
 
 // Orchestrator manages job lifecycle
 type Orchestrator struct {
-	cfg       *config.Config
-	db        *db.DB
-	linear    *linear.Client
-	opencode  *opencode.Client
-	activeJobs map[string]bool // Track actively running jobs to prevent double-resume
+	cfg            *config.Config
+	db             *db.DB
+	linear         *linear.Client
+	opencode       *opencode.Client
+	activeJobs     map[string]bool // Track actively running jobs to prevent double-resume
+	healingAttempts map[string]int  // Track session healing attempts per job (jobID -> count)
 }
+
+const (
+	maxHealingAttempts = 2 // Max number of session recreate attempts per phase
+)
 
 // NewOrchestrator creates a new job orchestrator
 func NewOrchestrator(cfg *config.Config, database *db.DB) *Orchestrator {
 	return &Orchestrator{
-		cfg:        cfg,
-		db:         database,
-		linear:     linear.NewClient(cfg.Linear.APIKey),
-		opencode:   opencode.NewClient(cfg.OpenCode.BaseURL, cfg.OpenCode.Username, cfg.OpenCode.Password, cfg.OpenCode.Version),
-		activeJobs: make(map[string]bool),
+		cfg:             cfg,
+		db:              database,
+		linear:          linear.NewClient(cfg.Linear.APIKey),
+		opencode:        opencode.NewClient(cfg.OpenCode.BaseURL, cfg.OpenCode.Username, cfg.OpenCode.Password, cfg.OpenCode.Version),
+		activeJobs:      make(map[string]bool),
+		healingAttempts: make(map[string]int),
 	}
 }
 
@@ -255,12 +261,13 @@ func (o *Orchestrator) executeCoding(job *db.Job) error {
 
 	o.log(job.ID, "info", "Sent task to OpenCode, waiting for completion")
 
-	// Wait for OpenCode to complete the coding task
+	// Wait for OpenCode to complete the coding task with healing support
 	logFunc := func(msg string) {
 		o.log(job.ID, "info", msg)
 	}
 	
-	if err := o.opencode.WaitForSessionIdle(session.ID, o.cfg.OpenCode.Timeout, job.WorktreePath, logFunc); err != nil {
+	sessionID, err := o.waitForSessionWithHealing(job, "coding", logFunc)
+	if err != nil {
 		// Timeout or error - mark as blocked for human review
 		o.log(job.ID, "error", fmt.Sprintf("OpenCode session did not complete: %v", err))
 		job.State = db.StateBlocked
@@ -269,6 +276,14 @@ func (o *Orchestrator) executeCoding(job *db.Job) error {
 			return fmt.Errorf("failed to mark job as blocked: %w (original error: %v)", updateErr, err)
 		}
 		return nil // Don't fail the job, just block it for human intervention
+	}
+
+	// Update job with final session ID (in case it was healed)
+	if sessionID != job.OpenCodeSessionID {
+		job.OpenCodeSessionID = sessionID
+		if err := o.db.UpdateJob(job); err != nil {
+			o.log(job.ID, "warn", fmt.Sprintf("Failed to update final session ID: %v", err))
+		}
 	}
 
 	o.log(job.ID, "info", "OpenCode coding session completed")
@@ -301,13 +316,22 @@ If you find issues, fix them now. If everything looks good, confirm the changes 
 
 	o.log(job.ID, "info", "Sent review prompt, waiting for completion")
 
-	// Wait for review to complete
+	// Wait for review to complete with healing support
 	logFunc := func(msg string) {
 		o.log(job.ID, "info", msg)
 	}
 	
-	if err := o.opencode.WaitForSessionIdle(job.OpenCodeSessionID, o.cfg.OpenCode.Timeout, job.WorktreePath, logFunc); err != nil {
+	sessionID, err := o.waitForSessionWithHealing(job, "reviewing", logFunc)
+	if err != nil {
 		return fmt.Errorf("OpenCode review timed out or failed: %w", err)
+	}
+
+	// Update job with final session ID (in case it was healed)
+	if sessionID != job.OpenCodeSessionID {
+		job.OpenCodeSessionID = sessionID
+		if err := o.db.UpdateJob(job); err != nil {
+			o.log(job.ID, "warn", fmt.Sprintf("Failed to update final session ID: %v", err))
+		}
 	}
 
 	o.log(job.ID, "info", "Code review completed")
@@ -616,13 +640,14 @@ func (o *Orchestrator) resumeJobFromState(job *db.Job) {
 func (o *Orchestrator) resumeCoding(job *db.Job) error {
 	o.log(job.ID, "info", "Resuming OpenCode coding session wait")
 
-	// Wait for OpenCode to complete the coding task
+	// Wait for OpenCode to complete the coding task with healing support
 	logFunc := func(msg string) {
 		o.log(job.ID, "info", msg)
 	}
 
-	if err := o.opencode.WaitForSessionIdle(job.OpenCodeSessionID, o.cfg.OpenCode.Timeout, job.WorktreePath, logFunc); err != nil {
-		// Timeout or error - mark as blocked for human review
+	sessionID, err := o.waitForSessionWithHealing(job, "coding", logFunc)
+	if err != nil {
+		// Timeout or error after healing attempts - mark as blocked for human review
 		o.log(job.ID, "error", fmt.Sprintf("OpenCode session did not complete: %v", err))
 		job.State = db.StateBlocked
 		job.BlockerReason = fmt.Sprintf("OpenCode session timed out or failed: %v", err)
@@ -630,6 +655,14 @@ func (o *Orchestrator) resumeCoding(job *db.Job) error {
 			return fmt.Errorf("failed to mark job as blocked: %w (original error: %v)", updateErr, err)
 		}
 		return nil // Don't fail the job, just block it for human intervention
+	}
+
+	// Update job with final session ID (in case it was healed)
+	if sessionID != job.OpenCodeSessionID {
+		job.OpenCodeSessionID = sessionID
+		if err := o.db.UpdateJob(job); err != nil {
+			o.log(job.ID, "warn", fmt.Sprintf("Failed to update final session ID: %v", err))
+		}
 	}
 
 	o.log(job.ID, "info", "OpenCode coding session completed")
@@ -640,13 +673,22 @@ func (o *Orchestrator) resumeCoding(job *db.Job) error {
 func (o *Orchestrator) resumeReviewing(job *db.Job) error {
 	o.log(job.ID, "info", "Resuming OpenCode review session wait")
 
-	// Wait for review to complete
+	// Wait for review to complete with healing support
 	logFunc := func(msg string) {
 		o.log(job.ID, "info", msg)
 	}
 
-	if err := o.opencode.WaitForSessionIdle(job.OpenCodeSessionID, o.cfg.OpenCode.Timeout, job.WorktreePath, logFunc); err != nil {
+	sessionID, err := o.waitForSessionWithHealing(job, "reviewing", logFunc)
+	if err != nil {
 		return fmt.Errorf("OpenCode review timed out or failed: %w", err)
+	}
+
+	// Update job with final session ID (in case it was healed)
+	if sessionID != job.OpenCodeSessionID {
+		job.OpenCodeSessionID = sessionID
+		if err := o.db.UpdateJob(job); err != nil {
+			o.log(job.ID, "warn", fmt.Sprintf("Failed to update final session ID: %v", err))
+		}
 	}
 
 	o.log(job.ID, "info", "Code review completed")
@@ -883,4 +925,120 @@ After making changes, confirm they are ready to push.`, feedback)
 
 	o.log(job.ID, "info", "Review iteration completed successfully")
 	return nil
+}
+
+// waitForSessionWithHealing waits for an OpenCode session to complete, with automatic healing for dead sessions.
+// phase should be "coding" or "reviewing" to determine which prompt to send on recreation.
+// Returns the final session ID (which may differ from job.OpenCodeSessionID if healing occurred).
+func (o *Orchestrator) waitForSessionWithHealing(job *db.Job, phase string, logFunc func(string)) (string, error) {
+	sessionID := job.OpenCodeSessionID
+	
+	for {
+		// Try to wait for the session
+		err := o.opencode.WaitForSessionIdle(sessionID, o.cfg.OpenCode.Timeout, job.WorktreePath, logFunc)
+		
+		if err == nil {
+			// Success - session completed
+			return sessionID, nil
+		}
+		
+		// Check if this looks like a dead/missing session error
+		errMsg := err.Error()
+		isDeadSession := strings.Contains(errMsg, "never appeared in active map") ||
+			strings.Contains(errMsg, "session") && strings.Contains(errMsg, "not found") ||
+			strings.Contains(errMsg, "404")
+		
+		if !isDeadSession {
+			// Not a dead session error - could be timeout or other issue
+			// Return the error as-is
+			return sessionID, err
+		}
+		
+		// Dead session detected - attempt to heal
+		o.log(job.ID, "warn", fmt.Sprintf("Detected dead/missing OpenCode session %s", sessionID))
+		
+		// Check healing attempt limit
+		attemptKey := fmt.Sprintf("%s-%s", job.ID, phase)
+		attempts := o.healingAttempts[attemptKey]
+		
+		if attempts >= maxHealingAttempts {
+			o.log(job.ID, "error", fmt.Sprintf("Max healing attempts (%d) reached for phase %s", maxHealingAttempts, phase))
+			return sessionID, fmt.Errorf("session healing failed after %d attempts: %w", maxHealingAttempts, err)
+		}
+		
+		// Increment healing attempts
+		o.healingAttempts[attemptKey]++
+		o.log(job.ID, "info", fmt.Sprintf("Attempting session healing (attempt %d/%d)", o.healingAttempts[attemptKey], maxHealingAttempts))
+		
+		// Heal the session
+		newSessionID, healErr := o.healSession(job, phase)
+		if healErr != nil {
+			o.log(job.ID, "error", fmt.Sprintf("Session healing failed: %v", healErr))
+			return sessionID, fmt.Errorf("failed to heal session: %w", healErr)
+		}
+		
+		// Update to new session ID and retry wait
+		sessionID = newSessionID
+		o.log(job.ID, "info", fmt.Sprintf("Session healed successfully, new session ID: %s", sessionID))
+		
+		// Continue loop to wait on new session
+	}
+}
+
+// healSession creates a new OpenCode session and resends the appropriate prompt.
+// phase should be "coding" or "reviewing" to determine which prompt to send.
+// Returns the new session ID.
+func (o *Orchestrator) healSession(job *db.Job, phase string) (string, error) {
+	// Fetch issue details for prompt
+	issue, err := o.linear.GetIssue(job.LinearIssueID)
+	if err != nil {
+		return "", fmt.Errorf("failed to fetch Linear issue: %w", err)
+	}
+	
+	// Create new session
+	sessionName := fmt.Sprintf("%s: %s (healed)", issue.Identifier, issue.Title)
+	session, err := o.opencode.CreateSession(sessionName, job.WorktreePath)
+	if err != nil {
+		return "", fmt.Errorf("failed to create new session: %w", err)
+	}
+	
+	o.log(job.ID, "info", fmt.Sprintf("Created new OpenCode session: %s", session.ID))
+	
+	// Build and send appropriate prompt based on phase
+	var prompt string
+	if phase == "coding" {
+		// Get job for operator context
+		currentJob, err := o.db.GetJob(job.ID)
+		if err != nil {
+			return "", fmt.Errorf("failed to get job: %w", err)
+		}
+		prompt = o.buildCodingPrompt(issue, currentJob.OperatorContext)
+	} else if phase == "reviewing" {
+		prompt = `Please review the changes you just made:
+1. Check for code quality issues
+2. Verify tests are passing
+3. Ensure documentation is updated
+4. Confirm the implementation matches requirements
+5. **TUI changes (internal/tui/)**: Verify the dashboard fits entirely in one terminal screen with no overflow or clipped header/footer. Left column height (jobs + errors + integrations) must equal right column height (server logs + job logs).
+
+If you find issues, fix them now. If everything looks good, confirm the changes are ready.`
+	} else {
+		return "", fmt.Errorf("unknown phase: %s", phase)
+	}
+	
+	// Send prompt to new session
+	if err := o.opencode.SendMessage(session.ID, prompt, job.WorktreePath); err != nil {
+		return "", fmt.Errorf("failed to send prompt to new session: %w", err)
+	}
+	
+	o.log(job.ID, "info", fmt.Sprintf("Re-sent %s prompt to new session", phase))
+	
+	// Update job with new session ID
+	job.OpenCodeSessionID = session.ID
+	if err := o.db.UpdateJob(job); err != nil {
+		o.log(job.ID, "warn", fmt.Sprintf("Failed to update job with new session ID: %v", err))
+		// Continue anyway - session is created and prompt is sent
+	}
+	
+	return session.ID, nil
 }
