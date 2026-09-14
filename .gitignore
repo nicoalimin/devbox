@@ -17,6 +17,9 @@ go.work.sum
 *.db-shm
 *.db-wal
 
+# In-repo database directory
+.devbox/
+
 # Config with secrets
 devboxd.yaml
 *.env

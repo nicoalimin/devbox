@@ -637,9 +637,15 @@ Devboxd uses SQLite for persistent job storage. The database survives server res
 - Complete job logs
 
 **Default location:**
-- `~/.local/share/devbox/jobs.db` (Linux/macOS)
-- `$XDG_DATA_HOME/devbox/jobs.db` (if `XDG_DATA_HOME` is set)
-- `devboxd.db` (current directory, as fallback)
+- `.devbox/jobs.db` (relative to current working directory)
+
+**⚠️ Breaking Change from v0.1.0:**
+Previous versions used `~/.local/share/devbox/jobs.db` (XDG convention). The new default is `.devbox/jobs.db` in the repository directory.
+
+**Migration Notes:**
+- Old data in `~/.local/share/devbox/jobs.db` is **not automatically migrated**
+- The database schema uses golang-migrate for version management
+- If you want to keep using the old location, set `database.path` in your config
 
 **Override options:**
 1. **Config file**: Set `database.path` in `devboxd.yaml`
@@ -663,16 +669,21 @@ The database is a single SQLite file. To backup or migrate:
 
 ```bash
 # Backup
-cp ~/.local/share/devbox/jobs.db ~/backups/jobs-$(date +%Y%m%d).db
+cp .devbox/jobs.db ~/backups/jobs-$(date +%Y%m%d).db
 
 # Restore
-cp ~/backups/jobs-20240115.db ~/.local/share/devbox/jobs.db
+cp ~/backups/jobs-20240115.db .devbox/jobs.db
 
 # Migrate to new location
-mv ~/.local/share/devbox/jobs.db /var/lib/devboxd/jobs.db
+mv .devbox/jobs.db /var/lib/devboxd/jobs.db
 # Update devboxd.yaml:
 #   database:
 #     path: "/var/lib/devboxd/jobs.db"
+
+# To use old XDG location (not recommended):
+# Update devboxd.yaml:
+#   database:
+#     path: "~/.local/share/devbox/jobs.db"
 ```
 
 ## Troubleshooting
@@ -685,7 +696,7 @@ mv ~/.local/share/devbox/jobs.db /var/lib/devboxd/jobs.db
 
 **Error**: `failed to open database`
 - Check file permissions on the database path
-- The default database location is `~/.local/share/devbox/jobs.db`
+- The default database location is `.devbox/jobs.db` (relative to current working directory)
 - You can override it with the `--db` flag or `database.path` in the config file
 - The parent directory is automatically created, but ensure you have write permissions
 

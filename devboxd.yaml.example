@@ -4,8 +4,11 @@ server:
 
 database:
   # path: ""  # Path to SQLite database file
-              # Default: ~/.local/share/devbox/jobs.db (or $XDG_DATA_HOME/devbox/jobs.db)
+              # Default: .devbox/jobs.db (relative to current working directory)
               # Can also set DEVBOXD_DB_PATH env var or use --db CLI flag
+              # 
+              # Breaking change from v0.1.0: old default was ~/.local/share/devbox/jobs.db
+              # To use old location, explicitly set: path: "~/.local/share/devbox/jobs.db"
 
 linear:
   # api_key: "lin_api_your_key_here"     # or set LINEAR_API_KEY env var
