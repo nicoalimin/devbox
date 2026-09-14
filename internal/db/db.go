@@ -42,19 +42,21 @@ func (s JobState) IsBusy() bool {
 
 // Job represents a coding job
 type Job struct {
-	ID               string     `json:"id"`
-	LinearIssueID    string     `json:"linear_issue_id"`
-	LinearURL        string     `json:"linear_url"`
-	State            JobState   `json:"state"`
-	RepoPath         string     `json:"repo_path"`
-	BranchName       string     `json:"branch_name"`
-	WorktreePath     string     `json:"worktree_path"`
-	PRURL            string     `json:"pr_url"`
-	BlockerReason    string     `json:"blocker_reason"`
-	OpenCodeSessionID string    `json:"opencode_session_id"`
-	CreatedAt        time.Time  `json:"created_at"`
-	UpdatedAt        time.Time  `json:"updated_at"`
-	CompletedAt      *time.Time `json:"completed_at"`
+	ID                string     `json:"id"`
+	LinearIssueID     string     `json:"linear_issue_id"`
+	LinearURL         string     `json:"linear_url"`
+	State             JobState   `json:"state"`
+	RepoPath          string     `json:"repo_path"`
+	BranchName        string     `json:"branch_name"`
+	WorktreePath      string     `json:"worktree_path"`
+	PRURL             string     `json:"pr_url"`
+	BlockerReason     string     `json:"blocker_reason"`
+	OpenCodeSessionID string     `json:"opencode_session_id"`
+	OperatorContext   string     `json:"operator_context"`
+	ReviewFeedback    string     `json:"review_feedback"`
+	CreatedAt         time.Time  `json:"created_at"`
+	UpdatedAt         time.Time  `json:"updated_at"`
+	CompletedAt       *time.Time `json:"completed_at"`
 }
 
 // JobLog represents a log entry for a job
@@ -109,11 +111,13 @@ func (db *DB) CreateJob(job *Job) error {
 		INSERT INTO jobs (
 			id, linear_issue_id, linear_url, state, repo_path, branch_name,
 			worktree_path, pr_url, blocker_reason, opencode_session_id,
+			operator_context, review_feedback,
 			created_at, updated_at, completed_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`, job.ID, job.LinearIssueID, job.LinearURL, job.State, job.RepoPath,
 		job.BranchName, job.WorktreePath, job.PRURL, job.BlockerReason,
-		job.OpenCodeSessionID, job.CreatedAt, job.UpdatedAt, job.CompletedAt)
+		job.OpenCodeSessionID, job.OperatorContext, job.ReviewFeedback,
+		job.CreatedAt, job.UpdatedAt, job.CompletedAt)
 	return err
 }
 
@@ -124,10 +128,12 @@ func (db *DB) UpdateJob(job *Job) error {
 		UPDATE jobs SET
 			state = ?, repo_path = ?, branch_name = ?, worktree_path = ?,
 			pr_url = ?, blocker_reason = ?, opencode_session_id = ?,
+			operator_context = ?, review_feedback = ?,
 			updated_at = ?, completed_at = ?
 		WHERE id = ?
 	`, job.State, job.RepoPath, job.BranchName, job.WorktreePath,
 		job.PRURL, job.BlockerReason, job.OpenCodeSessionID,
+		job.OperatorContext, job.ReviewFeedback,
 		job.UpdatedAt, job.CompletedAt, job.ID)
 	return err
 }
@@ -138,12 +144,14 @@ func (db *DB) GetJob(id string) (*Job, error) {
 	err := db.conn.QueryRow(`
 		SELECT id, linear_issue_id, linear_url, state, repo_path, branch_name,
 			worktree_path, pr_url, blocker_reason, opencode_session_id,
+			operator_context, review_feedback,
 			created_at, updated_at, completed_at
 		FROM jobs WHERE id = ?
 	`, id).Scan(
 		&job.ID, &job.LinearIssueID, &job.LinearURL, &job.State, &job.RepoPath,
 		&job.BranchName, &job.WorktreePath, &job.PRURL, &job.BlockerReason,
-		&job.OpenCodeSessionID, &job.CreatedAt, &job.UpdatedAt, &job.CompletedAt,
+		&job.OpenCodeSessionID, &job.OperatorContext, &job.ReviewFeedback,
+		&job.CreatedAt, &job.UpdatedAt, &job.CompletedAt,
 	)
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -153,7 +161,7 @@ func (db *DB) GetJob(id string) (*Job, error) {
 
 // ListJobs lists jobs with optional limit
 func (db *DB) ListJobs(limit int) ([]*Job, error) {
-	query := "SELECT id, linear_issue_id, linear_url, state, repo_path, branch_name, worktree_path, pr_url, blocker_reason, opencode_session_id, created_at, updated_at, completed_at FROM jobs ORDER BY created_at DESC"
+	query := "SELECT id, linear_issue_id, linear_url, state, repo_path, branch_name, worktree_path, pr_url, blocker_reason, opencode_session_id, operator_context, review_feedback, created_at, updated_at, completed_at FROM jobs ORDER BY created_at DESC"
 	if limit > 0 {
 		query += fmt.Sprintf(" LIMIT %d", limit)
 	}
@@ -170,7 +178,8 @@ func (db *DB) ListJobs(limit int) ([]*Job, error) {
 		if err := rows.Scan(
 			&job.ID, &job.LinearIssueID, &job.LinearURL, &job.State, &job.RepoPath,
 			&job.BranchName, &job.WorktreePath, &job.PRURL, &job.BlockerReason,
-			&job.OpenCodeSessionID, &job.CreatedAt, &job.UpdatedAt, &job.CompletedAt,
+			&job.OpenCodeSessionID, &job.OperatorContext, &job.ReviewFeedback,
+			&job.CreatedAt, &job.UpdatedAt, &job.CompletedAt,
 		); err != nil {
 			return nil, err
 		}
@@ -185,6 +194,7 @@ func (db *DB) GetCurrentJob() (*Job, error) {
 	err := db.conn.QueryRow(`
 		SELECT id, linear_issue_id, linear_url, state, repo_path, branch_name,
 			worktree_path, pr_url, blocker_reason, opencode_session_id,
+			operator_context, review_feedback,
 			created_at, updated_at, completed_at
 		FROM jobs
 		WHERE state IN ('fetching', 'preparing', 'coding', 'reviewing', 'pushing', 'pr_open')
@@ -193,7 +203,32 @@ func (db *DB) GetCurrentJob() (*Job, error) {
 	`).Scan(
 		&job.ID, &job.LinearIssueID, &job.LinearURL, &job.State, &job.RepoPath,
 		&job.BranchName, &job.WorktreePath, &job.PRURL, &job.BlockerReason,
-		&job.OpenCodeSessionID, &job.CreatedAt, &job.UpdatedAt, &job.CompletedAt,
+		&job.OpenCodeSessionID, &job.OperatorContext, &job.ReviewFeedback,
+		&job.CreatedAt, &job.UpdatedAt, &job.CompletedAt,
+	)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	return &job, err
+}
+
+// GetJobByLinearIssueID retrieves a job by Linear issue ID (most recent first)
+func (db *DB) GetJobByLinearIssueID(linearIssueID string) (*Job, error) {
+	var job Job
+	err := db.conn.QueryRow(`
+		SELECT id, linear_issue_id, linear_url, state, repo_path, branch_name,
+			worktree_path, pr_url, blocker_reason, opencode_session_id,
+			operator_context, review_feedback,
+			created_at, updated_at, completed_at
+		FROM jobs
+		WHERE linear_issue_id = ?
+		ORDER BY created_at DESC
+		LIMIT 1
+	`, linearIssueID).Scan(
+		&job.ID, &job.LinearIssueID, &job.LinearURL, &job.State, &job.RepoPath,
+		&job.BranchName, &job.WorktreePath, &job.PRURL, &job.BlockerReason,
+		&job.OpenCodeSessionID, &job.OperatorContext, &job.ReviewFeedback,
+		&job.CreatedAt, &job.UpdatedAt, &job.CompletedAt,
 	)
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -206,6 +241,7 @@ func (db *DB) GetBlockedJobs() ([]*Job, error) {
 	rows, err := db.conn.Query(`
 		SELECT id, linear_issue_id, linear_url, state, repo_path, branch_name,
 			worktree_path, pr_url, blocker_reason, opencode_session_id,
+			operator_context, review_feedback,
 			created_at, updated_at, completed_at
 		FROM jobs
 		WHERE state = 'blocked'
@@ -222,7 +258,8 @@ func (db *DB) GetBlockedJobs() ([]*Job, error) {
 		if err := rows.Scan(
 			&job.ID, &job.LinearIssueID, &job.LinearURL, &job.State, &job.RepoPath,
 			&job.BranchName, &job.WorktreePath, &job.PRURL, &job.BlockerReason,
-			&job.OpenCodeSessionID, &job.CreatedAt, &job.UpdatedAt, &job.CompletedAt,
+			&job.OpenCodeSessionID, &job.OperatorContext, &job.ReviewFeedback,
+			&job.CreatedAt, &job.UpdatedAt, &job.CompletedAt,
 		); err != nil {
 			return nil, err
 		}

@@ -32,8 +32,8 @@ func NewOrchestrator(cfg *config.Config, database *db.DB) *Orchestrator {
 	}
 }
 
-// CreateJob creates a new job for a Linear issue
-func (o *Orchestrator) CreateJob(linearIssueID string) (*db.Job, error) {
+// CreateJob creates a new job for a Linear issue with optional operator context
+func (o *Orchestrator) CreateJob(linearIssueID string, operatorContext string) (*db.Job, error) {
 	// Check if server is busy
 	currentJob, err := o.db.GetCurrentJob()
 	if err != nil {
@@ -49,11 +49,12 @@ func (o *Orchestrator) CreateJob(linearIssueID string) (*db.Job, error) {
 
 	// Create job record
 	job := &db.Job{
-		ID:            uuid.New().String(),
-		LinearIssueID: linearIssueID,
-		State:         db.StateFetching,
-		CreatedAt:     time.Now(),
-		UpdatedAt:     time.Now(),
+		ID:              uuid.New().String(),
+		LinearIssueID:   linearIssueID,
+		OperatorContext: operatorContext,
+		State:           db.StateFetching,
+		CreatedAt:       time.Now(),
+		UpdatedAt:       time.Now(),
 	}
 
 	if err := o.db.CreateJob(job); err != nil {
@@ -61,6 +62,9 @@ func (o *Orchestrator) CreateJob(linearIssueID string) (*db.Job, error) {
 	}
 
 	o.log(job.ID, "info", fmt.Sprintf("Created job for Linear issue %s", linearIssueID))
+	if operatorContext != "" {
+		o.log(job.ID, "info", "Operator context provided")
+	}
 
 	// Start processing asynchronously
 	go o.ProcessJob(job.ID)
@@ -213,8 +217,14 @@ func (o *Orchestrator) executeCoding(job *db.Job) error {
 		return err
 	}
 
+	// Get job for operator context
+	currentJob, err := o.db.GetJob(job.ID)
+	if err != nil {
+		return err
+	}
+
 	// Build prompt with context
-	prompt := o.buildCodingPrompt(issue)
+	prompt := o.buildCodingPrompt(issue, currentJob.OperatorContext)
 
 	// Send task to OpenCode
 	if err := o.opencode.SendMessage(session.ID, prompt, job.WorktreePath); err != nil {
@@ -371,8 +381,8 @@ func (o *Orchestrator) failJob(job *db.Job, reason string) {
 	}
 }
 
-// buildCodingPrompt builds the prompt for OpenCode
-func (o *Orchestrator) buildCodingPrompt(issue *linear.Issue) string {
+// buildCodingPrompt builds the prompt for OpenCode with optional operator context
+func (o *Orchestrator) buildCodingPrompt(issue *linear.Issue, operatorContext string) string {
 	var sb strings.Builder
 
 	sb.WriteString(fmt.Sprintf("Build the following Linear issue:\n\n"))
@@ -396,6 +406,12 @@ func (o *Orchestrator) buildCodingPrompt(issue *linear.Issue) string {
 	}
 
 	sb.WriteString(fmt.Sprintf("\nDescription:\n%s\n\n", issue.Description))
+
+	if operatorContext != "" {
+		sb.WriteString("## Additional Operator Context\n\n")
+		sb.WriteString(operatorContext)
+		sb.WriteString("\n\n")
+	}
 
 	sb.WriteString("Instructions:\n")
 	sb.WriteString("1. Review the .opencode instructions in this repository\n")
@@ -486,5 +502,102 @@ func (o *Orchestrator) ReplyToJob(jobID, message string) error {
 	}
 
 	o.log(jobID, "info", "Job resumed")
+	return nil
+}
+
+// ReviewJob sends review feedback to an existing job and updates the PR
+func (o *Orchestrator) ReviewJob(jobIDOrLinearID, feedback string) error {
+	// Try to find job by ID first, then by Linear issue ID
+	job, err := o.db.GetJob(jobIDOrLinearID)
+	if err != nil {
+		return fmt.Errorf("failed to get job: %w", err)
+	}
+	if job == nil {
+		// Try finding by Linear issue ID
+		job, err = o.db.GetJobByLinearIssueID(jobIDOrLinearID)
+		if err != nil {
+			return fmt.Errorf("failed to get job by Linear ID: %w", err)
+		}
+		if job == nil {
+			return fmt.Errorf("job not found: %s", jobIDOrLinearID)
+		}
+	}
+
+	// Check that job has a PR
+	if job.PRURL == "" {
+		return fmt.Errorf("job does not have a pull request yet (state: %s)", job.State)
+	}
+
+	// Check that we have necessary information
+	if job.WorktreePath == "" {
+		return fmt.Errorf("job has no worktree path")
+	}
+	if job.BranchName == "" {
+		return fmt.Errorf("job has no branch name")
+	}
+
+	o.log(job.ID, "info", "Received review feedback")
+
+	// Store review feedback
+	job.ReviewFeedback = feedback
+	if err := o.db.UpdateJob(job); err != nil {
+		return fmt.Errorf("failed to update job: %w", err)
+	}
+
+	// Build review prompt
+	reviewPrompt := fmt.Sprintf(`Review feedback on your pull request:
+
+%s
+
+Please address the feedback:
+1. Review and understand each comment
+2. Make the necessary changes to address the feedback
+3. Run tests to ensure everything still works
+4. Commit your changes with clear messages describing what you fixed
+
+After making changes, confirm they are ready to push.`, feedback)
+
+	// Create or reuse OpenCode session
+	sessionID := job.OpenCodeSessionID
+	if sessionID == "" {
+		// Create new session if none exists
+		issue, err := o.linear.GetIssue(job.LinearIssueID)
+		if err != nil {
+			return fmt.Errorf("failed to get Linear issue: %w", err)
+		}
+		sessionName := fmt.Sprintf("%s: Review iteration", issue.Identifier)
+		session, err := o.opencode.CreateSession(sessionName, job.WorktreePath)
+		if err != nil {
+			return fmt.Errorf("failed to create OpenCode session: %w", err)
+		}
+		sessionID = session.ID
+		job.OpenCodeSessionID = sessionID
+		if err := o.db.UpdateJob(job); err != nil {
+			return fmt.Errorf("failed to update job with session ID: %w", err)
+		}
+	}
+
+	// Send review feedback to OpenCode
+	if err := o.opencode.SendMessage(sessionID, reviewPrompt, job.WorktreePath); err != nil {
+		return fmt.Errorf("failed to send review feedback to OpenCode: %w", err)
+	}
+
+	o.log(job.ID, "info", "Review feedback sent to OpenCode")
+
+	// TODO: Wait for OpenCode session to be idle (WaitForSessionIdle)
+	// For now, we return and expect the operator to monitor progress
+	// In the future, we should:
+	// 1. Poll session status until idle
+	// 2. Check for new commits
+	// 3. Auto-push if there are changes
+
+	o.log(job.ID, "info", "Review in progress - monitor OpenCode session for completion")
+
+	// Update state to reviewing
+	job.State = db.StateReviewing
+	if err := o.db.UpdateJob(job); err != nil {
+		return fmt.Errorf("failed to update job state: %w", err)
+	}
+
 	return nil
 }

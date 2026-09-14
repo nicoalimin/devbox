@@ -9,6 +9,8 @@ CREATE TABLE IF NOT EXISTS jobs (
     pr_url TEXT,
     blocker_reason TEXT,
     opencode_session_id TEXT,
+    operator_context TEXT,
+    review_feedback TEXT,
     created_at TIMESTAMP NOT NULL,
     updated_at TIMESTAMP NOT NULL,
     completed_at TIMESTAMP
