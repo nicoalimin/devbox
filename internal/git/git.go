@@ -57,8 +57,11 @@ func (m *Manager) CreateWorktree(identifier string) (*WorktreeInfo, error) {
 		return nil, fmt.Errorf("failed to create worktree directory: %w", err)
 	}
 
-	// Create worktree
-	cmd := exec.Command("git", "worktree", "add", "-b", branchName, worktreePath, m.baseBranch)
+	// Create worktree from remote base branch to ensure we have the latest changes
+	// Use origin/<baseBranch> instead of local <baseBranch> to handle cases where
+	// the local base branch is stale or has diverged from remote
+	remoteBase := fmt.Sprintf("origin/%s", m.baseBranch)
+	cmd := exec.Command("git", "worktree", "add", "-b", branchName, worktreePath, remoteBase)
 	cmd.Dir = m.repoPath
 	output, err := cmd.CombinedOutput()
 	if err != nil {
