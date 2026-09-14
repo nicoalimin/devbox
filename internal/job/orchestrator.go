@@ -279,14 +279,8 @@ func (o *Orchestrator) executeCoding(job *db.Job) error {
 	
 	sessionID, err := o.waitForSessionWithHealing(job, "coding", logFunc)
 	if err != nil {
-		// Timeout or error - mark as blocked for human review
 		o.log(job.ID, "error", fmt.Sprintf("OpenCode session did not complete: %v", err))
-		job.State = db.StateBlocked
-		job.BlockerReason = fmt.Sprintf("OpenCode session timed out or failed: %v", err)
-		if updateErr := o.db.UpdateJob(job); updateErr != nil {
-			return fmt.Errorf("failed to mark job as blocked: %w (original error: %v)", updateErr, err)
-		}
-		return nil // Don't fail the job, just block it for human intervention
+		return fmt.Errorf("OpenCode coding session timed out or failed: %w", err)
 	}
 
 	// Update job with final session ID (in case it was healed)
@@ -672,14 +666,8 @@ func (o *Orchestrator) resumeCoding(job *db.Job) error {
 
 	sessionID, err := o.waitForSessionWithHealing(job, "coding", logFunc)
 	if err != nil {
-		// Timeout or error after healing attempts - mark as blocked for human review
 		o.log(job.ID, "error", fmt.Sprintf("OpenCode session did not complete: %v", err))
-		job.State = db.StateBlocked
-		job.BlockerReason = fmt.Sprintf("OpenCode session timed out or failed: %v", err)
-		if updateErr := o.db.UpdateJob(job); updateErr != nil {
-			return fmt.Errorf("failed to mark job as blocked: %w (original error: %v)", updateErr, err)
-		}
-		return nil // Don't fail the job, just block it for human intervention
+		return fmt.Errorf("OpenCode coding session timed out or failed: %w", err)
 	}
 
 	// Update job with final session ID (in case it was healed)
