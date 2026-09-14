@@ -5,7 +5,6 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
-	"strings"
 	"testing"
 	"time"
 )
@@ -451,7 +450,73 @@ func containsHelper(s, substr string) bool {
 	return false
 }
 
-func TestIsSessionBusy(t *testing.T) {
+func TestIsSessionBusyV2(t *testing.T) {
+	tests := []struct {
+		name           string
+		sessionID      string
+		activeSessions map[string]SessionActive
+		wantBusy       bool
+		wantError      bool
+	}{
+		{
+			name:      "session is active/busy",
+			sessionID: "ses_abc123",
+			activeSessions: map[string]SessionActive{
+				"ses_abc123": {ID: "ses_abc123", Status: "active"},
+			},
+			wantBusy:  true,
+			wantError: false,
+		},
+		{
+			name:      "session is idle (not in active map)",
+			sessionID: "ses_xyz789",
+			activeSessions: map[string]SessionActive{
+				"ses_abc123": {ID: "ses_abc123", Status: "active"},
+			},
+			wantBusy:  false,
+			wantError: false,
+		},
+		{
+			name:           "no active sessions at all",
+			sessionID:      "ses_xyz789",
+			activeSessions: map[string]SessionActive{},
+			wantBusy:       false,
+			wantError:      false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != "/api/session/active" {
+					t.Errorf("Expected path /api/session/active, got %s", r.URL.Path)
+				}
+				
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusOK)
+				json.NewEncoder(w).Encode(V2ActiveSessionsResponse{
+					Data: tt.activeSessions,
+				})
+			}))
+			defer server.Close()
+
+			client := NewClient(server.URL, "", "", "v2")
+			busy, err := client.IsSessionBusy(tt.sessionID, "")
+
+			if tt.wantError && err == nil {
+				t.Fatal("Expected error but got nil")
+			}
+			if !tt.wantError && err != nil {
+				t.Fatalf("Unexpected error: %v", err)
+			}
+			if busy != tt.wantBusy {
+				t.Errorf("Expected busy=%v, got %v", tt.wantBusy, busy)
+			}
+		})
+	}
+}
+
+func TestIsSessionBusyClassic(t *testing.T) {
 	tests := []struct {
 		name      string
 		sessionID string
@@ -478,13 +543,13 @@ func TestIsSessionBusy(t *testing.T) {
 			wantError: false,
 		},
 		{
-			name:      "session not found",
+			name:      "session not in map (completed)",
 			sessionID: "session-456",
 			status: SessionStatus{
 				"session-123": SessionInfo{Status: "idle", Busy: false},
 			},
 			wantBusy:  false,
-			wantError: true,
+			wantError: false,
 		},
 	}
 
@@ -501,8 +566,8 @@ func TestIsSessionBusy(t *testing.T) {
 			}))
 			defer server.Close()
 
-			client := NewClient(server.URL, "", "", "v2")
-			busy, err := client.IsSessionBusy(tt.sessionID)
+			client := NewClient(server.URL, "", "", "classic")
+			busy, err := client.IsSessionBusy(tt.sessionID, "")
 
 			if tt.wantError && err == nil {
 				t.Fatal("Expected error but got nil")
@@ -517,87 +582,157 @@ func TestIsSessionBusy(t *testing.T) {
 	}
 }
 
-func TestWaitForSessionIdle(t *testing.T) {
-	tests := []struct {
-		name        string
-		sessionID   string
-		statusSeq   []SessionStatus
-		timeout     time.Duration
-		wantError   bool
-		wantTimeout bool
-	}{
-		{
-			name:      "session becomes idle immediately",
-			sessionID: "session-123",
-			statusSeq: []SessionStatus{
-				{"session-123": SessionInfo{Status: "idle", Busy: false}},
-			},
-			timeout:     10 * time.Second,
-			wantError:   false,
-			wantTimeout: false,
-		},
-		{
-			name:      "session transitions from busy to idle",
-			sessionID: "session-123",
-			statusSeq: []SessionStatus{
-				{"session-123": SessionInfo{Status: "active", Busy: true}},
-				{"session-123": SessionInfo{Status: "active", Busy: true}},
-				{"session-123": SessionInfo{Status: "idle", Busy: false}},
-			},
-			timeout:     10 * time.Second,
-			wantError:   false,
-			wantTimeout: false,
-		},
-		{
-			name:      "timeout waiting for idle",
-			sessionID: "session-123",
-			statusSeq: []SessionStatus{
-				{"session-123": SessionInfo{Status: "active", Busy: true}},
-				{"session-123": SessionInfo{Status: "active", Busy: true}},
-				{"session-123": SessionInfo{Status: "active", Busy: true}},
-			},
-			timeout:     3 * time.Second,
-			wantError:   true,
-			wantTimeout: true,
-		},
+func TestWaitForSessionIdleV2RaceCondition(t *testing.T) {
+	// Test that we handle the race condition: empty active map right after prompt
+	// should NOT immediately return success - must wait for session to become active first
+	callCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		
+		// Simulate race condition:
+		// Call 1-2: session not yet active (OpenCode hasn't started processing)
+		// Call 3-4: session becomes active
+		// Call 5+: session completes (not in active map)
+		var response V2ActiveSessionsResponse
+		if callCount <= 2 {
+			// Not yet started
+			response = V2ActiveSessionsResponse{Data: map[string]SessionActive{}}
+		} else if callCount <= 4 {
+			// Now active
+			response = V2ActiveSessionsResponse{
+				Data: map[string]SessionActive{
+					"ses_test": {ID: "ses_test", Status: "active"},
+				},
+			}
+		} else {
+			// Completed (not in active map)
+			response = V2ActiveSessionsResponse{Data: map[string]SessionActive{}}
+		}
+		
+		json.NewEncoder(w).Encode(response)
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL, "", "", "v2")
+	
+	var logMessages []string
+	logFunc := func(msg string) {
+		logMessages = append(logMessages, msg)
 	}
+	
+	err := client.WaitForSessionIdle("ses_test", 30*time.Second, "", logFunc)
+	if err != nil {
+		t.Fatalf("Expected success, got error: %v", err)
+	}
+	
+	// Should have made at least 5 calls (waiting for active, then idle)
+	if callCount < 5 {
+		t.Errorf("Expected at least 5 API calls to handle race condition, got %d", callCount)
+	}
+	
+	// Should have logged the transition
+	if len(logMessages) < 2 {
+		t.Errorf("Expected at least 2 log messages, got %d: %v", len(logMessages), logMessages)
+	}
+}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			callCount := 0
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				if r.URL.Path != "/session/status" {
-					t.Errorf("Expected path /session/status, got %s", r.URL.Path)
-				}
-
-				// Return status based on call count
-				var status SessionStatus
-				if callCount < len(tt.statusSeq) {
-					status = tt.statusSeq[callCount]
-				} else {
-					// Keep returning last status
-					status = tt.statusSeq[len(tt.statusSeq)-1]
-				}
-				callCount++
-
-				w.Header().Set("Content-Type", "application/json")
-				w.WriteHeader(http.StatusOK)
-				json.NewEncoder(w).Encode(status)
-			}))
-			defer server.Close()
-
-			client := NewClient(server.URL, "", "", "v2")
-			err := client.WaitForSessionIdle(tt.sessionID, tt.timeout)
-
-			if tt.wantError && err == nil {
-				t.Fatal("Expected error but got nil")
+func TestWaitForSessionIdleV2ImmediatelyActive(t *testing.T) {
+	// Test that if session is immediately active, we wait for it to complete
+	callCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		
+		// Session is active on first check, then completes
+		var response V2ActiveSessionsResponse
+		if callCount <= 2 {
+			response = V2ActiveSessionsResponse{
+				Data: map[string]SessionActive{
+					"ses_test": {ID: "ses_test", Status: "active"},
+				},
 			}
-			if !tt.wantError && err != nil {
-				t.Fatalf("Unexpected error: %v", err)
+		} else {
+			response = V2ActiveSessionsResponse{Data: map[string]SessionActive{}}
+		}
+		
+		json.NewEncoder(w).Encode(response)
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL, "", "", "v2")
+	
+	err := client.WaitForSessionIdle("ses_test", 30*time.Second, "", nil)
+	if err != nil {
+		t.Fatalf("Expected success, got error: %v", err)
+	}
+	
+	if callCount < 3 {
+		t.Errorf("Expected at least 3 API calls, got %d", callCount)
+	}
+}
+
+func TestWaitForSessionIdleClassic(t *testing.T) {
+	// Test classic version still works
+	callCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		
+		// First 2 calls: busy, then idle
+		var status SessionStatus
+		if callCount <= 2 {
+			status = SessionStatus{
+				"session-123": SessionInfo{Status: "active", Busy: true},
 			}
-			if tt.wantTimeout && err != nil && !strings.Contains(err.Error(), "timeout") {
-				t.Errorf("Expected timeout error, got: %v", err)
+		} else {
+			status = SessionStatus{
+				"session-123": SessionInfo{Status: "idle", Busy: false},
 			}
+		}
+		
+		json.NewEncoder(w).Encode(status)
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL, "", "", "classic")
+	
+	err := client.WaitForSessionIdle("session-123", 30*time.Second, "", nil)
+	if err != nil {
+		t.Fatalf("Expected success, got error: %v", err)
+	}
+	
+	if callCount < 3 {
+		t.Errorf("Expected at least 3 API calls, got %d", callCount)
+	}
+}
+
+func TestWaitForSessionIdleTimeout(t *testing.T) {
+	// Test timeout is enforced
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Always return active
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(V2ActiveSessionsResponse{
+			Data: map[string]SessionActive{
+				"ses_test": {ID: "ses_test", Status: "active"},
+			},
 		})
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL, "", "", "v2")
+	
+	// Use very short timeout
+	err := client.WaitForSessionIdle("ses_test", 3*time.Second, "", nil)
+	if err == nil {
+		t.Fatal("Expected timeout error, got nil")
+	}
+	
+	if !contains(err.Error(), "timeout") {
+		t.Errorf("Expected timeout error message, got: %v", err)
 	}
 }

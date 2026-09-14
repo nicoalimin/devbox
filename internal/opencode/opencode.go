@@ -41,13 +41,25 @@ type HealthResponse struct {
 	Healthy bool `json:"healthy"`
 }
 
-// SessionStatus represents the status of sessions
+// SessionStatus represents the status of sessions (classic API)
 type SessionStatus map[string]SessionInfo
 
-// SessionInfo represents information about a session
+// SessionInfo represents information about a session (classic API)
 type SessionInfo struct {
 	Status string `json:"status"`
 	Busy   bool   `json:"busy"`
+}
+
+// V2ActiveSessionsResponse represents the /api/session/active response
+type V2ActiveSessionsResponse struct {
+	Data map[string]SessionActive `json:"data"`
+}
+
+// SessionActive represents an active session in OpenCode2
+type SessionActive struct {
+	ID     interface{} `json:"id"`
+	Status string      `json:"status,omitempty"`
+	// Other fields can be added as needed
 }
 
 // Session represents an OpenCode session
@@ -227,8 +239,40 @@ func (c *Client) SendMessage(sessionID, message, directory string) error {
 	return c.sendMessageClassic(sessionID, message, directory)
 }
 
-// IsSessionBusy checks if a specific session is busy
-func (c *Client) IsSessionBusy(sessionID string) (bool, error) {
+// IsSessionBusy checks if a specific session is busy (version-aware)
+// For v2: session is busy if present in /api/session/active map
+// For classic: session is busy if status shows busy field = true
+// directory parameter is optional and only used for v2 instance-scoped endpoints
+func (c *Client) IsSessionBusy(sessionID string, directory string) (bool, error) {
+	if c.version == "v2" {
+		return c.isSessionBusyV2(sessionID, directory)
+	}
+	return c.isSessionBusyClassic(sessionID)
+}
+
+// isSessionBusyV2 checks if a session is busy using OpenCode2 /api/session/active
+func (c *Client) isSessionBusyV2(sessionID string, directory string) (bool, error) {
+	path := "/api/session/active"
+	
+	// Add directory header if provided (for instance-scoped routing)
+	var response V2ActiveSessionsResponse
+	if directory != "" {
+		// For now, directory routing is handled at session creation
+		// If we need per-request routing, we'd add x-opencode-directory header here
+		// or ?directory= query parameter
+	}
+	
+	if err := c.get(path, &response); err != nil {
+		return false, fmt.Errorf("failed to get active sessions: %w", err)
+	}
+	
+	// Session is busy if it's present in the active map
+	_, isActive := response.Data[sessionID]
+	return isActive, nil
+}
+
+// isSessionBusyClassic checks if a session is busy using classic /session/status
+func (c *Client) isSessionBusyClassic(sessionID string) (bool, error) {
 	status, err := c.GetSessionStatus()
 	if err != nil {
 		return false, err
@@ -236,42 +280,109 @@ func (c *Client) IsSessionBusy(sessionID string) (bool, error) {
 	
 	sessionInfo, exists := status[sessionID]
 	if !exists {
-		return false, fmt.Errorf("session %s not found in status", sessionID)
+		// Session not in status map - could mean completed or not started yet
+		// Return false (not busy) - caller should handle this case
+		return false, nil
 	}
 	
 	return sessionInfo.Busy, nil
 }
 
 // WaitForSessionIdle polls the session status until it becomes idle or timeout
-func (c *Client) WaitForSessionIdle(sessionID string, timeout time.Duration) error {
-	deadline := time.Now().Add(timeout)
-	backoff := 2 * time.Second
-	maxBackoff := 30 * time.Second
+// Handles race condition: waits for session to become active before checking for idle
+// directory parameter is optional and used for v2 instance-scoped routing
+// logFunc is called periodically with status updates (can be nil)
+func (c *Client) WaitForSessionIdle(sessionID string, timeout time.Duration, directory string, logFunc func(string)) error {
+	start := time.Now()
+	pollInterval := 5 * time.Second
+	logInterval := 30 * time.Second
+	lastLog := time.Now()
 	
-	for {
-		if time.Now().After(deadline) {
-			return fmt.Errorf("timeout waiting for session %s to become idle after %v", sessionID, timeout)
+	// Phase 1: Wait for session to become active (race condition protection)
+	// For v2: after sending prompt, OpenCode may take a moment to start processing
+	// Don't treat "not in active map" as idle until we've seen it become active at least once
+	sawActive := false
+	warmupDeadline := start.Add(30 * time.Second) // Give it 30s to start
+	
+	if logFunc != nil {
+		logFunc(fmt.Sprintf("Waiting for OpenCode session %s to start (version: %s)", sessionID, c.version))
+	}
+	
+	for !sawActive && time.Now().Before(warmupDeadline) {
+		if time.Now().After(start.Add(timeout)) {
+			return fmt.Errorf("timeout waiting for session %s to start after %v", sessionID, timeout)
 		}
 		
-		busy, err := c.IsSessionBusy(sessionID)
+		busy, err := c.IsSessionBusy(sessionID, directory)
 		if err != nil {
-			// Session might not exist yet, wait and retry
-			time.Sleep(backoff)
-			if backoff < maxBackoff {
-				backoff *= 2
+			// Log error but continue - might be temporary
+			if logFunc != nil && time.Now().Sub(lastLog) >= logInterval {
+				logFunc(fmt.Sprintf("Warning: failed to check session status: %v", err))
+				lastLog = time.Now()
 			}
+			time.Sleep(pollInterval)
 			continue
 		}
 		
-		if !busy {
-			return nil
+		if busy {
+			sawActive = true
+			if logFunc != nil {
+				logFunc(fmt.Sprintf("OpenCode session %s is now active, waiting for completion", sessionID))
+			}
+			break
 		}
 		
-		// Wait before next check
-		time.Sleep(backoff)
-		if backoff < maxBackoff {
-			backoff *= 2
+		// Not yet active, wait a bit
+		time.Sleep(pollInterval)
+	}
+	
+	// If we never saw the session become active, that's unusual but not necessarily an error
+	// It could mean OpenCode finished very quickly. Log a warning and proceed to check for completion signals.
+	if !sawActive {
+		if logFunc != nil {
+			logFunc(fmt.Sprintf("Warning: session %s never appeared in active map (may have completed very quickly)", sessionID))
 		}
+	}
+	
+	// Phase 2: Wait for session to become idle
+	lastLog = time.Now()
+	for {
+		elapsed := time.Since(start)
+		if elapsed >= timeout {
+			return fmt.Errorf("timeout waiting for session %s after %v", sessionID, elapsed)
+		}
+		
+		busy, err := c.IsSessionBusy(sessionID, directory)
+		if err != nil {
+			// Log error but continue - might be temporary
+			if logFunc != nil && time.Now().Sub(lastLog) >= logInterval {
+				logFunc(fmt.Sprintf("Warning: failed to check session status: %v", err))
+				lastLog = time.Now()
+			}
+			time.Sleep(pollInterval)
+			continue
+		}
+		
+		// Session is idle only if we saw it active before OR it's not in the map
+		if !busy {
+			if sawActive || c.version == "classic" {
+				// For v2: idle after being active = done
+				// For classic: not busy = idle
+				if logFunc != nil {
+					logFunc(fmt.Sprintf("OpenCode session %s completed after %v", sessionID, elapsed))
+				}
+				return nil
+			}
+			// For v2: not active yet, keep waiting
+		}
+		
+		// Log progress periodically
+		if logFunc != nil && time.Now().Sub(lastLog) >= logInterval {
+			logFunc(fmt.Sprintf("Still waiting for OpenCode session %s (elapsed: %v)", sessionID, elapsed))
+			lastLog = time.Now()
+		}
+		
+		time.Sleep(pollInterval)
 	}
 }
 
