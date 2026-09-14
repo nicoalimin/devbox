@@ -98,6 +98,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case JobsPane:
 				if m.selectedJobIdx < len(m.recentJobs)-1 {
 					m.selectedJobIdx++
+					// Scroll to bottom immediately when selecting a different job
+					if m.ready {
+						m.jobLogsViewport.GotoBottom()
+					}
 					cmds = append(cmds, m.refreshJobLogs())
 				}
 			case ServerLogsPane:
@@ -113,6 +117,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case JobsPane:
 				if m.selectedJobIdx > 0 {
 					m.selectedJobIdx--
+					// Scroll to bottom immediately when selecting a different job
+					if m.ready {
+						m.jobLogsViewport.GotoBottom()
+					}
 					cmds = append(cmds, m.refreshJobLogs())
 				}
 			case ServerLogsPane:
@@ -128,6 +136,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			switch m.focusedPane {
 			case JobsPane:
 				m.selectedJobIdx = 0
+				// Scroll to bottom immediately when selecting a different job
+				if m.ready {
+					m.jobLogsViewport.GotoBottom()
+				}
 				cmds = append(cmds, m.refreshJobLogs())
 			case ServerLogsPane:
 				m.serverLogsViewport.GotoTop()
@@ -142,6 +154,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case JobsPane:
 				if len(m.recentJobs) > 0 {
 					m.selectedJobIdx = len(m.recentJobs) - 1
+					// Scroll to bottom immediately when selecting a different job
+					if m.ready {
+						m.jobLogsViewport.GotoBottom()
+					}
 					cmds = append(cmds, m.refreshJobLogs())
 				}
 			case ServerLogsPane:
@@ -156,6 +172,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// Switch focus to job logs pane
 			if m.focusedPane == JobsPane {
 				m.focusedPane = JobLogsPane
+				// Immediately scroll to bottom when entering job logs
+				if m.ready {
+					m.jobLogsViewport.GotoBottom()
+				}
 			}
 			return m, nil
 		}
