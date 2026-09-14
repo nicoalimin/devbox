@@ -155,6 +155,21 @@ When writing code:
 - ✅ **Use meaningful commit messages** that reference the Linear issue
 - ✅ **Keep PRs focused** on the single issue (no scope creep)
 
+#### TUI (Terminal User Interface) Requirements
+
+If your changes affect the TUI (`internal/tui/` files), you **must** verify:
+
+- ✅ **Full-screen fit**: The entire dashboard (header + both columns + footer) fits within **one terminal screen** with no overflow or clipping
+  - Test with various terminal sizes (minimum: 80x24, recommended: 120x30+)
+  - Both columns (left sidebar: JOBS + ERRORS + INTEGRATIONS, right: LIVE SERVER LOGS + JOB LOGS) must have the **same total height**
+  - Resize the terminal to confirm no content is pushed above the visible area
+- ✅ **Layout balance**: Left column height equals right column height
+- ✅ **Headless mode**: `--no-tui` flag still works correctly
+- ✅ **Navigation**: Independent scrolling in server logs and job logs panes functions correctly
+- ✅ **Job selection**: Changing selected job in jobs pane updates job logs pane as expected
+
+**Why this matters**: The TUI is an immersive full-screen interface (like vim/htop). Users expect it to fit perfectly in one terminal screen without overflow or manual scrolling. Unbalanced columns or overflow break the professional user experience.
+
 #### Commit Message Format
 
 ```

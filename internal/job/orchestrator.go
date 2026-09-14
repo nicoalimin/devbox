@@ -270,6 +270,7 @@ func (o *Orchestrator) reviewCode(job *db.Job) error {
 2. Verify tests are passing
 3. Ensure documentation is updated
 4. Confirm the implementation matches requirements
+5. **TUI changes (internal/tui/)**: Verify the dashboard fits entirely in one terminal screen with no overflow or clipped header/footer. Left column height (jobs + errors + integrations) must equal right column height (server logs + job logs).
 
 If you find issues, fix them now. If everything looks good, confirm the changes are ready.`
 
