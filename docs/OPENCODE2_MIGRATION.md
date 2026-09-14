@@ -14,6 +14,7 @@ OpenCode2 introduced breaking changes to the HTTP API:
 |-----------|------------------|-----------|
 | Create Session | `POST /session?directory=<path>` | `POST /api/session` with `location: {directory}` in body |
 | Send Message | `POST /session/{id}/message?directory=<path>` | `POST /api/session/{id}/prompt` with `location: {directory}` in body |
+| Event Stream | N/A | `GET /event` or `GET /global/event` (SSE) |
 | Response Format | `{id: "string", status: "string"}` | `{data: {id: {value: "string"}}}` |
 
 ### Key Differences
@@ -22,6 +23,7 @@ OpenCode2 introduced breaking changes to the HTTP API:
 2. **Directory Parameter**: Moved from query parameter to request body under `location.directory`
 3. **Endpoint Names**: `/message` → `/prompt` for sending prompts to sessions
 4. **Response Structure**: Wrapped in `{data: ...}` envelope with nested ID objects
+5. **Event Streaming**: OpenCode2 provides SSE event streams at `/event` (directory-scoped) or `/global/event` for real-time session updates
 
 ## Configuration
 

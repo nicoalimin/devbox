@@ -551,46 +551,75 @@ func (c *Client) post(path string, body interface{}, result interface{}) error {
 // StreamSessionEvents subscribes to session events via SSE and calls the handler for each event.
 // Returns a stop function to terminate the stream and any subscription errors.
 // The handler receives parsed events and should return quickly to avoid blocking the stream.
+// For OpenCode2, this connects to the global event stream and filters events by sessionID.
 func (c *Client) StreamSessionEvents(sessionID string, handler func(SessionEvent) error) (stopFunc func(), err error) {
 	if c.version != "v2" {
 		return nil, fmt.Errorf("event streaming only supported for OpenCode v2")
 	}
 
-	path := fmt.Sprintf("/api/session/%s/event", sessionID)
-	fullURL := c.baseURL + path
-
-	req, err := http.NewRequest("GET", fullURL, nil)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
+	// OpenCode2 SSE endpoints to try, in order of preference
+	// The API uses /event or /global/event, NOT /api/session/{id}/event
+	paths := []string{
+		"/event",        // Directory-scoped (preferred if available)
+		"/global/event", // Global event stream
+		"/api/event",    // Alternative with /api prefix
+		"/api/global/event",
 	}
 
-	if c.username != "" && c.password != "" {
-		req.SetBasicAuth(c.username, c.password)
-	}
-
-	req.Header.Set("Accept", "text/event-stream")
-	req.Header.Set("Cache-Control", "no-cache")
+	var resp *http.Response
+	var fullURL string
+	var lastErr error
 
 	// Use a new client with no timeout for SSE
 	sseClient := &http.Client{
 		Timeout: 0, // No timeout for long-lived SSE connection
 	}
 
-	resp, err := sseClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("request failed: %w", err)
-	}
+	// Try each endpoint until one succeeds
+	for _, path := range paths {
+		fullURL = c.baseURL + path
 
-	if resp.StatusCode != http.StatusOK {
+		req, err := http.NewRequest("GET", fullURL, nil)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create request: %w", err)
+		}
+
+		if c.username != "" && c.password != "" {
+			req.SetBasicAuth(c.username, c.password)
+		}
+
+		req.Header.Set("Accept", "text/event-stream")
+		req.Header.Set("Cache-Control", "no-cache")
+
+		resp, err = sseClient.Do(req)
+		if err != nil {
+			lastErr = err
+			continue // Try next endpoint
+		}
+
+		if resp.StatusCode == http.StatusOK {
+			// Success! Use this endpoint
+			break
+		}
+
+		// Non-200 response, try next endpoint
 		respBody, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
-		return nil, &HTTPError{
+		lastErr = &HTTPError{
 			Method:       "GET",
 			URL:          fullURL,
 			StatusCode:   resp.StatusCode,
 			Status:       resp.Status,
 			ResponseBody: strings.TrimSpace(string(respBody)),
 		}
+	}
+
+	// If all endpoints failed, return the last error
+	if resp == nil || resp.StatusCode != http.StatusOK {
+		if lastErr != nil {
+			return nil, fmt.Errorf("all SSE endpoints failed, last error: %w", lastErr)
+		}
+		return nil, fmt.Errorf("failed to connect to any SSE endpoint")
 	}
 
 	// Create stop channel and cleanup function
@@ -651,7 +680,26 @@ func (c *Client) StreamSessionEvents(sessionID string, handler func(SessionEvent
 					continue
 				}
 
-				// Call handler
+				// Filter events by sessionID
+				// OpenCode2 global event stream includes events for all sessions
+				// Check properties.sessionID or properties.session.id
+				eventSessionID := ""
+				if sid, ok := event.Properties["sessionID"].(string); ok {
+					eventSessionID = sid
+				} else if sid, ok := event.Properties["sessionId"].(string); ok {
+					eventSessionID = sid
+				} else if sessionObj, ok := event.Properties["session"].(map[string]interface{}); ok {
+					if sid, ok := sessionObj["id"].(string); ok {
+						eventSessionID = sid
+					}
+				}
+
+				// Skip events that don't match our sessionID (unless it's server.connected)
+				if eventSessionID != "" && eventSessionID != sessionID && event.Type != "server.connected" {
+					continue
+				}
+
+				// Call handler for matching events
 				if err := handler(event); err != nil {
 					// Handler error, stop streaming
 					stopFunc()
