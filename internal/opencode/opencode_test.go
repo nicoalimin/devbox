@@ -3,6 +3,7 @@ package opencode
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -894,5 +895,187 @@ func TestWaitForSessionIdleReusedSessionHangsActive(t *testing.T) {
 	}
 	if !hasActiveLog {
 		t.Error("Expected to see 'is now active' log message")
+	}
+}
+
+func TestStreamSessionEventsV2(t *testing.T) {
+	tests := []struct {
+		name           string
+		sessionID      string
+		endpointPath   string
+		events         []string
+		expectFiltered bool
+	}{
+		{
+			name:         "/event endpoint works",
+			sessionID:    "ses_abc123",
+			endpointPath: "/event",
+			events: []string{
+				`{"type":"server.connected","properties":{}}`,
+				`{"type":"session.status","properties":{"sessionID":"ses_abc123","status":"active"}}`,
+				`{"type":"session.status","properties":{"sessionID":"other_session","status":"active"}}`,
+			},
+			expectFiltered: true,
+		},
+		{
+			name:         "/global/event endpoint works",
+			sessionID:    "ses_xyz",
+			endpointPath: "/global/event",
+			events: []string{
+				`{"type":"session.next.tool.started","properties":{"sessionID":"ses_xyz"},"data":{"tool":"read_file"}}`,
+			},
+			expectFiltered: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			receivedEvents := []SessionEvent{}
+			
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				// Check that it's trying the right endpoint
+				if r.URL.Path != tt.endpointPath {
+					http.NotFound(w, r)
+					return
+				}
+
+				// Verify SSE headers
+				if r.Header.Get("Accept") != "text/event-stream" {
+					t.Errorf("Expected Accept: text/event-stream header")
+				}
+
+				// Stream events
+				w.Header().Set("Content-Type", "text/event-stream")
+				w.Header().Set("Cache-Control", "no-cache")
+				w.WriteHeader(http.StatusOK)
+
+				flusher, ok := w.(http.Flusher)
+				if !ok {
+					t.Fatal("ResponseWriter doesn't support flushing")
+				}
+
+				for _, event := range tt.events {
+					w.Write([]byte("data: " + event + "\n\n"))
+					flusher.Flush()
+				}
+			}))
+			defer server.Close()
+
+			client := NewClient(server.URL, "", "", "v2")
+			
+			handler := func(event SessionEvent) error {
+				receivedEvents = append(receivedEvents, event)
+				if len(receivedEvents) >= 2 {
+					// Stop after receiving expected events
+					return fmt.Errorf("done")
+				}
+				return nil
+			}
+
+			stopFunc, err := client.StreamSessionEvents(tt.sessionID, handler)
+			if err != nil {
+				t.Fatalf("StreamSessionEvents failed: %v", err)
+			}
+			defer stopFunc()
+
+			// Wait a bit for events to arrive
+			time.Sleep(200 * time.Millisecond)
+
+			// Verify we received events
+			if len(receivedEvents) == 0 {
+				t.Fatal("Expected to receive events, got none")
+			}
+
+			// Verify filtering if expected
+			if tt.expectFiltered {
+				for _, event := range receivedEvents {
+					if event.Type == "server.connected" {
+						continue // server.connected is always allowed
+					}
+					// Check that sessionID matches if present
+					if sid, ok := event.Properties["sessionID"].(string); ok {
+						if sid != tt.sessionID {
+							t.Errorf("Expected filtered events for session %s, but got event for %s", tt.sessionID, sid)
+						}
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestStreamSessionEventsEndpointFallback(t *testing.T) {
+	// Test that client tries multiple endpoints and succeeds with fallback
+	sessionID := "ses_test"
+	attempts := []string{}
+	
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts = append(attempts, r.URL.Path)
+		
+		// First 3 endpoints return 404
+		if len(attempts) <= 3 {
+			http.NotFound(w, r)
+			return
+		}
+
+		// Fourth endpoint succeeds
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("data: {\"type\":\"server.connected\"}\n\n"))
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL, "", "", "v2")
+	
+	stopFunc, err := client.StreamSessionEvents(sessionID, func(event SessionEvent) error {
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("Expected success with fallback, got error: %v", err)
+	}
+	defer stopFunc()
+
+	// Verify it tried multiple endpoints
+	if len(attempts) < 2 {
+		t.Errorf("Expected multiple endpoint attempts, got %d: %v", len(attempts), attempts)
+	}
+}
+
+func TestStreamSessionEventsAllEndpointsFail(t *testing.T) {
+	// Test that client returns error when all endpoints fail
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.NotFound(w, r)
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL, "", "", "v2")
+	
+	_, err := client.StreamSessionEvents("ses_test", func(event SessionEvent) error {
+		return nil
+	})
+	
+	if err == nil {
+		t.Fatal("Expected error when all endpoints fail, got nil")
+	}
+
+	if !contains(err.Error(), "failed") {
+		t.Errorf("Expected error message about failure, got: %v", err)
+	}
+}
+
+func TestStreamSessionEventsClassicUnsupported(t *testing.T) {
+	// Test that classic version returns error
+	client := NewClient("http://localhost", "", "", "classic")
+	
+	_, err := client.StreamSessionEvents("session-123", func(event SessionEvent) error {
+		return nil
+	})
+	
+	if err == nil {
+		t.Fatal("Expected error for classic version, got nil")
+	}
+
+	if !contains(err.Error(), "only supported for OpenCode v2") {
+		t.Errorf("Expected unsupported error message, got: %v", err)
 	}
 }
