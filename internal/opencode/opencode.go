@@ -1,12 +1,14 @@
 package opencode
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -105,6 +107,14 @@ func (e *HTTPError) Error() string {
 		msg += fmt.Sprintf(": %s", e.ResponseBody)
 	}
 	return msg
+}
+
+// SessionEvent represents an OpenCode session event from the SSE stream
+type SessionEvent struct {
+	ID         string                 `json:"id"`
+	Type       string                 `json:"type"`
+	Properties map[string]interface{} `json:"properties"`
+	Data       map[string]interface{} `json:"data"`
 }
 
 // HealthCheck checks if OpenCode is healthy
@@ -536,4 +546,120 @@ func (c *Client) post(path string, body interface{}, result interface{}) error {
 	}
 
 	return nil
+}
+
+// StreamSessionEvents subscribes to session events via SSE and calls the handler for each event.
+// Returns a stop function to terminate the stream and any subscription errors.
+// The handler receives parsed events and should return quickly to avoid blocking the stream.
+func (c *Client) StreamSessionEvents(sessionID string, handler func(SessionEvent) error) (stopFunc func(), err error) {
+	if c.version != "v2" {
+		return nil, fmt.Errorf("event streaming only supported for OpenCode v2")
+	}
+
+	path := fmt.Sprintf("/api/session/%s/event", sessionID)
+	fullURL := c.baseURL + path
+
+	req, err := http.NewRequest("GET", fullURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+
+	if c.username != "" && c.password != "" {
+		req.SetBasicAuth(c.username, c.password)
+	}
+
+	req.Header.Set("Accept", "text/event-stream")
+	req.Header.Set("Cache-Control", "no-cache")
+
+	// Use a new client with no timeout for SSE
+	sseClient := &http.Client{
+		Timeout: 0, // No timeout for long-lived SSE connection
+	}
+
+	resp, err := sseClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("request failed: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		return nil, &HTTPError{
+			Method:       "GET",
+			URL:          fullURL,
+			StatusCode:   resp.StatusCode,
+			Status:       resp.Status,
+			ResponseBody: strings.TrimSpace(string(respBody)),
+		}
+	}
+
+	// Create stop channel and cleanup function
+	stopCh := make(chan struct{})
+	stopped := false
+	var mu sync.Mutex
+
+	stopFunc = func() {
+		mu.Lock()
+		defer mu.Unlock()
+		if !stopped {
+			stopped = true
+			close(stopCh)
+			resp.Body.Close()
+		}
+	}
+
+	// Start goroutine to read SSE stream
+	go func() {
+		defer resp.Body.Close()
+		reader := bufio.NewReader(resp.Body)
+
+		for {
+			select {
+			case <-stopCh:
+				return
+			default:
+			}
+
+			line, err := reader.ReadString('\n')
+			if err != nil {
+				if err != io.EOF {
+					// Stream error, call handler with error event
+					handler(SessionEvent{
+						Type: "stream.error",
+						Data: map[string]interface{}{
+							"error": err.Error(),
+						},
+					})
+				}
+				return
+			}
+
+			line = strings.TrimSpace(line)
+
+			// Skip empty lines and comments
+			if line == "" || strings.HasPrefix(line, ":") {
+				continue
+			}
+
+			// Parse SSE data line
+			if strings.HasPrefix(line, "data: ") {
+				data := strings.TrimPrefix(line, "data: ")
+				
+				var event SessionEvent
+				if err := json.Unmarshal([]byte(data), &event); err != nil {
+					// Skip malformed events
+					continue
+				}
+
+				// Call handler
+				if err := handler(event); err != nil {
+					// Handler error, stop streaming
+					stopFunc()
+					return
+				}
+			}
+		}
+	}()
+
+	return stopFunc, nil
 }

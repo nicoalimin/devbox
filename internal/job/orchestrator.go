@@ -5,6 +5,7 @@ import (
 	"log"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -17,12 +18,14 @@ import (
 
 // Orchestrator manages job lifecycle
 type Orchestrator struct {
-	cfg            *config.Config
-	db             *db.DB
-	linear         *linear.Client
-	opencode       *opencode.Client
-	activeJobs     map[string]bool // Track actively running jobs to prevent double-resume
-	healingAttempts map[string]int  // Track session healing attempts per job (jobID -> count)
+	cfg             *config.Config
+	db              *db.DB
+	linear          *linear.Client
+	opencode        *opencode.Client
+	activeJobs      map[string]bool              // Track actively running jobs to prevent double-resume
+	healingAttempts map[string]int               // Track session healing attempts per job (jobID -> count)
+	streamStopFuncs map[string]func()            // Stop functions for active event streams (jobID -> stopFunc)
+	streamMu        sync.Mutex                   // Mutex to protect streamStopFuncs map
 }
 
 const (
@@ -38,6 +41,7 @@ func NewOrchestrator(cfg *config.Config, database *db.DB) *Orchestrator {
 		opencode:        opencode.NewClient(cfg.OpenCode.BaseURL, cfg.OpenCode.Username, cfg.OpenCode.Password, cfg.OpenCode.Version),
 		activeJobs:      make(map[string]bool),
 		healingAttempts: make(map[string]int),
+		streamStopFuncs: make(map[string]func()),
 	}
 }
 
@@ -261,6 +265,13 @@ func (o *Orchestrator) executeCoding(job *db.Job) error {
 
 	o.log(job.ID, "info", "Sent task to OpenCode, waiting for completion")
 
+	// Start event stream to capture OpenCode logs
+	if err := o.startEventStream(job, session.ID); err != nil {
+		o.log(job.ID, "warn", fmt.Sprintf("Failed to start event stream: %v", err))
+		// Continue without streaming - not fatal
+	}
+	defer o.stopEventStream(job.ID)
+
 	// Wait for OpenCode to complete the coding task with healing support
 	logFunc := func(msg string) {
 		o.log(job.ID, "info", msg)
@@ -315,6 +326,13 @@ If you find issues, fix them now. If everything looks good, confirm the changes 
 	}
 
 	o.log(job.ID, "info", "Sent review prompt, waiting for completion")
+
+	// Start event stream to capture OpenCode logs
+	if err := o.startEventStream(job, job.OpenCodeSessionID); err != nil {
+		o.log(job.ID, "warn", fmt.Sprintf("Failed to start event stream: %v", err))
+		// Continue without streaming - not fatal
+	}
+	defer o.stopEventStream(job.ID)
 
 	// Wait for review to complete with healing support
 	logFunc := func(msg string) {
@@ -640,6 +658,13 @@ func (o *Orchestrator) resumeJobFromState(job *db.Job) {
 func (o *Orchestrator) resumeCoding(job *db.Job) error {
 	o.log(job.ID, "info", "Resuming OpenCode coding session wait")
 
+	// Start event stream to capture OpenCode logs
+	if err := o.startEventStream(job, job.OpenCodeSessionID); err != nil {
+		o.log(job.ID, "warn", fmt.Sprintf("Failed to start event stream: %v", err))
+		// Continue without streaming - not fatal
+	}
+	defer o.stopEventStream(job.ID)
+
 	// Wait for OpenCode to complete the coding task with healing support
 	logFunc := func(msg string) {
 		o.log(job.ID, "info", msg)
@@ -672,6 +697,13 @@ func (o *Orchestrator) resumeCoding(job *db.Job) error {
 // resumeReviewing resumes waiting for an existing OpenCode review session
 func (o *Orchestrator) resumeReviewing(job *db.Job) error {
 	o.log(job.ID, "info", "Resuming OpenCode review session wait")
+
+	// Start event stream to capture OpenCode logs
+	if err := o.startEventStream(job, job.OpenCodeSessionID); err != nil {
+		o.log(job.ID, "warn", fmt.Sprintf("Failed to start event stream: %v", err))
+		// Continue without streaming - not fatal
+	}
+	defer o.stopEventStream(job.ID)
 
 	// Wait for review to complete with healing support
 	logFunc := func(msg string) {
@@ -869,6 +901,13 @@ After making changes, confirm they are ready to push.`, feedback)
 
 	o.log(job.ID, "info", "Review feedback sent to OpenCode, waiting for completion")
 
+	// Start event stream to capture OpenCode logs
+	if err := o.startEventStream(job, sessionID); err != nil {
+		o.log(job.ID, "warn", fmt.Sprintf("Failed to start event stream: %v", err))
+		// Continue without streaming - not fatal
+	}
+	defer o.stopEventStream(job.ID)
+
 	// Wait for OpenCode session to become idle
 	logFunc := func(msg string) {
 		o.log(job.ID, "info", msg)
@@ -1041,4 +1080,111 @@ If you find issues, fix them now. If everything looks good, confirm the changes 
 	}
 	
 	return session.ID, nil
+}
+
+// startEventStream starts streaming OpenCode session events and logging them
+func (o *Orchestrator) startEventStream(job *db.Job, sessionID string) error {
+	// Only support v2
+	if o.cfg.OpenCode.Version != "v2" {
+		return nil // Silently skip for non-v2
+	}
+
+	o.log(job.ID, "info", "Starting OpenCode event stream")
+
+	// Create event handler that logs interesting events
+	handler := func(event opencode.SessionEvent) error {
+		// Map events to log entries
+		switch event.Type {
+		case "session.status":
+			// Log status changes
+			if status, ok := event.Properties["status"].(string); ok {
+				o.log(job.ID, "info", fmt.Sprintf("OpenCode session status: %s", status))
+			}
+
+		case "session.next.text.delta":
+			// Log streaming text deltas (coalesce to reduce noise)
+			if text, ok := event.Data["text"].(string); ok && len(text) > 0 {
+				// Only log substantial chunks to avoid flooding
+				if len(text) > 20 {
+					preview := text
+					if len(preview) > 60 {
+						preview = preview[:60] + "..."
+					}
+					o.log(job.ID, "info", fmt.Sprintf("OpenCode: %s", preview))
+				}
+			}
+
+		case "session.next.text.ended":
+			o.log(job.ID, "info", "OpenCode: text generation completed")
+
+		case "session.next.tool.started":
+			// Log tool calls
+			if toolName, ok := event.Data["tool"].(string); ok {
+				o.log(job.ID, "info", fmt.Sprintf("OpenCode: calling tool '%s'", toolName))
+			} else if toolMap, ok := event.Data["tool"].(map[string]interface{}); ok {
+				if name, ok := toolMap["name"].(string); ok {
+					o.log(job.ID, "info", fmt.Sprintf("OpenCode: calling tool '%s'", name))
+				}
+			}
+
+		case "session.next.tool.ended":
+			if toolName, ok := event.Data["tool"].(string); ok {
+				o.log(job.ID, "info", fmt.Sprintf("OpenCode: tool '%s' completed", toolName))
+			} else if toolMap, ok := event.Data["tool"].(map[string]interface{}); ok {
+				if name, ok := toolMap["name"].(string); ok {
+					o.log(job.ID, "info", fmt.Sprintf("OpenCode: tool '%s' completed", name))
+				}
+			}
+
+		case "session.error":
+			// Log errors
+			if errMsg, ok := event.Data["error"].(string); ok {
+				o.log(job.ID, "error", fmt.Sprintf("OpenCode error: %s", errMsg))
+			} else if errMap, ok := event.Data["error"].(map[string]interface{}); ok {
+				if msg, ok := errMap["message"].(string); ok {
+					o.log(job.ID, "error", fmt.Sprintf("OpenCode error: %s", msg))
+				}
+			}
+
+		case "stream.error":
+			// Stream connection error
+			if errMsg, ok := event.Data["error"].(string); ok {
+				o.log(job.ID, "warn", fmt.Sprintf("Event stream error: %s", errMsg))
+			}
+			return fmt.Errorf("stream error") // Stop on stream error
+
+		case "message.updated":
+			// Log message updates (concise)
+			o.log(job.ID, "info", "OpenCode: message updated")
+
+		default:
+			// Skip other events silently to reduce noise
+		}
+
+		return nil
+	}
+
+	// Start streaming
+	stopFunc, err := o.opencode.StreamSessionEvents(sessionID, handler)
+	if err != nil {
+		return fmt.Errorf("failed to start event stream: %w", err)
+	}
+
+	// Store stop function
+	o.streamMu.Lock()
+	o.streamStopFuncs[job.ID] = stopFunc
+	o.streamMu.Unlock()
+
+	return nil
+}
+
+// stopEventStream stops the event stream for a job
+func (o *Orchestrator) stopEventStream(jobID string) {
+	o.streamMu.Lock()
+	defer o.streamMu.Unlock()
+
+	if stopFunc, exists := o.streamStopFuncs[jobID]; exists {
+		stopFunc()
+		delete(o.streamStopFuncs, jobID)
+	}
 }
