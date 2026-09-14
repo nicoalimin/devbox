@@ -770,3 +770,114 @@ func TestResumeInFlightJobs_SkipsAlreadyActive(t *testing.T) {
 		t.Errorf("Expected job to remain in coding state (skipped), got state %s", jobAfter.State)
 	}
 }
+
+// TestCodingTimeoutFailsJob verifies that a coding phase timeout or failure
+// results in a failed job that does NOT proceed to the reviewing phase.
+// This is a regression test for UTA-15 where timed-out coding sessions
+// incorrectly proceeded to code review.
+func TestCodingTimeoutFailsJob(t *testing.T) {
+	// Setup
+	dbPath := "test_coding_timeout_fails.db"
+	defer os.Remove(dbPath)
+
+	database, err := db.Open(dbPath)
+	if err != nil {
+		t.Fatalf("Failed to open database: %v", err)
+	}
+	defer database.Close()
+
+	cfg := &config.Config{
+		Linear: config.LinearConfig{
+			APIKey: "test-key",
+		},
+		OpenCode: config.OpenCodeConfig{
+			BaseURL:  "http://localhost:3000",
+			Timeout:  1 * time.Second, // Very short timeout to trigger failure quickly
+			Username: "test",
+			Password: "test",
+			Version:  "v2",
+		},
+		Repos: []config.RepoConfig{
+			{
+				Match: config.RepoMatch{Team: "ENG"},
+				Repo:  config.RepoInfo{Path: "/tmp/repo", BaseBranch: "main"},
+			},
+		},
+		GitHub: config.GitHubConfig{
+			DefaultBaseBranch: "main",
+		},
+	}
+
+	orch := NewOrchestrator(cfg, database)
+
+	// Create a job in coding state with a dead/missing OpenCode session
+	// This simulates the UTA-15 scenario where the session times out
+	job := &db.Job{
+		ID:                "job-timeout-test",
+		LinearIssueID:     "ENG-999",
+		State:             db.StateCoding,
+		OpenCodeSessionID: "nonexistent-session-id", // This session doesn't exist
+		WorktreePath:      "/tmp/test-worktree",
+		RepoPath:          "/tmp/repo",
+		BranchName:        "test-branch",
+		CreatedAt:         time.Now(),
+		UpdatedAt:         time.Now(),
+	}
+	if err := database.CreateJob(job); err != nil {
+		t.Fatalf("Failed to create job: %v", err)
+	}
+
+	// Start resuming the coding phase in a goroutine (simulates real workflow)
+	done := make(chan bool)
+	go func() {
+		defer func() { done <- true }()
+		orch.markJobActive(job.ID)
+		defer orch.markJobInactive(job.ID)
+		
+		// This should fail and mark the job as failed
+		err := orch.resumeCoding(job)
+		if err == nil {
+			t.Error("Expected resumeCoding to return error for timed-out/missing session")
+		}
+		
+		// The error should propagate and cause failJob to be called by the caller
+		// In the real workflow, this happens in resumeJobFromState
+		if err != nil {
+			orch.failJob(job, fmt.Sprintf("Failed to resume coding: %v", err))
+		}
+	}()
+
+	// Wait for goroutine to complete (with timeout)
+	select {
+	case <-done:
+		// Good, completed
+	case <-time.After(10 * time.Second):
+		t.Fatal("Test timed out waiting for resumeCoding")
+	}
+
+	// Verify the job is in failed state (not reviewing)
+	finalJob, err := database.GetJob(job.ID)
+	if err != nil {
+		t.Fatalf("Failed to get job after timeout: %v", err)
+	}
+
+	if finalJob.State != db.StateFailed {
+		t.Errorf("Expected job to be in failed state after coding timeout, got %s", finalJob.State)
+	}
+
+	// Verify the job did NOT enter reviewing state
+	if finalJob.State == db.StateReviewing {
+		t.Error("Job incorrectly proceeded to reviewing state after coding timeout - this is the bug!")
+	}
+
+	// Verify there's a blocker reason explaining the failure
+	if finalJob.BlockerReason == "" {
+		t.Error("Expected BlockerReason to be set on failed job")
+	}
+
+	// Verify the error message mentions the timeout/failure
+	if !strings.Contains(strings.ToLower(finalJob.BlockerReason), "coding") {
+		t.Errorf("Expected BlockerReason to mention coding failure, got: %s", finalJob.BlockerReason)
+	}
+}
+
