@@ -56,7 +56,7 @@ func TestSingleFlightEnforcement(t *testing.T) {
 	}
 
 	// Try to create second job (should fail because job1 is busy)
-	_, err = orch.CreateJob("ENG-124")
+	_, err = orch.CreateJob("ENG-124", "")
 	if err == nil {
 		t.Error("Expected error when creating job while busy, got nil")
 	}
@@ -75,7 +75,7 @@ func TestSingleFlightEnforcement(t *testing.T) {
 	}
 
 	// Now should be able to create job2
-	job2, err := orch.CreateJob("ENG-124")
+	job2, err := orch.CreateJob("ENG-124", "")
 	if err != nil {
 		t.Errorf("Expected success when creating job after previous done, got error: %v", err)
 	}

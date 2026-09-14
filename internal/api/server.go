@@ -82,6 +82,7 @@ func (s *Server) StartWithLogger(customLogger func(string, ...interface{})) erro
 		r.Get("/v1/jobs/{id}", s.handleGetJob)
 		r.Get("/v1/blockers", s.handleGetBlockers)
 		r.Post("/v1/jobs/{id}/reply", s.handleReplyToJob)
+		r.Post("/v1/jobs/{id}/review", s.handleReviewJob)
 		r.Post("/v1/jobs/{id}/cancel", s.handleCancelJob)
 		r.Get("/v1/jobs/{id}/logs", s.handleGetLogs)
 	})
@@ -144,7 +145,8 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 
 // CreateJobRequest represents a request to create a job
 type CreateJobRequest struct {
-	LinearIssueID string `json:"linearIssueId"`
+	LinearIssueID   string `json:"linearIssueId"`
+	OperatorContext string `json:"operatorContext,omitempty"`
 }
 
 // handleCreateJob handles job creation requests
@@ -160,12 +162,8 @@ func (s *Server) handleCreateJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	job, err := s.orchestrator.CreateJob(req.LinearIssueID)
+	job, err := s.orchestrator.CreateJob(req.LinearIssueID, req.OperatorContext)
 	if err != nil {
-		if err.Error() == fmt.Sprintf("server busy with job %s", job.ID) {
-			s.writeError(w, http.StatusConflict, err.Error())
-			return
-		}
 		s.writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -229,6 +227,11 @@ type ReplyRequest struct {
 	Message string `json:"message"`
 }
 
+// ReviewRequest represents review feedback for a job
+type ReviewRequest struct {
+	Feedback string `json:"feedback"`
+}
+
 // handleReplyToJob handles job reply requests
 func (s *Server) handleReplyToJob(w http.ResponseWriter, r *http.Request) {
 	jobID := chi.URLParam(r, "id")
@@ -252,6 +255,32 @@ func (s *Server) handleReplyToJob(w http.ResponseWriter, r *http.Request) {
 	s.writeJSON(w, http.StatusOK, map[string]interface{}{
 		"success": true,
 		"message": "reply sent",
+	})
+}
+
+// handleReviewJob handles review feedback requests
+func (s *Server) handleReviewJob(w http.ResponseWriter, r *http.Request) {
+	jobID := chi.URLParam(r, "id")
+
+	var req ReviewRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		s.writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	if req.Feedback == "" {
+		s.writeError(w, http.StatusBadRequest, "feedback is required")
+		return
+	}
+
+	if err := s.orchestrator.ReviewJob(jobID, req.Feedback); err != nil {
+		s.writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	s.writeJSON(w, http.StatusOK, map[string]interface{}{
+		"success": true,
+		"message": "review feedback sent",
 	})
 }
 

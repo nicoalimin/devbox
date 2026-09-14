@@ -56,6 +56,7 @@ func main() {
 		jobCmd(),
 		blockersCmd(),
 		replyCmd(),
+		reviewCmd(),
 		cancelCmd(),
 		logsCmd(),
 	)
@@ -114,13 +115,52 @@ func statusCmd() *cobra.Command {
 
 func assignCmd() *cobra.Command {
 	var queue bool
+	var context string
+	var contextFile string
+	var notes []string
+
 	cmd := &cobra.Command{
 		Use:   "assign <LINEAR_ISSUE_ID>",
 		Short: "Create/start job for Linear ticket",
+		Long: `Create and start a job for a Linear ticket.
+
+You can provide additional context to the coding agent using:
+  --context "inline context"
+  --context-file path/to/file
+  --note "first note" --note "second note" (can be used multiple times)
+
+All context sources are combined and passed to the OpenCode worker.`,
 		Args:  cobra.ExactArgs(1),
 		Run: func(cmd *cobra.Command, args []string) {
+			// Build operator context from all sources
+			var contextParts []string
+
+			if context != "" {
+				contextParts = append(contextParts, context)
+			}
+
+			if contextFile != "" {
+				fileContent, err := os.ReadFile(contextFile)
+				if err != nil {
+					exitError("Failed to read context file", err)
+				}
+				contextParts = append(contextParts, string(fileContent))
+			}
+
+			for _, note := range notes {
+				contextParts = append(contextParts, note)
+			}
+
+			operatorContext := ""
+			if len(contextParts) > 0 {
+				operatorContext = fmt.Sprintf("%s", contextParts[0])
+				for i := 1; i < len(contextParts); i++ {
+					operatorContext += "\n\n" + contextParts[i]
+				}
+			}
+
 			c := client.NewClient(serverURL, token)
-			job, err := c.Assign(args[0])
+			job, err := c.Assign(args[0], operatorContext)
 			if err != nil {
 				exitError("Failed to assign job", err)
 			}
@@ -131,11 +171,17 @@ func assignCmd() *cobra.Command {
 				fmt.Printf("✓ Job created: %s\n", job.ID)
 				fmt.Printf("  Linear Issue: %s\n", job.LinearIssueID)
 				fmt.Printf("  State: %s\n", job.State)
+				if operatorContext != "" {
+					fmt.Printf("  Operator Context: provided (%d bytes)\n", len(operatorContext))
+				}
 				fmt.Printf("  Created: %s\n", job.CreatedAt.Format(time.RFC3339))
 			}
 		},
 	}
 	cmd.Flags().BoolVar(&queue, "queue", false, "queue if server is busy")
+	cmd.Flags().StringVar(&context, "context", "", "additional context for the coding agent")
+	cmd.Flags().StringVar(&contextFile, "context-file", "", "path to file containing additional context")
+	cmd.Flags().StringArrayVar(&notes, "note", []string{}, "additional note (can be specified multiple times)")
 	return cmd
 }
 
@@ -267,6 +313,57 @@ func replyCmd() *cobra.Command {
 			}
 		},
 	}
+}
+
+func reviewCmd() *cobra.Command {
+	var comments string
+	var commentsFile string
+
+	cmd := &cobra.Command{
+		Use:   "review <job_id|LINEAR_ISSUE_ID>",
+		Short: "Send review feedback to update existing PR",
+		Long: `Send review feedback to an existing job with a PR.
+
+The feedback will be sent to the OpenCode agent to address on the same branch/PR.
+You can provide feedback using:
+  --comments "inline feedback"
+  --comments-file path/to/file
+
+The job can be identified by job ID or Linear issue ID.`,
+		Args:  cobra.ExactArgs(1),
+		Run: func(cmd *cobra.Command, args []string) {
+			feedback := comments
+			if commentsFile != "" {
+				fileContent, err := os.ReadFile(commentsFile)
+				if err != nil {
+					exitError("Failed to read comments file", err)
+				}
+				if feedback != "" {
+					feedback += "\n\n"
+				}
+				feedback += string(fileContent)
+			}
+
+			if feedback == "" {
+				exitError("Review feedback required", fmt.Errorf("use --comments or --comments-file to provide feedback"))
+			}
+
+			c := client.NewClient(serverURL, token)
+			if err := c.Review(args[0], feedback); err != nil {
+				exitError("Failed to send review feedback", err)
+			}
+
+			if outputJSON {
+				printJSON(map[string]string{"status": "success"})
+			} else {
+				fmt.Printf("✓ Review feedback sent to job %s\n", args[0])
+				fmt.Printf("  OpenCode will address the feedback and update the PR\n")
+			}
+		},
+	}
+	cmd.Flags().StringVar(&comments, "comments", "", "review feedback comments")
+	cmd.Flags().StringVar(&commentsFile, "comments-file", "", "path to file containing review feedback")
+	return cmd
 }
 
 func cancelCmd() *cobra.Command {

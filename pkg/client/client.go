@@ -43,19 +43,21 @@ type StatusResponse struct {
 
 // Job represents a job
 type Job struct {
-	ID               string     `json:"id"`
-	LinearIssueID    string     `json:"linear_issue_id"`
-	LinearURL        string     `json:"linear_url"`
-	State            string     `json:"state"`
-	RepoPath         string     `json:"repo_path"`
-	BranchName       string     `json:"branch_name"`
-	WorktreePath     string     `json:"worktree_path"`
-	PRURL            string     `json:"pr_url"`
-	BlockerReason    string     `json:"blocker_reason"`
-	OpenCodeSessionID string    `json:"opencode_session_id"`
-	CreatedAt        time.Time  `json:"created_at"`
-	UpdatedAt        time.Time  `json:"updated_at"`
-	CompletedAt      *time.Time `json:"completed_at"`
+	ID                string     `json:"id"`
+	LinearIssueID     string     `json:"linear_issue_id"`
+	LinearURL         string     `json:"linear_url"`
+	State             string     `json:"state"`
+	RepoPath          string     `json:"repo_path"`
+	BranchName        string     `json:"branch_name"`
+	WorktreePath      string     `json:"worktree_path"`
+	PRURL             string     `json:"pr_url"`
+	BlockerReason     string     `json:"blocker_reason"`
+	OpenCodeSessionID string     `json:"opencode_session_id"`
+	OperatorContext   string     `json:"operator_context"`
+	ReviewFeedback    string     `json:"review_feedback"`
+	CreatedAt         time.Time  `json:"created_at"`
+	UpdatedAt         time.Time  `json:"updated_at"`
+	CompletedAt       *time.Time `json:"completed_at"`
 }
 
 // JobLog represents a log entry
@@ -85,10 +87,13 @@ func (c *Client) Status() (*StatusResponse, error) {
 	return &resp, nil
 }
 
-// Assign creates a new job
-func (c *Client) Assign(linearIssueID string) (*Job, error) {
-	body := map[string]string{
+// Assign creates a new job with optional operator context
+func (c *Client) Assign(linearIssueID string, operatorContext string) (*Job, error) {
+	body := map[string]interface{}{
 		"linearIssueId": linearIssueID,
+	}
+	if operatorContext != "" {
+		body["operatorContext"] = operatorContext
 	}
 	
 	var job Job
@@ -139,6 +144,16 @@ func (c *Client) Reply(jobID, message string) error {
 	
 	var resp map[string]interface{}
 	return c.post(fmt.Sprintf("/v1/jobs/%s/reply", jobID), body, &resp, true)
+}
+
+// Review sends review feedback to a job
+func (c *Client) Review(jobIDOrLinearID, feedback string) error {
+	body := map[string]string{
+		"feedback": feedback,
+	}
+	
+	var resp map[string]interface{}
+	return c.post(fmt.Sprintf("/v1/jobs/%s/review", jobIDOrLinearID), body, &resp, true)
 }
 
 // Cancel cancels a job
