@@ -234,7 +234,7 @@ func (c *Client) post(path string, body interface{}, result interface{}, auth bo
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusAccepted {
 		body, _ := io.ReadAll(resp.Body)
 		return fmt.Errorf("API error (status %d): %s", resp.StatusCode, string(body))
 	}
