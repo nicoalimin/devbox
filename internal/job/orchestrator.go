@@ -221,11 +221,14 @@ func (o *Orchestrator) executeCoding(job *db.Job) error {
 		return err
 	}
 
-	o.log(job.ID, "info", "Sent task to OpenCode")
+	o.log(job.ID, "info", "Sent task to OpenCode, waiting for completion")
 
-	// Note: In a real implementation, we'd monitor OpenCode session status
-	// For now, we assume it completes. The "blocked" state would be set
-	// if OpenCode indicates it needs clarification.
+	// Wait for OpenCode to complete the coding task
+	if err := o.opencode.WaitForSessionIdle(session.ID, o.cfg.OpenCode.Timeout); err != nil {
+		return fmt.Errorf("OpenCode session timed out or failed: %w", err)
+	}
+
+	o.log(job.ID, "info", "OpenCode coding session completed")
 
 	return nil
 }
@@ -252,6 +255,13 @@ If you find issues, fix them now. If everything looks good, confirm the changes 
 		return err
 	}
 
+	o.log(job.ID, "info", "Sent review prompt, waiting for completion")
+
+	// Wait for review to complete
+	if err := o.opencode.WaitForSessionIdle(job.OpenCodeSessionID, o.cfg.OpenCode.Timeout); err != nil {
+		return fmt.Errorf("OpenCode review timed out or failed: %w", err)
+	}
+
 	o.log(job.ID, "info", "Code review completed")
 	return nil
 }
@@ -263,9 +273,22 @@ func (o *Orchestrator) pushBranch(job *db.Job) error {
 		return err
 	}
 
-	o.log(job.ID, "info", "Pushing branch to remote")
+	o.log(job.ID, "info", "Verifying commits before push")
 
 	gitMgr := git.NewManager(job.RepoPath, o.cfg.GitHub.DefaultBaseBranch)
+	
+	// Check if there are commits ahead of base
+	hasCommits, err := gitMgr.HasCommitsAheadOfBase(job.WorktreePath)
+	if err != nil {
+		return fmt.Errorf("failed to check for commits: %w", err)
+	}
+	
+	if !hasCommits {
+		return fmt.Errorf("no commits found on branch %s compared to base branch - OpenCode may have completed without making changes", job.BranchName)
+	}
+
+	o.log(job.ID, "info", "Commits verified, pushing branch to remote")
+
 	if err := gitMgr.PushBranch(job.WorktreePath, job.BranchName); err != nil {
 		return err
 	}
