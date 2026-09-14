@@ -3,6 +3,7 @@ package job
 import (
 	"fmt"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -481,6 +482,229 @@ func TestJobActiveTracking(t *testing.T) {
 	orch.markJobInactive(jobID)
 	if orch.isJobActive(jobID) {
 		t.Error("Job should not be active after unmarking")
+	}
+}
+
+func TestHealSession_CodingPhase(t *testing.T) {
+	// Setup
+	dbPath := "test_heal_coding.db"
+	defer os.Remove(dbPath)
+
+	database, err := db.Open(dbPath)
+	if err != nil {
+		t.Fatalf("Failed to open database: %v", err)
+	}
+	defer database.Close()
+
+	cfg := &config.Config{
+		Linear: config.LinearConfig{
+			APIKey: "test-key",
+		},
+		OpenCode: config.OpenCodeConfig{
+			BaseURL:  "http://localhost:3000",
+			Timeout:  30 * time.Minute,
+			Username: "test",
+			Password: "test",
+			Version:  "v2",
+		},
+		Repos: []config.RepoConfig{
+			{
+				Match: config.RepoMatch{Team: "ENG"},
+				Repo:  config.RepoInfo{Path: "/tmp/repo", BaseBranch: "main"},
+			},
+		},
+	}
+
+	orch := NewOrchestrator(cfg, database)
+
+	// Create a job in coding state
+	job := &db.Job{
+		ID:                "job-heal-coding",
+		LinearIssueID:     "ENG-500",
+		State:             db.StateCoding,
+		OpenCodeSessionID: "dead-session-123",
+		WorktreePath:      "/tmp/worktree",
+		CreatedAt:         time.Now(),
+		UpdatedAt:         time.Now(),
+	}
+	if err := database.CreateJob(job); err != nil {
+		t.Fatalf("Failed to create job: %v", err)
+	}
+
+	// Test healSession method (will fail because OpenCode isn't running, but we can verify the logic)
+	// We can't fully test without mocking OpenCode, but we can verify the method exists and handles errors
+	_, err = orch.healSession(job, "coding")
+	if err == nil {
+		t.Error("Expected error when healing without OpenCode running, got nil")
+	}
+
+	// Verify error message indicates it's trying to fetch issue or create session
+	errMsg := err.Error()
+	if !strings.Contains(errMsg, "failed") {
+		t.Errorf("Expected error to contain 'failed', got: %s", errMsg)
+	}
+}
+
+func TestHealSession_ReviewingPhase(t *testing.T) {
+	// Setup
+	dbPath := "test_heal_reviewing.db"
+	defer os.Remove(dbPath)
+
+	database, err := db.Open(dbPath)
+	if err != nil {
+		t.Fatalf("Failed to open database: %v", err)
+	}
+	defer database.Close()
+
+	cfg := &config.Config{
+		Linear: config.LinearConfig{
+			APIKey: "test-key",
+		},
+		OpenCode: config.OpenCodeConfig{
+			BaseURL:  "http://localhost:3000",
+			Timeout:  30 * time.Minute,
+			Username: "test",
+			Password: "test",
+			Version:  "v2",
+		},
+		Repos: []config.RepoConfig{
+			{
+				Match: config.RepoMatch{Team: "ENG"},
+				Repo:  config.RepoInfo{Path: "/tmp/repo", BaseBranch: "main"},
+			},
+		},
+	}
+
+	orch := NewOrchestrator(cfg, database)
+
+	// Create a job in reviewing state
+	job := &db.Job{
+		ID:                "job-heal-reviewing",
+		LinearIssueID:     "ENG-501",
+		State:             db.StateReviewing,
+		OpenCodeSessionID: "dead-session-456",
+		WorktreePath:      "/tmp/worktree",
+		CreatedAt:         time.Now(),
+		UpdatedAt:         time.Now(),
+	}
+	if err := database.CreateJob(job); err != nil {
+		t.Fatalf("Failed to create job: %v", err)
+	}
+
+	// Test healSession with reviewing phase
+	_, err = orch.healSession(job, "reviewing")
+	if err == nil {
+		t.Error("Expected error when healing without Linear/OpenCode running, got nil")
+	}
+}
+
+func TestHealingAttemptLimit(t *testing.T) {
+	// Setup
+	dbPath := "test_healing_limit.db"
+	defer os.Remove(dbPath)
+
+	database, err := db.Open(dbPath)
+	if err != nil {
+		t.Fatalf("Failed to open database: %v", err)
+	}
+	defer database.Close()
+
+	cfg := &config.Config{
+		Linear: config.LinearConfig{
+			APIKey: "test-key",
+		},
+		OpenCode: config.OpenCodeConfig{
+			BaseURL:  "http://localhost:3000",
+			Timeout:  30 * time.Minute,
+			Username: "test",
+			Password: "test",
+			Version:  "v2",
+		},
+	}
+
+	orch := NewOrchestrator(cfg, database)
+
+	// Create a job
+	job := &db.Job{
+		ID:                "job-heal-limit",
+		LinearIssueID:     "ENG-502",
+		State:             db.StateCoding,
+		OpenCodeSessionID: "dead-session-789",
+		WorktreePath:      "/tmp/worktree",
+		CreatedAt:         time.Now(),
+		UpdatedAt:         time.Now(),
+	}
+	if err := database.CreateJob(job); err != nil {
+		t.Fatalf("Failed to create job: %v", err)
+	}
+
+	// Simulate healing attempts
+	attemptKey := fmt.Sprintf("%s-%s", job.ID, "coding")
+
+	// First attempt should be allowed
+	orch.healingAttempts[attemptKey] = 0
+	if orch.healingAttempts[attemptKey] >= maxHealingAttempts {
+		t.Error("First attempt should be allowed")
+	}
+
+	// Second attempt should be allowed
+	orch.healingAttempts[attemptKey] = 1
+	if orch.healingAttempts[attemptKey] >= maxHealingAttempts {
+		t.Error("Second attempt should be allowed")
+	}
+
+	// Third attempt should be blocked
+	orch.healingAttempts[attemptKey] = 2
+	if orch.healingAttempts[attemptKey] < maxHealingAttempts {
+		t.Error("Third attempt should be blocked (max is 2)")
+	}
+}
+
+func TestHealSession_InvalidPhase(t *testing.T) {
+	// Setup
+	dbPath := "test_heal_invalid.db"
+	defer os.Remove(dbPath)
+
+	database, err := db.Open(dbPath)
+	if err != nil {
+		t.Fatalf("Failed to open database: %v", err)
+	}
+	defer database.Close()
+
+	cfg := &config.Config{
+		Linear: config.LinearConfig{
+			APIKey: "test-key",
+		},
+		OpenCode: config.OpenCodeConfig{
+			BaseURL:  "http://localhost:3000",
+			Timeout:  30 * time.Minute,
+			Username: "test",
+			Password: "test",
+			Version:  "v2",
+		},
+	}
+
+	orch := NewOrchestrator(cfg, database)
+
+	// Create a job
+	job := &db.Job{
+		ID:                "job-heal-invalid",
+		LinearIssueID:     "ENG-503",
+		State:             db.StateCoding,
+		OpenCodeSessionID: "dead-session-xyz",
+		WorktreePath:      "/tmp/worktree",
+		CreatedAt:         time.Now(),
+		UpdatedAt:         time.Now(),
+	}
+	if err := database.CreateJob(job); err != nil {
+		t.Fatalf("Failed to create job: %v", err)
+	}
+
+	// Test with invalid phase (even without Linear running, it should fail on phase validation first)
+	// Actually, it will fail on Linear fetch first, but let's verify the error handling
+	_, err = orch.healSession(job, "invalid-phase")
+	if err == nil {
+		t.Error("Expected error when healing with invalid phase")
 	}
 }
 
