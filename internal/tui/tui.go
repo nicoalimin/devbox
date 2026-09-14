@@ -169,36 +169,38 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// So: Main Content must be exactly (height - 4)
 		//
 		// Sidebar (stacked vertically):
-		//   - Jobs section: content + 2 borders
-		//   - Errors section: content + 2 borders  
-		//   - Integrations bar: ~5 lines (3 content + 2 borders)
-		//   Total sidebar = jobs_content + errors_content + 9
+		//   - Jobs section: title (1) + viewport content + borders (2) = viewport + 3
+		//   - Errors section: title (1) + viewport content + borders (2) = viewport + 3
+		//   - Integrations bar: 5 lines (3 content + 2 borders)
+		//   Total sidebar = (jobsViewport + 3) + (errorsViewport + 3) + 5 = jobsViewport + errorsViewport + 11
 		//
 		// For sidebar to equal (height - 4):
-		//   jobs_content + errors_content + 9 = height - 4
-		//   jobs_content + errors_content = height - 13
-		//   Split equally: each = (height - 13) / 2
+		//   jobsViewport + errorsViewport + 11 = height - 4
+		//   jobsViewport + errorsViewport = height - 15
+		//   Split equally: each = (height - 15) / 2
 		//
 		// Logs pane (split into server logs + job logs, stacked vertically):
-		//   Each log section needs: content + header (2 lines) + borders (2)
-		//   Total = (height - 4)
-		//   Split equally: each section content = (height - 4) / 2 - 4
+		//   Each log section: title (1) + subtitle (1) + viewport + borders (2) = viewport + 4
+		//   Total = (serverLogsViewport + 4) + (jobLogsViewport + 4) = height - 4
+		//   serverLogsViewport + jobLogsViewport = height - 12
+		//   Split equally: each = (height - 12) / 2
 
 		sidebarWidth := 30
 		availableContentHeight := msg.Height - 4 // For the entire main content area
 		
 		// Jobs and errors split the available height, accounting for integrations bar (~5 lines)
+		// Each section needs: title (1) + viewport + borders (2) = viewport + 3
+		// Total: jobsViewport + errorsViewport + 6 + integrations (5) = availableContentHeight
 		sidebarJobsErrors := availableContentHeight - 5 // 5 for integrations bar
-		jobsHeight := sidebarJobsErrors/2 - 2           // -2 for each section's borders
-		errorsHeight := sidebarJobsErrors/2 - 2
+		jobsHeight := (sidebarJobsErrors - 6) / 2       // -6 for titles (2) and borders (4) across both sections
+		errorsHeight := (sidebarJobsErrors - 6) / 2
 		
 		// Split logs pane into two sections (server logs + job logs)
-		// Each section needs: title (1) + subtitle (1) + content + borders (2) = content + 4
-		// Total available: availableContentHeight
-		// Each section: (availableContentHeight / 2) - 4 for content
-		logsSectionHeight := availableContentHeight / 2
-		serverLogsHeight := logsSectionHeight - 4  // Account for title, subtitle, borders
-		jobLogsHeight := logsSectionHeight - 4
+		// Each section renders as: title (1) + subtitle (1) + viewport + borders (2) = viewport + 4
+		// Total: (serverLogsViewport + 4) + (jobLogsViewport + 4) = availableContentHeight
+		// So: serverLogsViewport + jobLogsViewport = availableContentHeight - 8
+		serverLogsHeight := (availableContentHeight - 8) / 2
+		jobLogsHeight := (availableContentHeight - 8) / 2
 
 		// Ensure minimum heights
 		if jobsHeight < 3 {
@@ -380,10 +382,10 @@ func (m Model) renderMainContent() string {
 func (m Model) renderSidebar() string {
 	sidebarWidth := 30
 
-	// Jobs section - use viewport height for consistency
+	// Jobs section - height includes title (1) + viewport + borders (2)
 	jobsStyle := lipgloss.NewStyle().
 		Width(sidebarWidth).
-		Height(m.jobsViewport.Height).
+		Height(m.jobsViewport.Height + 3).
 		BorderStyle(lipgloss.RoundedBorder()).
 		BorderForeground(m.getBorderColor(JobsPane))
 
@@ -401,10 +403,10 @@ func (m Model) renderSidebar() string {
 		m.jobsViewport.View(),
 	)
 
-	// Errors section - use viewport height for consistency
+	// Errors section - height includes title (1) + viewport + borders (2)
 	errorsStyle := lipgloss.NewStyle().
 		Width(sidebarWidth).
-		Height(m.errorsViewport.Height).
+		Height(m.errorsViewport.Height + 3).
 		BorderStyle(lipgloss.RoundedBorder()).
 		BorderForeground(lipgloss.Color("241"))
 
@@ -544,10 +546,10 @@ func (m Model) renderIntegrationsBar() string {
 func (m Model) renderLogsPane() string {
 	logsWidth := m.width - 32
 	
-	// Server Logs Section
+	// Server Logs Section - height includes title (1) + subtitle (1) + viewport + borders (2) = viewport + 4
 	serverLogsStyle := lipgloss.NewStyle().
 		Width(logsWidth).
-		Height(m.serverLogsViewport.Height + 4). // +4 for title, subtitle, and borders
+		Height(m.serverLogsViewport.Height + 4).
 		BorderStyle(lipgloss.RoundedBorder()).
 		BorderForeground(m.getBorderColor(ServerLogsPane))
 
@@ -570,10 +572,10 @@ func (m Model) renderLogsPane() string {
 		m.serverLogsViewport.View(),
 	)
 
-	// Job Logs Section
+	// Job Logs Section - height includes title (1) + subtitle (1) + viewport + borders (2) = viewport + 4
 	jobLogsStyle := lipgloss.NewStyle().
 		Width(logsWidth).
-		Height(m.jobLogsViewport.Height + 4). // +4 for title, subtitle, and borders
+		Height(m.jobLogsViewport.Height + 4).
 		BorderStyle(lipgloss.RoundedBorder()).
 		BorderForeground(m.getBorderColor(JobLogsPane))
 
