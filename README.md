@@ -233,6 +233,12 @@ opencode:
   base_url: "http://localhost:3000"
   timeout: "30m"                          # Mark blocked after this timeout
 
+  # HTTP Basic Authentication (OpenCode 2.0.3+)
+  # When OpenCode server is started with OPENCODE_SERVER_PASSWORD set,
+  # all API requests require HTTP Basic Auth.
+  username: "opencode"                    # or set DEVBOXD_OPENCODE_USERNAME / OPENCODE_SERVER_USERNAME
+  password: "your-password-here"          # or set DEVBOXD_OPENCODE_PASSWORD / OPENCODE_SERVER_PASSWORD
+
 github:
   default_base_branch: "main"
 
@@ -267,6 +273,8 @@ queue:
 - `LINEAR_API_KEY` - Linear API key
 - `LINEAR_ASSIGNEE_ID` - Linear user ID filter
 - `OPENCODE_BASE_URL` - OpenCode server URL
+- `DEVBOXD_OPENCODE_USERNAME` or `OPENCODE_SERVER_USERNAME` - OpenCode HTTP Basic Auth username
+- `DEVBOXD_OPENCODE_PASSWORD` or `OPENCODE_SERVER_PASSWORD` - OpenCode HTTP Basic Auth password
 
 ### Client Configuration
 
@@ -417,9 +425,36 @@ echo "Monitor with: devbox job $JOB_ID"
 
 Devboxd integrates with [OpenCode](https://github.com/nicoalimin/opencode) via its HTTP API. When a job is assigned:
 
-1. **Session Creation**: `POST /session` with job name
-2. **Task Prompt**: `POST /session/:id/message` with issue details
+1. **Session Creation**: `POST /api/session` with job name
+2. **Task Prompt**: `POST /api/session/:id/prompt` with issue details
 3. **Review Prompt**: Another message for code review
+
+### OpenCode 2.0.3+ Authentication
+
+OpenCode 2.0.3 and later require **HTTP Basic Authentication** when `OPENCODE_SERVER_PASSWORD` is set on the OpenCode server. Devboxd automatically sends credentials with every request.
+
+**Configuration options:**
+
+1. **Config file** (`devboxd.yaml`):
+```yaml
+opencode:
+  base_url: "http://localhost:3000"
+  username: "opencode"           # Default username
+  password: "your-password-here" # Match OPENCODE_SERVER_PASSWORD
+```
+
+2. **Environment variables** (higher priority):
+```bash
+# Option 1: Use DEVBOXD_ prefix (recommended)
+export DEVBOXD_OPENCODE_USERNAME="opencode"
+export DEVBOXD_OPENCODE_PASSWORD="your-password-here"
+
+# Option 2: Use OPENCODE_SERVER_ variables (matches OpenCode conventions)
+export OPENCODE_SERVER_USERNAME="opencode"
+export OPENCODE_SERVER_PASSWORD="your-password-here"
+```
+
+**Without authentication**, all OpenCode API requests will fail with `401 Unauthorized`.
 
 ### OpenCode Prompt Format
 

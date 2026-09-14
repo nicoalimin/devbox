@@ -14,10 +14,16 @@ linear:
 
 opencode:
   version: v2
-  base_url: "http://localhost:3000"
+  base_url: "http://localhost:3000"       # or set OPENCODE_BASE_URL env var
   timeout: "30m"                          # Mark blocked after this timeout
-  # username: ""                          # Optional auth
-  # password: ""                          # Optional auth
+  
+  # HTTP Basic Authentication for OpenCode 2.0.3+ (when OPENCODE_SERVER_PASSWORD is set)
+  # username: "opencode"                  # or set DEVBOXD_OPENCODE_USERNAME / OPENCODE_SERVER_USERNAME env var
+  # password: "your-password-here"        # or set DEVBOXD_OPENCODE_PASSWORD / OPENCODE_SERVER_PASSWORD env var
+  #
+  # When OpenCode server is started with OPENCODE_SERVER_PASSWORD set, all API requests
+  # require HTTP Basic Auth. The username defaults to "opencode" unless OPENCODE_SERVER_USERNAME
+  # is set. Configure matching credentials here or via environment variables.
 
 github:
   default_base_branch: "main"
