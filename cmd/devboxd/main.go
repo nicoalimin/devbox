@@ -53,6 +53,12 @@ func main() {
 	// Create orchestrator
 	orchestrator := job.NewOrchestrator(cfg, database)
 
+	// Resume any in-flight jobs from previous run
+	if err := orchestrator.ResumeInFlightJobs(); err != nil {
+		log.Printf("Warning: Failed to resume in-flight jobs: %v", err)
+		// Don't fail startup, just log the warning
+	}
+
 	// Create server
 	server := api.NewServer(cfg, database, orchestrator)
 	

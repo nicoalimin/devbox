@@ -21,16 +21,33 @@ type Orchestrator struct {
 	db        *db.DB
 	linear    *linear.Client
 	opencode  *opencode.Client
+	activeJobs map[string]bool // Track actively running jobs to prevent double-resume
 }
 
 // NewOrchestrator creates a new job orchestrator
 func NewOrchestrator(cfg *config.Config, database *db.DB) *Orchestrator {
 	return &Orchestrator{
-		cfg:      cfg,
-		db:       database,
-		linear:   linear.NewClient(cfg.Linear.APIKey),
-		opencode: opencode.NewClient(cfg.OpenCode.BaseURL, cfg.OpenCode.Username, cfg.OpenCode.Password, cfg.OpenCode.Version),
+		cfg:        cfg,
+		db:         database,
+		linear:     linear.NewClient(cfg.Linear.APIKey),
+		opencode:   opencode.NewClient(cfg.OpenCode.BaseURL, cfg.OpenCode.Username, cfg.OpenCode.Password, cfg.OpenCode.Version),
+		activeJobs: make(map[string]bool),
 	}
+}
+
+// markJobActive marks a job as actively running
+func (o *Orchestrator) markJobActive(jobID string) {
+	o.activeJobs[jobID] = true
+}
+
+// markJobInactive marks a job as no longer running
+func (o *Orchestrator) markJobInactive(jobID string) {
+	delete(o.activeJobs, jobID)
+}
+
+// isJobActive checks if a job is currently running
+func (o *Orchestrator) isJobActive(jobID string) bool {
+	return o.activeJobs[jobID]
 }
 
 // CreateJob creates a new job for a Linear issue with optional operator context
@@ -75,6 +92,10 @@ func (o *Orchestrator) CreateJob(linearIssueID string, operatorContext string) (
 
 // ProcessJob processes a job through its lifecycle
 func (o *Orchestrator) ProcessJob(jobID string) {
+	// Mark job as active
+	o.markJobActive(jobID)
+	defer o.markJobInactive(jobID)
+
 	job, err := o.db.GetJob(jobID)
 	if err != nil {
 		o.log(jobID, "error", fmt.Sprintf("Failed to get job: %v", err))
@@ -475,6 +496,161 @@ func (o *Orchestrator) log(jobID, level, message string) {
 	// Format: [jobID] message
 	formattedMsg := fmt.Sprintf("[%s] %s", jobID, message)
 	log.Printf("[%s] %s", level, formattedMsg)
+}
+
+// ResumeInFlightJobs resumes all in-flight jobs after devboxd restart
+func (o *Orchestrator) ResumeInFlightJobs() error {
+	// Query DB for all jobs in busy/in-flight states
+	jobs, err := o.db.ListJobs(0) // Get all jobs
+	if err != nil {
+		return fmt.Errorf("failed to list jobs: %w", err)
+	}
+
+	inFlightCount := 0
+	for _, job := range jobs {
+		// Skip terminal states and jobs already running
+		if job.State.IsTerminal() {
+			continue
+		}
+		if !job.State.IsBusy() {
+			// Also skip non-busy states like queued or blocked
+			continue
+		}
+
+		// Check if already running (shouldn't happen but defensive)
+		if o.isJobActive(job.ID) {
+			log.Printf("[orchestrator] Job %s already active, skipping resume", job.ID)
+			continue
+		}
+
+		inFlightCount++
+		log.Printf("[orchestrator] Resuming job %s in state %s", job.ID, job.State)
+		o.log(job.ID, "info", fmt.Sprintf("Resuming job from state %s after devboxd restart", job.State))
+
+		// Resume job asynchronously based on its state
+		go o.resumeJobFromState(job)
+	}
+
+	if inFlightCount > 0 {
+		log.Printf("[orchestrator] Resumed %d in-flight job(s)", inFlightCount)
+	} else {
+		log.Printf("[orchestrator] No in-flight jobs to resume")
+	}
+
+	return nil
+}
+
+// resumeJobFromState resumes a job from its current state
+func (o *Orchestrator) resumeJobFromState(job *db.Job) {
+	// Mark job as active
+	o.markJobActive(job.ID)
+	defer o.markJobInactive(job.ID)
+
+	// Validate that we have the necessary information to resume
+	if job.OpenCodeSessionID == "" && (job.State == db.StateCoding || job.State == db.StateReviewing) {
+		o.failJob(job, fmt.Sprintf("Cannot resume %s: missing OpenCode session ID", job.State))
+		return
+	}
+
+	if job.WorktreePath == "" && job.State != db.StateFetching {
+		o.failJob(job, fmt.Sprintf("Cannot resume %s: missing worktree path", job.State))
+		return
+	}
+
+	// Resume from the appropriate state
+	switch job.State {
+	case db.StateFetching:
+		// Resume from the beginning
+		if err := o.fetchLinearIssue(job); err != nil {
+			o.failJob(job, fmt.Sprintf("Failed to fetch Linear issue: %v", err))
+			return
+		}
+		fallthrough
+
+	case db.StatePreparing:
+		// Continue with worktree preparation
+		if err := o.prepareWorktree(job); err != nil {
+			o.failJob(job, fmt.Sprintf("Failed to prepare worktree: %v", err))
+			return
+		}
+		fallthrough
+
+	case db.StateCoding:
+		// Resume waiting for OpenCode coding session
+		if err := o.resumeCoding(job); err != nil {
+			o.failJob(job, fmt.Sprintf("Failed to resume coding: %v", err))
+			return
+		}
+		fallthrough
+
+	case db.StateReviewing:
+		// Resume waiting for OpenCode review session
+		if err := o.resumeReviewing(job); err != nil {
+			o.failJob(job, fmt.Sprintf("Failed to resume reviewing: %v", err))
+			return
+		}
+		fallthrough
+
+	case db.StatePushing:
+		// Resume pushing branch
+		if err := o.pushBranch(job); err != nil {
+			o.failJob(job, fmt.Sprintf("Failed to push branch: %v", err))
+			return
+		}
+
+		// Create PR
+		if err := o.createPullRequest(job); err != nil {
+			o.failJob(job, fmt.Sprintf("Failed to create PR: %v", err))
+			return
+		}
+
+		// Mark complete
+		o.completeJob(job)
+
+	default:
+		o.failJob(job, fmt.Sprintf("Cannot resume from unknown state: %s", job.State))
+	}
+}
+
+// resumeCoding resumes waiting for an existing OpenCode coding session
+func (o *Orchestrator) resumeCoding(job *db.Job) error {
+	o.log(job.ID, "info", "Resuming OpenCode coding session wait")
+
+	// Wait for OpenCode to complete the coding task
+	logFunc := func(msg string) {
+		o.log(job.ID, "info", msg)
+	}
+
+	if err := o.opencode.WaitForSessionIdle(job.OpenCodeSessionID, o.cfg.OpenCode.Timeout, job.WorktreePath, logFunc); err != nil {
+		// Timeout or error - mark as blocked for human review
+		o.log(job.ID, "error", fmt.Sprintf("OpenCode session did not complete: %v", err))
+		job.State = db.StateBlocked
+		job.BlockerReason = fmt.Sprintf("OpenCode session timed out or failed: %v", err)
+		if updateErr := o.db.UpdateJob(job); updateErr != nil {
+			return fmt.Errorf("failed to mark job as blocked: %w (original error: %v)", updateErr, err)
+		}
+		return nil // Don't fail the job, just block it for human intervention
+	}
+
+	o.log(job.ID, "info", "OpenCode coding session completed")
+	return nil
+}
+
+// resumeReviewing resumes waiting for an existing OpenCode review session
+func (o *Orchestrator) resumeReviewing(job *db.Job) error {
+	o.log(job.ID, "info", "Resuming OpenCode review session wait")
+
+	// Wait for review to complete
+	logFunc := func(msg string) {
+		o.log(job.ID, "info", msg)
+	}
+
+	if err := o.opencode.WaitForSessionIdle(job.OpenCodeSessionID, o.cfg.OpenCode.Timeout, job.WorktreePath, logFunc); err != nil {
+		return fmt.Errorf("OpenCode review timed out or failed: %w", err)
+	}
+
+	o.log(job.ID, "info", "Code review completed")
+	return nil
 }
 
 // CancelJob cancels a running job
