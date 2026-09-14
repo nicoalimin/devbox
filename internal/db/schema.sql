@@ -11,6 +11,8 @@ CREATE TABLE IF NOT EXISTS jobs (
     opencode_session_id TEXT,
     operator_context TEXT,
     review_feedback TEXT,
+    coding_wait_started_at TIMESTAMP,
+    reviewing_wait_started_at TIMESTAMP,
     created_at TIMESTAMP NOT NULL,
     updated_at TIMESTAMP NOT NULL,
     completed_at TIMESTAMP

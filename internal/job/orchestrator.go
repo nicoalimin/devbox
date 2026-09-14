@@ -960,12 +960,59 @@ After making changes, confirm they are ready to push.`, feedback)
 func (o *Orchestrator) waitForSessionWithHealing(job *db.Job, phase string, logFunc func(string)) (string, error) {
 	sessionID := job.OpenCodeSessionID
 	
+	// Determine wait timeout - use remaining time if resuming, else full budget
+	timeout := o.cfg.OpenCode.Timeout
+	var waitStartedAt *time.Time
+	
+	if phase == "coding" {
+		waitStartedAt = job.CodingWaitStartedAt
+	} else if phase == "reviewing" {
+		waitStartedAt = job.ReviewingWaitStartedAt
+	}
+	
+	// If wait was already in progress, calculate remaining time
+	if waitStartedAt != nil {
+		elapsed := time.Since(*waitStartedAt)
+		remaining := o.cfg.OpenCode.Timeout - elapsed
+		
+		if remaining <= 0 {
+			// Already exhausted - fail immediately
+			return sessionID, fmt.Errorf("wait timeout already exhausted: elapsed %v (started at %v)", 
+				elapsed, waitStartedAt.Format(time.RFC3339))
+		}
+		
+		timeout = remaining
+		o.log(job.ID, "info", fmt.Sprintf("Resuming %s wait: %v elapsed, %v remaining (budget: %v)", 
+			phase, elapsed.Round(time.Second), timeout.Round(time.Second), o.cfg.OpenCode.Timeout))
+	} else {
+		// First time waiting - persist start time
+		now := time.Now()
+		if phase == "coding" {
+			job.CodingWaitStartedAt = &now
+		} else if phase == "reviewing" {
+			job.ReviewingWaitStartedAt = &now
+		}
+		if err := o.db.UpdateJob(job); err != nil {
+			o.log(job.ID, "warn", fmt.Sprintf("Failed to persist wait start time: %v", err))
+			// Continue anyway - not fatal
+		}
+		o.log(job.ID, "info", fmt.Sprintf("Starting %s wait with %v timeout", phase, timeout))
+	}
+	
 	for {
-		// Try to wait for the session
-		err := o.opencode.WaitForSessionIdle(sessionID, o.cfg.OpenCode.Timeout, job.WorktreePath, logFunc)
+		// Try to wait for the session with remaining timeout
+		err := o.opencode.WaitForSessionIdle(sessionID, timeout, job.WorktreePath, logFunc)
 		
 		if err == nil {
-			// Success - session completed
+			// Success - session completed, clear wait start time
+			if phase == "coding" {
+				job.CodingWaitStartedAt = nil
+			} else if phase == "reviewing" {
+				job.ReviewingWaitStartedAt = nil
+			}
+			if updateErr := o.db.UpdateJob(job); updateErr != nil {
+				o.log(job.ID, "warn", fmt.Sprintf("Failed to clear wait start time: %v", updateErr))
+			}
 			return sessionID, nil
 		}
 		
@@ -977,7 +1024,7 @@ func (o *Orchestrator) waitForSessionWithHealing(job *db.Job, phase string, logF
 		
 		if !isDeadSession {
 			// Not a dead session error - could be timeout or other issue
-			// Return the error as-is
+			// Return the error as-is (keep wait start time for potential future resume)
 			return sessionID, err
 		}
 		
@@ -1007,6 +1054,15 @@ func (o *Orchestrator) waitForSessionWithHealing(job *db.Job, phase string, logF
 		// Update to new session ID and retry wait
 		sessionID = newSessionID
 		o.log(job.ID, "info", fmt.Sprintf("Session healed successfully, new session ID: %s", sessionID))
+		
+		// Recalculate remaining timeout before retry
+		if waitStartedAt != nil {
+			elapsed := time.Since(*waitStartedAt)
+			timeout = o.cfg.OpenCode.Timeout - elapsed
+			if timeout <= 0 {
+				return sessionID, fmt.Errorf("wait timeout exhausted during healing: elapsed %v", elapsed)
+			}
+		}
 		
 		// Continue loop to wait on new session
 	}
