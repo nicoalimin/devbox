@@ -736,3 +736,163 @@ func TestWaitForSessionIdleTimeout(t *testing.T) {
 		t.Errorf("Expected timeout error message, got: %v", err)
 	}
 }
+
+func TestWaitForSessionIdleReusedSessionNeverActive(t *testing.T) {
+	// Test reused session scenario: session never becomes active after second prompt
+	// This reproduces the bug where review phase hangs when session doesn't process the prompt
+	callCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		
+		// Session never appears in active map (simulating OpenCode not processing the reused session)
+		response := V2ActiveSessionsResponse{Data: map[string]SessionActive{}}
+		json.NewEncoder(w).Encode(response)
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL, "", "", "v2")
+	
+	var logMessages []string
+	logFunc := func(msg string) {
+		logMessages = append(logMessages, msg)
+		t.Logf("LOG: %s", msg)
+	}
+	
+	// Use shorter timeout to make test faster
+	err := client.WaitForSessionIdle("ses_reused", 10*time.Second, "", logFunc)
+	
+	// Should timeout or return an error, not hang forever
+	if err == nil {
+		t.Fatal("Expected timeout or error when session never becomes active, got nil")
+	}
+	
+	// Should have logged about waiting
+	if len(logMessages) == 0 {
+		t.Error("Expected log messages during wait, got none")
+	}
+	
+	t.Logf("Error (expected): %v", err)
+	t.Logf("Log messages: %v", logMessages)
+}
+
+func TestWaitForSessionIdleReusedSessionStaleActive(t *testing.T) {
+	// Test reused session scenario: session appears active from previous use
+	// but never transitions to idle (stuck in stale state)
+	callCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		
+		var response V2ActiveSessionsResponse
+		if callCount <= 1 {
+			// Appears active immediately (stale from previous use)
+			response = V2ActiveSessionsResponse{
+				Data: map[string]SessionActive{
+					"ses_reused": {ID: "ses_reused", Status: "active"},
+				},
+			}
+		} else {
+			// But then stays in limbo (not in active map, but not actually processing)
+			// This simulates the case where OpenCode thinks it's done but hasn't actually processed the new prompt
+			response = V2ActiveSessionsResponse{Data: map[string]SessionActive{}}
+		}
+		
+		json.NewEncoder(w).Encode(response)
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL, "", "", "v2")
+	
+	var logMessages []string
+	logFunc := func(msg string) {
+		logMessages = append(logMessages, msg)
+		t.Logf("LOG: %s", msg)
+	}
+	
+	// Use shorter timeout to make test faster
+	err := client.WaitForSessionIdle("ses_reused", 10*time.Second, "", logFunc)
+	
+	// This scenario is tricky - if we see it become active briefly then idle,
+	// current code would treat it as complete (which might be wrong for a reused session).
+	// But at minimum, it should not hang - either return success or timeout
+	if err != nil {
+		// Timeout is acceptable
+		t.Logf("Got error (acceptable for this edge case): %v", err)
+	}
+	
+	// Should have logged something
+	if len(logMessages) == 0 {
+		t.Error("Expected log messages during wait, got none")
+	}
+	
+	t.Logf("Result: %v, logs: %v", err, logMessages)
+}
+
+func TestWaitForSessionIdleReusedSessionHangsActive(t *testing.T) {
+	// Test reused session scenario that reproduces the actual bug:
+	// Session appears active immediately and STAYS active forever (never completes)
+	// This simulates what happens when OpenCode gets stuck processing a reused session
+	callCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		
+		// Session is always active (stuck)
+		response := V2ActiveSessionsResponse{
+			Data: map[string]SessionActive{
+				"ses_reused": {ID: "ses_reused", Status: "active"},
+			},
+		}
+		
+		json.NewEncoder(w).Encode(response)
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL, "", "", "v2")
+	
+	var logMessages []string
+	logFunc := func(msg string) {
+		logMessages = append(logMessages, msg)
+		t.Logf("LOG: %s", msg)
+	}
+	
+	// Use shorter timeout to make test faster
+	start := time.Now()
+	err := client.WaitForSessionIdle("ses_reused", 12*time.Second, "", logFunc)
+	elapsed := time.Since(start)
+	
+	// Should timeout, not hang forever
+	if err == nil {
+		t.Fatal("Expected timeout error when session stays active forever, got nil")
+	}
+	
+	if !contains(err.Error(), "timeout") {
+		t.Errorf("Expected timeout error, got: %v", err)
+	}
+	
+	// Should have logged multiple heartbeats during the wait
+	// With 12s timeout and 30s log interval, we won't see heartbeats in Phase 2
+	// But we should at least see the initial logs from Phase 1
+	t.Logf("Call count: %d, elapsed: %v", callCount, elapsed)
+	t.Logf("Log messages (%d): %v", len(logMessages), logMessages)
+	
+	if len(logMessages) < 2 {
+		t.Errorf("Expected at least 2 log messages (start + active), got %d: %v", len(logMessages), logMessages)
+	}
+	
+	// Should have seen "session is now active" message
+	hasActiveLog := false
+	for _, msg := range logMessages {
+		if contains(msg, "is now active") {
+			hasActiveLog = true
+			break
+		}
+	}
+	if !hasActiveLog {
+		t.Error("Expected to see 'is now active' log message")
+	}
+}
