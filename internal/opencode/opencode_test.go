@@ -1079,3 +1079,271 @@ func TestStreamSessionEventsClassicUnsupported(t *testing.T) {
 		t.Errorf("Expected unsupported error message, got: %v", err)
 	}
 }
+
+func TestAuthorizationHeaderOnActiveSessionsEndpoint(t *testing.T) {
+	// Test that 401 is returned when auth is missing, and 200 when auth is correct
+	username := "opencode"
+	password := "test-password"
+
+	tests := []struct {
+		name         string
+		clientUser   string
+		clientPass   string
+		wantStatus   int
+		wantAuthSent bool
+	}{
+		{
+			name:         "no auth credentials - 401",
+			clientUser:   "",
+			clientPass:   "",
+			wantStatus:   401,
+			wantAuthSent: false,
+		},
+		{
+			name:         "correct auth credentials - 200",
+			clientUser:   username,
+			clientPass:   password,
+			wantStatus:   200,
+			wantAuthSent: true,
+		},
+		{
+			name:         "wrong password - 401",
+			clientUser:   username,
+			clientPass:   "wrong-password",
+			wantStatus:   401,
+			wantAuthSent: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			authHeaderReceived := false
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != "/api/session/active" {
+					t.Errorf("Expected path /api/session/active, got %s", r.URL.Path)
+				}
+
+				// Check for Authorization header
+				user, pass, ok := r.BasicAuth()
+				if ok {
+					authHeaderReceived = true
+					// Verify credentials
+					if user != username || pass != password {
+						w.WriteHeader(http.StatusUnauthorized)
+						w.Write([]byte(`{"error": "Invalid credentials"}`))
+						return
+					}
+				} else {
+					// No auth header
+					if tt.wantAuthSent {
+						t.Error("Expected Authorization header but none was sent")
+					}
+					w.WriteHeader(http.StatusUnauthorized)
+					w.Write([]byte(`{"error": "Authorization required"}`))
+					return
+				}
+
+				// Success response
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusOK)
+				json.NewEncoder(w).Encode(V2ActiveSessionsResponse{
+					Data: map[string]SessionActive{},
+				})
+			}))
+			defer server.Close()
+
+			client := NewClient(server.URL, tt.clientUser, tt.clientPass, "v2")
+			_, err := client.IsSessionBusy("ses_test", "")
+
+			if tt.wantStatus == 401 {
+				if err == nil {
+					t.Fatal("Expected 401 error, got nil")
+				}
+				var httpErr *HTTPError
+				if !errors.As(err, &httpErr) {
+					t.Fatalf("Expected HTTPError, got %T: %v", err, err)
+				}
+				if httpErr.StatusCode != 401 {
+					t.Errorf("Expected status 401, got %d", httpErr.StatusCode)
+				}
+			} else {
+				if err != nil {
+					t.Fatalf("Unexpected error: %v", err)
+				}
+			}
+
+			if authHeaderReceived != tt.wantAuthSent {
+				t.Errorf("Expected authHeaderReceived=%v, got %v", tt.wantAuthSent, authHeaderReceived)
+			}
+		})
+	}
+}
+
+func TestAuthorizationHeaderOnAllEndpoints(t *testing.T) {
+	// Test that Authorization header is sent on all request types
+	username := "opencode"
+	password := "test-password"
+
+	tests := []struct {
+		name     string
+		testFunc func(*testing.T, *Client, *httptest.Server) error
+	}{
+		{
+			name: "CreateSession sends auth",
+			testFunc: func(t *testing.T, client *Client, server *httptest.Server) error {
+				_, err := client.CreateSession("Test", "")
+				return err
+			},
+		},
+		{
+			name: "SendMessage sends auth",
+			testFunc: func(t *testing.T, client *Client, server *httptest.Server) error {
+				return client.SendMessage("ses_123", "test message", "")
+			},
+		},
+		{
+			name: "IsSessionBusy sends auth",
+			testFunc: func(t *testing.T, client *Client, server *httptest.Server) error {
+				_, err := client.IsSessionBusy("ses_123", "")
+				return err
+			},
+		},
+		{
+			name: "HealthCheck sends auth",
+			testFunc: func(t *testing.T, client *Client, server *httptest.Server) error {
+				_, err := client.HealthCheck()
+				return err
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			authReceived := false
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				// Check for Authorization header
+				user, pass, ok := r.BasicAuth()
+				if !ok {
+					w.WriteHeader(http.StatusUnauthorized)
+					w.Write([]byte(`{"error": "Authorization required"}`))
+					return
+				}
+
+				authReceived = true
+
+				if user != username || pass != password {
+					w.WriteHeader(http.StatusUnauthorized)
+					w.Write([]byte(`{"error": "Invalid credentials"}`))
+					return
+				}
+
+				// Success response based on path
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusOK)
+				
+				switch {
+				case contains(r.URL.Path, "/api/session/active"):
+					json.NewEncoder(w).Encode(V2ActiveSessionsResponse{Data: map[string]SessionActive{}})
+				case contains(r.URL.Path, "/api/session"):
+					json.NewEncoder(w).Encode(map[string]interface{}{
+						"data": map[string]interface{}{"id": "ses_123"},
+					})
+				case contains(r.URL.Path, "/api/health"):
+					json.NewEncoder(w).Encode(HealthResponse{Healthy: true})
+				default:
+					json.NewEncoder(w).Encode(map[string]interface{}{"status": "ok"})
+				}
+			}))
+			defer server.Close()
+
+			client := NewClient(server.URL, username, password, "v2")
+			err := tt.testFunc(t, client, server)
+
+			if err != nil {
+				t.Fatalf("Unexpected error: %v", err)
+			}
+
+			if !authReceived {
+				t.Error("Authorization header was not sent")
+			}
+		})
+	}
+}
+
+func TestStreamSessionEventsWithAuth(t *testing.T) {
+	// Test that SSE endpoint receives Authorization header
+	username := "opencode"
+	password := "test-password"
+
+	authReceived := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Check for Authorization header
+		user, pass, ok := r.BasicAuth()
+		if !ok {
+			w.WriteHeader(http.StatusUnauthorized)
+			w.Write([]byte(`{"error": "Authorization required"}`))
+			return
+		}
+
+		authReceived = true
+
+		if user != username || pass != password {
+			w.WriteHeader(http.StatusUnauthorized)
+			w.Write([]byte(`{"error": "Invalid credentials"}`))
+			return
+		}
+
+		// Success - send SSE response
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("data: {\"type\":\"server.connected\"}\n\n"))
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL, username, password, "v2")
+	
+	stopFunc, err := client.StreamSessionEvents("ses_test", func(event SessionEvent) error {
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("StreamSessionEvents failed: %v", err)
+	}
+	defer stopFunc()
+
+	// Give it a moment to connect
+	time.Sleep(100 * time.Millisecond)
+
+	if !authReceived {
+		t.Error("Authorization header was not sent to SSE endpoint")
+	}
+}
+
+func TestStreamSessionEventsWithoutAuth401(t *testing.T) {
+	// Test that SSE endpoint fails without auth
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Reject without auth
+		_, _, ok := r.BasicAuth()
+		if !ok {
+			w.WriteHeader(http.StatusUnauthorized)
+			w.Write([]byte(`{"error": "Authorization required"}`))
+			return
+		}
+		// Should not reach here in this test
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL, "", "", "v2")
+	
+	_, err := client.StreamSessionEvents("ses_test", func(event SessionEvent) error {
+		return nil
+	})
+
+	if err == nil {
+		t.Fatal("Expected error for SSE without auth, got nil")
+	}
+
+	if !contains(err.Error(), "401") && !contains(err.Error(), "failed") {
+		t.Errorf("Expected 401 or connection failure in error, got: %v", err)
+	}
+}

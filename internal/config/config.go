@@ -105,6 +105,17 @@ func LoadConfig(path string) (*Config, error) {
 	if baseURL := os.Getenv("OPENCODE_BASE_URL"); baseURL != "" {
 		cfg.OpenCode.BaseURL = baseURL
 	}
+	// OpenCode authentication - support both DEVBOXD_ prefix and OPENCODE_SERVER_ (matching OpenCode server vars)
+	if username := os.Getenv("DEVBOXD_OPENCODE_USERNAME"); username != "" {
+		cfg.OpenCode.Username = username
+	} else if username := os.Getenv("OPENCODE_SERVER_USERNAME"); username != "" {
+		cfg.OpenCode.Username = username
+	}
+	if password := os.Getenv("DEVBOXD_OPENCODE_PASSWORD"); password != "" {
+		cfg.OpenCode.Password = password
+	} else if password := os.Getenv("OPENCODE_SERVER_PASSWORD"); password != "" {
+		cfg.OpenCode.Password = password
+	}
 
 	// Defaults
 	if cfg.Server.Listen == "" {
