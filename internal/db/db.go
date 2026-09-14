@@ -37,7 +37,7 @@ func (s JobState) IsTerminal() bool {
 // IsBusy returns true if the state indicates active processing
 func (s JobState) IsBusy() bool {
 	return s == StateFetching || s == StatePreparing || s == StateCoding ||
-		s == StateReviewing || s == StatePushing || s == StatePROpen
+		s == StateReviewing || s == StatePushing
 }
 
 // Job represents a coding job
@@ -197,7 +197,7 @@ func (db *DB) GetCurrentJob() (*Job, error) {
 			operator_context, review_feedback,
 			created_at, updated_at, completed_at
 		FROM jobs
-		WHERE state IN ('fetching', 'preparing', 'coding', 'reviewing', 'pushing', 'pr_open')
+		WHERE state IN ('fetching', 'preparing', 'coding', 'reviewing', 'pushing')
 		ORDER BY created_at DESC
 		LIMIT 1
 	`).Scan(

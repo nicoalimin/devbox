@@ -70,7 +70,7 @@ func TestJobStateMethods(t *testing.T) {
 		{StateCoding, false, true},
 		{StateReviewing, false, true},
 		{StatePushing, false, true},
-		{StatePROpen, false, true},
+		{StatePROpen, false, false},
 		{StateDone, true, false},
 		{StateBlocked, false, false},
 		{StateFailed, true, false},
@@ -509,5 +509,140 @@ func TestRestartPersistence(t *testing.T) {
 	}
 	if updatedJob.BlockerReason != "" {
 		t.Errorf("BlockerReason should be empty after update, got: %s", updatedJob.BlockerReason)
+	}
+}
+
+func TestGetCurrentJobExcludesPROpen(t *testing.T) {
+	dbPath := "test_pr_open_not_busy.db"
+	defer os.Remove(dbPath)
+
+	db, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Failed to open database: %v", err)
+	}
+	defer db.Close()
+
+	// Create a job in pr_open state
+	job := &Job{
+		ID:            "job-pr-open",
+		LinearIssueID: "ENG-456",
+		State:         StatePROpen,
+		PRURL:         "https://github.com/test/repo/pull/1",
+		CreatedAt:     time.Now(),
+		UpdatedAt:     time.Now(),
+	}
+	if err := db.CreateJob(job); err != nil {
+		t.Fatalf("Failed to create job: %v", err)
+	}
+
+	// GetCurrentJob should return nil (pr_open is not busy)
+	current, err := db.GetCurrentJob()
+	if err != nil {
+		t.Fatalf("Failed to get current job: %v", err)
+	}
+	if current != nil {
+		t.Errorf("Expected nil (pr_open should not be busy), got job %s", current.ID)
+	}
+}
+
+func TestGetCurrentJobExcludesBlocked(t *testing.T) {
+	dbPath := "test_blocked_not_busy.db"
+	defer os.Remove(dbPath)
+
+	db, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Failed to open database: %v", err)
+	}
+	defer db.Close()
+
+	// Create a job in blocked state
+	job := &Job{
+		ID:            "job-blocked",
+		LinearIssueID: "ENG-789",
+		State:         StateBlocked,
+		BlockerReason: "Waiting for clarification",
+		CreatedAt:     time.Now(),
+		UpdatedAt:     time.Now(),
+	}
+	if err := db.CreateJob(job); err != nil {
+		t.Fatalf("Failed to create job: %v", err)
+	}
+
+	// GetCurrentJob should return nil (blocked is not busy)
+	current, err := db.GetCurrentJob()
+	if err != nil {
+		t.Fatalf("Failed to get current job: %v", err)
+	}
+	if current != nil {
+		t.Errorf("Expected nil (blocked should not be busy), got job %s", current.ID)
+	}
+}
+
+func TestGetCurrentJobWithMultipleStates(t *testing.T) {
+	dbPath := "test_multiple_states.db"
+	defer os.Remove(dbPath)
+
+	db, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Failed to open database: %v", err)
+	}
+	defer db.Close()
+
+	// Create jobs in various states
+	jobs := []*Job{
+		{
+			ID:            "job-done",
+			LinearIssueID: "ENG-100",
+			State:         StateDone,
+			CreatedAt:     time.Now().Add(-5 * time.Minute),
+			UpdatedAt:     time.Now(),
+		},
+		{
+			ID:            "job-pr-open",
+			LinearIssueID: "ENG-200",
+			State:         StatePROpen,
+			PRURL:         "https://github.com/test/repo/pull/2",
+			CreatedAt:     time.Now().Add(-4 * time.Minute),
+			UpdatedAt:     time.Now(),
+		},
+		{
+			ID:            "job-blocked",
+			LinearIssueID: "ENG-300",
+			State:         StateBlocked,
+			BlockerReason: "Need info",
+			CreatedAt:     time.Now().Add(-3 * time.Minute),
+			UpdatedAt:     time.Now(),
+		},
+		{
+			ID:            "job-coding",
+			LinearIssueID: "ENG-400",
+			State:         StateCoding,
+			CreatedAt:     time.Now().Add(-2 * time.Minute),
+			UpdatedAt:     time.Now(),
+		},
+		{
+			ID:            "job-failed",
+			LinearIssueID: "ENG-500",
+			State:         StateFailed,
+			CreatedAt:     time.Now().Add(-1 * time.Minute),
+			UpdatedAt:     time.Now(),
+		},
+	}
+
+	for _, job := range jobs {
+		if err := db.CreateJob(job); err != nil {
+			t.Fatalf("Failed to create job %s: %v", job.ID, err)
+		}
+	}
+
+	// GetCurrentJob should return only the coding job
+	current, err := db.GetCurrentJob()
+	if err != nil {
+		t.Fatalf("Failed to get current job: %v", err)
+	}
+	if current == nil {
+		t.Errorf("Expected job-coding, got nil")
+	} else if current.ID != "job-coding" {
+		t.Errorf("Expected job-coding, got %s", current.ID)
 	}
 }
