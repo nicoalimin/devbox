@@ -3,6 +3,7 @@ package opencode
 import (
 	"bufio"
 	"bytes"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -12,6 +13,12 @@ import (
 	"time"
 )
 
+// hashString computes a SHA256 hash of a string
+func hashString(s string) []byte {
+	h := sha256.Sum256([]byte(s))
+	return h[:]
+}
+
 // Client handles OpenCode API interactions
 type Client struct {
 	baseURL    string
@@ -19,6 +26,7 @@ type Client struct {
 	username   string
 	password   string
 	httpClient *http.Client
+	logFunc    func(level, message string) // Optional logging callback
 }
 
 // NewClient creates a new OpenCode API client
@@ -35,6 +43,18 @@ func NewClient(baseURL, username, password, version string) *Client {
 		httpClient: &http.Client{
 			Timeout: 60 * time.Second,
 		},
+	}
+}
+
+// SetLogFunc sets an optional logging callback for telemetry
+func (c *Client) SetLogFunc(logFunc func(level, message string)) {
+	c.logFunc = logFunc
+}
+
+// log logs a message if a log function is configured
+func (c *Client) log(level, message string) {
+	if c.logFunc != nil {
+		c.logFunc(level, message)
 	}
 }
 
@@ -152,6 +172,8 @@ func (c *Client) CreateSession(title, directory string) (*Session, error) {
 
 // createSessionV2 creates a session using OpenCode2 API
 func (c *Client) createSessionV2(title, directory string) (*Session, error) {
+	c.log("info", fmt.Sprintf("Creating OpenCode session (title: %s, directory: %s)", title, directory))
+	
 	body := map[string]interface{}{
 		"title": title,
 	}
@@ -165,6 +187,7 @@ func (c *Client) createSessionV2(title, directory string) (*Session, error) {
 
 	var response V2SessionResponse
 	if err := c.post("/api/session", body, &response); err != nil {
+		c.log("error", fmt.Sprintf("Failed to create session: %v", err))
 		return nil, fmt.Errorf("failed to create OpenCode2 session: %w", err)
 	}
 
@@ -178,9 +201,12 @@ func (c *Client) createSessionV2(title, directory string) (*Session, error) {
 		if len(responseStr) > 200 {
 			responseStr = responseStr[:200] + "..."
 		}
+		c.log("error", fmt.Sprintf("Empty session ID in response: %s", responseStr))
 		return nil, fmt.Errorf("OpenCode2 returned empty session ID (response: %s)", responseStr)
 	}
 
+	c.log("info", fmt.Sprintf("Session created successfully (id: %s, status: active)", sessionID))
+	
 	return &Session{
 		ID:     sessionID,
 		Status: "active",
@@ -306,7 +332,9 @@ func (c *Client) WaitForSessionIdle(sessionID string, timeout time.Duration, dir
 	start := time.Now()
 	pollInterval := 5 * time.Second
 	logInterval := 10 * time.Second // Reduced from 30s to 10s for more frequent heartbeats
+	staleActiveThreshold := 60 * time.Second // Warn if session is active but no events for 60s
 	lastLog := time.Now()
+	lastActiveCheck := time.Now()
 	
 	// Phase 1: Wait for session to become active (race condition protection)
 	// For v2: after sending prompt, OpenCode may take a moment to start processing
@@ -415,6 +443,17 @@ func (c *Client) WaitForSessionIdle(sessionID string, timeout time.Duration, dir
 				logFunc(fmt.Sprintf("Still waiting for OpenCode session %s (elapsed: %v)", sessionID, elapsed))
 				lastLog = time.Now()
 			}
+			
+			// Check for stale-active condition: session says active but no activity
+			// This is a heuristic based on polling interval - in production, event stream tracking would be more accurate
+			timeSinceLastCheck := time.Since(lastActiveCheck)
+			if timeSinceLastCheck >= staleActiveThreshold && sawActive {
+				if logFunc != nil {
+					logFunc(fmt.Sprintf("Warning: Session %s shows active in /api/session/active but has been polled for %v without completing - possible stale-active state", sessionID, timeSinceLastCheck.Round(time.Second)))
+				}
+				c.log("warn", fmt.Sprintf("Stale-active warning: session %s active for %v without completing", sessionID, timeSinceLastCheck.Round(time.Second)))
+			}
+			lastActiveCheck = time.Now()
 		}
 		
 		time.Sleep(pollInterval)
@@ -423,6 +462,11 @@ func (c *Client) WaitForSessionIdle(sessionID string, timeout time.Duration, dir
 
 // sendMessageV2 sends a message using OpenCode2 /api/session/{sessionID}/prompt
 func (c *Client) sendMessageV2(sessionID, message, directory string) error {
+	// Compute message size and hash for telemetry
+	messageSize := len(message)
+	messageHash := fmt.Sprintf("%x", hashString(message))
+	c.log("info", fmt.Sprintf("Sending prompt to session %s (size: %d bytes, hash: %s)", sessionID, messageSize, messageHash[:8]))
+	
 	// OpenCode2 beta-19135 expects FLAT structure with text at root level:
 	//   {"text": "message"}
 	// NOT nested: {"prompt": {"text": "message"}}
@@ -440,9 +484,11 @@ func (c *Client) sendMessageV2(sessionID, message, directory string) error {
 	// Log request body on failure for debugging
 	if err != nil {
 		bodyBytes, _ := json.Marshal(body)
+		c.log("error", fmt.Sprintf("Failed to send prompt: %v", err))
 		return fmt.Errorf("%w (request body: %s)", err, string(bodyBytes))
 	}
 	
+	c.log("info", fmt.Sprintf("Prompt sent successfully (response: OK)"))
 	return nil
 }
 
@@ -557,6 +603,8 @@ func (c *Client) StreamSessionEvents(sessionID string, handler func(SessionEvent
 		return nil, fmt.Errorf("event streaming only supported for OpenCode v2")
 	}
 
+	c.log("info", fmt.Sprintf("Attempting to connect to OpenCode event stream for session %s", sessionID))
+
 	// OpenCode2 SSE endpoints to try, in order of preference
 	// The API uses /event or /global/event, NOT /api/session/{id}/event
 	paths := []string{
@@ -616,11 +664,14 @@ func (c *Client) StreamSessionEvents(sessionID string, handler func(SessionEvent
 
 	// If all endpoints failed, return the last error
 	if resp == nil || resp.StatusCode != http.StatusOK {
+		c.log("error", fmt.Sprintf("Failed to connect to event stream: all endpoints failed"))
 		if lastErr != nil {
 			return nil, fmt.Errorf("all SSE endpoints failed, last error: %w", lastErr)
 		}
 		return nil, fmt.Errorf("failed to connect to any SSE endpoint")
 	}
+
+	c.log("info", fmt.Sprintf("Event stream connected successfully (endpoint: %s)", fullURL))
 
 	// Create stop channel and cleanup function
 	stopCh := make(chan struct{})
@@ -634,18 +685,34 @@ func (c *Client) StreamSessionEvents(sessionID string, handler func(SessionEvent
 			stopped = true
 			close(stopCh)
 			resp.Body.Close()
+			c.log("info", "Event stream disconnected")
 		}
 	}
 
-	// Start goroutine to read SSE stream
+	// Start goroutine to read SSE stream with heartbeat monitoring
 	go func() {
 		defer resp.Body.Close()
 		reader := bufio.NewReader(resp.Body)
 
+		// Heartbeat tracking
+		lastEventTime := time.Now()
+		heartbeatInterval := 30 * time.Second
+		heartbeatTimer := time.NewTicker(heartbeatInterval)
+		defer heartbeatTimer.Stop()
+
+		eventCount := 0
+
 		for {
 			select {
 			case <-stopCh:
+				c.log("info", fmt.Sprintf("Event stream closed after receiving %d events", eventCount))
 				return
+			case <-heartbeatTimer.C:
+				// Periodic heartbeat log if stream is quiet
+				elapsed := time.Since(lastEventTime)
+				if elapsed > heartbeatInterval {
+					c.log("info", fmt.Sprintf("Event stream heartbeat: no events for %v (stream still connected)", elapsed.Round(time.Second)))
+				}
 			default:
 			}
 
@@ -653,12 +720,15 @@ func (c *Client) StreamSessionEvents(sessionID string, handler func(SessionEvent
 			if err != nil {
 				if err != io.EOF {
 					// Stream error, call handler with error event
+					c.log("error", fmt.Sprintf("Event stream error: %v", err))
 					handler(SessionEvent{
 						Type: "stream.error",
 						Data: map[string]interface{}{
 							"error": err.Error(),
 						},
 					})
+				} else {
+					c.log("info", "Event stream closed by server (EOF)")
 				}
 				return
 			}
@@ -699,9 +769,14 @@ func (c *Client) StreamSessionEvents(sessionID string, handler func(SessionEvent
 					continue
 				}
 
+				// Update last event time and counter
+				lastEventTime = time.Now()
+				eventCount++
+
 				// Call handler for matching events
 				if err := handler(event); err != nil {
 					// Handler error, stop streaming
+					c.log("warn", fmt.Sprintf("Event handler error: %v, stopping stream", err))
 					stopFunc()
 					return
 				}
