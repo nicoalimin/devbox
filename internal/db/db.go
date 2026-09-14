@@ -42,21 +42,23 @@ func (s JobState) IsBusy() bool {
 
 // Job represents a coding job
 type Job struct {
-	ID                string     `json:"id"`
-	LinearIssueID     string     `json:"linear_issue_id"`
-	LinearURL         string     `json:"linear_url"`
-	State             JobState   `json:"state"`
-	RepoPath          string     `json:"repo_path"`
-	BranchName        string     `json:"branch_name"`
-	WorktreePath      string     `json:"worktree_path"`
-	PRURL             string     `json:"pr_url"`
-	BlockerReason     string     `json:"blocker_reason"`
-	OpenCodeSessionID string     `json:"opencode_session_id"`
-	OperatorContext   string     `json:"operator_context"`
-	ReviewFeedback    string     `json:"review_feedback"`
-	CreatedAt         time.Time  `json:"created_at"`
-	UpdatedAt         time.Time  `json:"updated_at"`
-	CompletedAt       *time.Time `json:"completed_at"`
+	ID                      string     `json:"id"`
+	LinearIssueID           string     `json:"linear_issue_id"`
+	LinearURL               string     `json:"linear_url"`
+	State                   JobState   `json:"state"`
+	RepoPath                string     `json:"repo_path"`
+	BranchName              string     `json:"branch_name"`
+	WorktreePath            string     `json:"worktree_path"`
+	PRURL                   string     `json:"pr_url"`
+	BlockerReason           string     `json:"blocker_reason"`
+	OpenCodeSessionID       string     `json:"opencode_session_id"`
+	OperatorContext         string     `json:"operator_context"`
+	ReviewFeedback          string     `json:"review_feedback"`
+	CodingWaitStartedAt     *time.Time `json:"coding_wait_started_at"`
+	ReviewingWaitStartedAt  *time.Time `json:"reviewing_wait_started_at"`
+	CreatedAt               time.Time  `json:"created_at"`
+	UpdatedAt               time.Time  `json:"updated_at"`
+	CompletedAt             *time.Time `json:"completed_at"`
 }
 
 // JobLog represents a log entry for a job
@@ -112,11 +114,13 @@ func (db *DB) CreateJob(job *Job) error {
 			id, linear_issue_id, linear_url, state, repo_path, branch_name,
 			worktree_path, pr_url, blocker_reason, opencode_session_id,
 			operator_context, review_feedback,
+			coding_wait_started_at, reviewing_wait_started_at,
 			created_at, updated_at, completed_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`, job.ID, job.LinearIssueID, job.LinearURL, job.State, job.RepoPath,
 		job.BranchName, job.WorktreePath, job.PRURL, job.BlockerReason,
 		job.OpenCodeSessionID, job.OperatorContext, job.ReviewFeedback,
+		job.CodingWaitStartedAt, job.ReviewingWaitStartedAt,
 		job.CreatedAt, job.UpdatedAt, job.CompletedAt)
 	return err
 }
@@ -129,11 +133,13 @@ func (db *DB) UpdateJob(job *Job) error {
 			state = ?, repo_path = ?, branch_name = ?, worktree_path = ?,
 			pr_url = ?, blocker_reason = ?, opencode_session_id = ?,
 			operator_context = ?, review_feedback = ?,
+			coding_wait_started_at = ?, reviewing_wait_started_at = ?,
 			updated_at = ?, completed_at = ?
 		WHERE id = ?
 	`, job.State, job.RepoPath, job.BranchName, job.WorktreePath,
 		job.PRURL, job.BlockerReason, job.OpenCodeSessionID,
 		job.OperatorContext, job.ReviewFeedback,
+		job.CodingWaitStartedAt, job.ReviewingWaitStartedAt,
 		job.UpdatedAt, job.CompletedAt, job.ID)
 	return err
 }
@@ -145,12 +151,14 @@ func (db *DB) GetJob(id string) (*Job, error) {
 		SELECT id, linear_issue_id, linear_url, state, repo_path, branch_name,
 			worktree_path, pr_url, blocker_reason, opencode_session_id,
 			operator_context, review_feedback,
+			coding_wait_started_at, reviewing_wait_started_at,
 			created_at, updated_at, completed_at
 		FROM jobs WHERE id = ?
 	`, id).Scan(
 		&job.ID, &job.LinearIssueID, &job.LinearURL, &job.State, &job.RepoPath,
 		&job.BranchName, &job.WorktreePath, &job.PRURL, &job.BlockerReason,
 		&job.OpenCodeSessionID, &job.OperatorContext, &job.ReviewFeedback,
+		&job.CodingWaitStartedAt, &job.ReviewingWaitStartedAt,
 		&job.CreatedAt, &job.UpdatedAt, &job.CompletedAt,
 	)
 	if err == sql.ErrNoRows {
@@ -161,7 +169,7 @@ func (db *DB) GetJob(id string) (*Job, error) {
 
 // ListJobs lists jobs with optional limit
 func (db *DB) ListJobs(limit int) ([]*Job, error) {
-	query := "SELECT id, linear_issue_id, linear_url, state, repo_path, branch_name, worktree_path, pr_url, blocker_reason, opencode_session_id, operator_context, review_feedback, created_at, updated_at, completed_at FROM jobs ORDER BY created_at DESC"
+	query := "SELECT id, linear_issue_id, linear_url, state, repo_path, branch_name, worktree_path, pr_url, blocker_reason, opencode_session_id, operator_context, review_feedback, coding_wait_started_at, reviewing_wait_started_at, created_at, updated_at, completed_at FROM jobs ORDER BY created_at DESC"
 	if limit > 0 {
 		query += fmt.Sprintf(" LIMIT %d", limit)
 	}
@@ -179,6 +187,7 @@ func (db *DB) ListJobs(limit int) ([]*Job, error) {
 			&job.ID, &job.LinearIssueID, &job.LinearURL, &job.State, &job.RepoPath,
 			&job.BranchName, &job.WorktreePath, &job.PRURL, &job.BlockerReason,
 			&job.OpenCodeSessionID, &job.OperatorContext, &job.ReviewFeedback,
+			&job.CodingWaitStartedAt, &job.ReviewingWaitStartedAt,
 			&job.CreatedAt, &job.UpdatedAt, &job.CompletedAt,
 		); err != nil {
 			return nil, err
@@ -195,6 +204,7 @@ func (db *DB) GetCurrentJob() (*Job, error) {
 		SELECT id, linear_issue_id, linear_url, state, repo_path, branch_name,
 			worktree_path, pr_url, blocker_reason, opencode_session_id,
 			operator_context, review_feedback,
+			coding_wait_started_at, reviewing_wait_started_at,
 			created_at, updated_at, completed_at
 		FROM jobs
 		WHERE state IN ('fetching', 'preparing', 'coding', 'reviewing', 'pushing')
@@ -204,6 +214,7 @@ func (db *DB) GetCurrentJob() (*Job, error) {
 		&job.ID, &job.LinearIssueID, &job.LinearURL, &job.State, &job.RepoPath,
 		&job.BranchName, &job.WorktreePath, &job.PRURL, &job.BlockerReason,
 		&job.OpenCodeSessionID, &job.OperatorContext, &job.ReviewFeedback,
+		&job.CodingWaitStartedAt, &job.ReviewingWaitStartedAt,
 		&job.CreatedAt, &job.UpdatedAt, &job.CompletedAt,
 	)
 	if err == sql.ErrNoRows {
@@ -219,6 +230,7 @@ func (db *DB) GetJobByLinearIssueID(linearIssueID string) (*Job, error) {
 		SELECT id, linear_issue_id, linear_url, state, repo_path, branch_name,
 			worktree_path, pr_url, blocker_reason, opencode_session_id,
 			operator_context, review_feedback,
+			coding_wait_started_at, reviewing_wait_started_at,
 			created_at, updated_at, completed_at
 		FROM jobs
 		WHERE linear_issue_id = ?
@@ -228,6 +240,7 @@ func (db *DB) GetJobByLinearIssueID(linearIssueID string) (*Job, error) {
 		&job.ID, &job.LinearIssueID, &job.LinearURL, &job.State, &job.RepoPath,
 		&job.BranchName, &job.WorktreePath, &job.PRURL, &job.BlockerReason,
 		&job.OpenCodeSessionID, &job.OperatorContext, &job.ReviewFeedback,
+		&job.CodingWaitStartedAt, &job.ReviewingWaitStartedAt,
 		&job.CreatedAt, &job.UpdatedAt, &job.CompletedAt,
 	)
 	if err == sql.ErrNoRows {
@@ -242,6 +255,7 @@ func (db *DB) GetBlockedJobs() ([]*Job, error) {
 		SELECT id, linear_issue_id, linear_url, state, repo_path, branch_name,
 			worktree_path, pr_url, blocker_reason, opencode_session_id,
 			operator_context, review_feedback,
+			coding_wait_started_at, reviewing_wait_started_at,
 			created_at, updated_at, completed_at
 		FROM jobs
 		WHERE state = 'blocked'
@@ -259,6 +273,7 @@ func (db *DB) GetBlockedJobs() ([]*Job, error) {
 			&job.ID, &job.LinearIssueID, &job.LinearURL, &job.State, &job.RepoPath,
 			&job.BranchName, &job.WorktreePath, &job.PRURL, &job.BlockerReason,
 			&job.OpenCodeSessionID, &job.OperatorContext, &job.ReviewFeedback,
+			&job.CodingWaitStartedAt, &job.ReviewingWaitStartedAt,
 			&job.CreatedAt, &job.UpdatedAt, &job.CompletedAt,
 		); err != nil {
 			return nil, err
