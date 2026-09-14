@@ -140,6 +140,21 @@ When you run `devboxd --config devboxd.yaml` on a terminal, it launches an immer
 - **Color-coded states**: Green (done), red (failed), yellow (blocked), blue (active)
 - **Responsive**: Handles terminal resize gracefully
 
+**TUI Review Requirements**
+
+When making changes to the TUI (files in `internal/tui/`), verify the following before submitting:
+
+- [ ] **Full-screen fit**: The entire dashboard (header + both columns + footer) fits within **one terminal screen** with no overflow or clipping
+  - Test with various terminal sizes (minimum: 80x24, recommended: 120x30+)
+  - Both columns (left sidebar and right logs) must have the **same total height**
+  - Resize the terminal to confirm no content is pushed above the visible area
+- [ ] **Layout balance**: Left sidebar height (jobs + errors + integrations) equals right column height (server logs + job logs)
+- [ ] **Headless mode**: `--no-tui` flag still works correctly for non-interactive environments
+- [ ] **Navigation**: Independent scrolling in server logs and job logs panes still functions
+- [ ] **Job selection**: Changing selected job in jobs pane updates job logs pane correctly
+
+These requirements ensure a professional, immersive TUI experience that fits standard terminal environments.
+
 **Headless Mode**
 
 To run without the TUI (e.g., in Docker, systemd, or CI):
