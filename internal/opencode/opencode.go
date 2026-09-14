@@ -295,7 +295,7 @@ func (c *Client) isSessionBusyClassic(sessionID string) (bool, error) {
 func (c *Client) WaitForSessionIdle(sessionID string, timeout time.Duration, directory string, logFunc func(string)) error {
 	start := time.Now()
 	pollInterval := 5 * time.Second
-	logInterval := 30 * time.Second
+	logInterval := 10 * time.Second // Reduced from 30s to 10s for more frequent heartbeats
 	lastLog := time.Now()
 	
 	// Phase 1: Wait for session to become active (race condition protection)
@@ -303,6 +303,7 @@ func (c *Client) WaitForSessionIdle(sessionID string, timeout time.Duration, dir
 	// Don't treat "not in active map" as idle until we've seen it become active at least once
 	sawActive := false
 	warmupDeadline := start.Add(30 * time.Second) // Give it 30s to start
+	warmupLogTimer := time.Now() // Separate timer for warmup phase logging
 	
 	if logFunc != nil {
 		logFunc(fmt.Sprintf("Waiting for OpenCode session %s to start (version: %s)", sessionID, c.version))
@@ -316,9 +317,9 @@ func (c *Client) WaitForSessionIdle(sessionID string, timeout time.Duration, dir
 		busy, err := c.IsSessionBusy(sessionID, directory)
 		if err != nil {
 			// Log error but continue - might be temporary
-			if logFunc != nil && time.Now().Sub(lastLog) >= logInterval {
+			if logFunc != nil && time.Now().Sub(warmupLogTimer) >= logInterval {
 				logFunc(fmt.Sprintf("Warning: failed to check session status: %v", err))
-				lastLog = time.Now()
+				warmupLogTimer = time.Now()
 			}
 			time.Sleep(pollInterval)
 			continue
@@ -332,31 +333,49 @@ func (c *Client) WaitForSessionIdle(sessionID string, timeout time.Duration, dir
 			break
 		}
 		
+		// Not yet active, log progress periodically during warmup
+		if logFunc != nil && time.Now().Sub(warmupLogTimer) >= logInterval {
+			warmupElapsed := time.Since(start)
+			logFunc(fmt.Sprintf("Still waiting for session %s to start (elapsed: %v)", sessionID, warmupElapsed))
+			warmupLogTimer = time.Now()
+		}
+		
 		// Not yet active, wait a bit
 		time.Sleep(pollInterval)
 	}
 	
-	// If we never saw the session become active, that's unusual but not necessarily an error
-	// It could mean OpenCode finished very quickly. Log a warning and proceed to check for completion signals.
+	// If we never saw the session become active after warmup period, that's a problem
+	// For reused sessions, this likely means OpenCode didn't process the new prompt
 	if !sawActive {
 		if logFunc != nil {
-			logFunc(fmt.Sprintf("Warning: session %s never appeared in active map (may have completed very quickly)", sessionID))
+			logFunc(fmt.Sprintf("Warning: session %s never appeared in active map after %v warmup", sessionID, time.Since(start)))
 		}
+		// Continue to Phase 2 but with a shorter timeout since something is likely wrong
+		// If it's truly done quickly, Phase 2 will detect it and return success
+		// If it's stuck, Phase 2 will timeout
 	}
 	
 	// Phase 2: Wait for session to become idle
 	lastLog = time.Now()
+	loopCount := 0
 	for {
+		loopCount++
 		elapsed := time.Since(start)
 		if elapsed >= timeout {
-			return fmt.Errorf("timeout waiting for session %s after %v", sessionID, elapsed)
+			// Provide context about what we saw during the wait
+			state := "never became active"
+			if sawActive {
+				state = "became active but never completed"
+			}
+			return fmt.Errorf("timeout waiting for session %s after %v (%s, checked %d times)", 
+				sessionID, elapsed, state, loopCount)
 		}
 		
 		busy, err := c.IsSessionBusy(sessionID, directory)
 		if err != nil {
 			// Log error but continue - might be temporary
 			if logFunc != nil && time.Now().Sub(lastLog) >= logInterval {
-				logFunc(fmt.Sprintf("Warning: failed to check session status: %v", err))
+				logFunc(fmt.Sprintf("Warning: failed to check session status: %v (elapsed: %v)", err, elapsed))
 				lastLog = time.Now()
 			}
 			time.Sleep(pollInterval)
@@ -373,13 +392,19 @@ func (c *Client) WaitForSessionIdle(sessionID string, timeout time.Duration, dir
 				}
 				return nil
 			}
-			// For v2: not active yet, keep waiting
-		}
-		
-		// Log progress periodically
-		if logFunc != nil && time.Now().Sub(lastLog) >= logInterval {
-			logFunc(fmt.Sprintf("Still waiting for OpenCode session %s (elapsed: %v)", sessionID, elapsed))
-			lastLog = time.Now()
+			// For v2: not active yet in Phase 2
+			// This is a weird state - we're past warmup but still haven't seen it active
+			// Log this more prominently and eventually timeout
+			if logFunc != nil && time.Now().Sub(lastLog) >= logInterval {
+				logFunc(fmt.Sprintf("Session %s still not active after %v (may not have started processing)", sessionID, elapsed))
+				lastLog = time.Now()
+			}
+		} else {
+			// Session is busy - normal state, log progress periodically
+			if logFunc != nil && time.Now().Sub(lastLog) >= logInterval {
+				logFunc(fmt.Sprintf("Still waiting for OpenCode session %s (elapsed: %v)", sessionID, elapsed))
+				lastLog = time.Now()
+			}
 		}
 		
 		time.Sleep(pollInterval)
