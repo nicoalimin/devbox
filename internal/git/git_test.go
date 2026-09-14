@@ -282,6 +282,133 @@ func TestFindUniqueBranchName(t *testing.T) {
 	}
 }
 
+func TestRecreateWorktree_Success(t *testing.T) {
+	repoPath := setupTestRepo(t)
+	defer os.RemoveAll(repoPath)
+
+	mgr := NewManager(repoPath, "main")
+
+	// First create a worktree and get a commit on it
+	worktree, err := mgr.CreateWorktree("TEST-RECREATE")
+	if err != nil {
+		t.Fatalf("CreateWorktree failed: %v", err)
+	}
+
+	branchName := worktree.BranchName
+	
+	// Add a commit to the worktree
+	testFile := filepath.Join(worktree.Path, "test.txt")
+	if err := os.WriteFile(testFile, []byte("test content\n"), 0644); err != nil {
+		t.Fatalf("Failed to create test file: %v", err)
+	}
+
+	cmd := exec.Command("git", "add", "test.txt")
+	cmd.Dir = worktree.Path
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("Failed to add test file: %v", err)
+	}
+
+	cmd = exec.Command("git", "commit", "-m", "Add test file")
+	cmd.Dir = worktree.Path
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("Failed to commit: %v", err)
+	}
+
+	// Now remove the worktree (simulating cleanup after job completion)
+	if err := mgr.RemoveWorktree(worktree.Path); err != nil {
+		t.Fatalf("RemoveWorktree failed: %v", err)
+	}
+
+	// Verify worktree is gone
+	if _, err := os.Stat(worktree.Path); !os.IsNotExist(err) {
+		t.Error("worktree still exists after removal")
+	}
+
+	// Now recreate the worktree from the existing branch
+	recreated, err := mgr.RecreateWorktree("TEST-RECREATE", branchName)
+	if err != nil {
+		t.Fatalf("RecreateWorktree failed: %v", err)
+	}
+
+	// Verify the worktree was recreated with the same branch
+	if recreated.BranchName != branchName {
+		t.Errorf("expected branch name '%s', got '%s'", branchName, recreated.BranchName)
+	}
+
+	expectedPath := filepath.Join(repoPath, ".devbox-worktrees", "TEST-RECREATE")
+	if recreated.Path != expectedPath {
+		t.Errorf("expected path '%s', got '%s'", expectedPath, recreated.Path)
+	}
+
+	// Verify worktree exists
+	if _, err := os.Stat(recreated.Path); os.IsNotExist(err) {
+		t.Error("recreated worktree path does not exist")
+	}
+
+	// Verify the commit is still there
+	testFilePath := filepath.Join(recreated.Path, "test.txt")
+	if _, err := os.Stat(testFilePath); os.IsNotExist(err) {
+		t.Error("test file from original branch not found in recreated worktree")
+	}
+
+	// Cleanup
+	mgr.RemoveWorktree(recreated.Path)
+}
+
+func TestRecreateWorktree_NonExistentBranch(t *testing.T) {
+	repoPath := setupTestRepo(t)
+	defer os.RemoveAll(repoPath)
+
+	mgr := NewManager(repoPath, "main")
+
+	// Try to recreate from a non-existent branch
+	_, err := mgr.RecreateWorktree("TEST-NONEXISTENT", "devbox/nonexistent")
+	if err == nil {
+		t.Error("expected error when recreating worktree from non-existent branch")
+	}
+}
+
+func TestRecreateWorktree_WithSuffix(t *testing.T) {
+	repoPath := setupTestRepo(t)
+	defer os.RemoveAll(repoPath)
+
+	mgr := NewManager(repoPath, "main")
+
+	// Create a branch that would conflict (so we get a suffixed branch name)
+	createBranch(t, repoPath, "devbox/test-suffix")
+
+	// Create a worktree which will get suffix -2
+	worktree, err := mgr.CreateWorktree("TEST-SUFFIX")
+	if err != nil {
+		t.Fatalf("CreateWorktree failed: %v", err)
+	}
+
+	branchName := worktree.BranchName // Should be "devbox/test-suffix-2"
+	if branchName != "devbox/test-suffix-2" {
+		t.Fatalf("expected branch name 'devbox/test-suffix-2', got '%s'", branchName)
+	}
+
+	// Remove the worktree
+	if err := mgr.RemoveWorktree(worktree.Path); err != nil {
+		t.Fatalf("RemoveWorktree failed: %v", err)
+	}
+
+	// Recreate with the suffixed branch name
+	recreated, err := mgr.RecreateWorktree("TEST-SUFFIX", branchName)
+	if err != nil {
+		t.Fatalf("RecreateWorktree failed: %v", err)
+	}
+
+	// Verify path has the same suffix
+	expectedPath := filepath.Join(repoPath, ".devbox-worktrees", "TEST-SUFFIX-2")
+	if recreated.Path != expectedPath {
+		t.Errorf("expected path '%s', got '%s'", expectedPath, recreated.Path)
+	}
+
+	// Cleanup
+	mgr.RemoveWorktree(recreated.Path)
+}
+
 func TestHasCommitsAheadOfBase(t *testing.T) {
 	repoPath := setupTestRepo(t)
 	defer os.RemoveAll(repoPath)

@@ -3,6 +3,7 @@ package job
 import (
 	"fmt"
 	"log"
+	"os"
 	"strings"
 	"time"
 
@@ -567,11 +568,37 @@ func (o *Orchestrator) ReviewJob(jobIDOrLinearID, feedback string) error {
 	}
 
 	// Check that we have necessary information
-	if job.WorktreePath == "" {
-		return fmt.Errorf("job has no worktree path")
-	}
 	if job.BranchName == "" {
 		return fmt.Errorf("job has no branch name")
+	}
+	if job.RepoPath == "" {
+		return fmt.Errorf("job has no repo path")
+	}
+
+	// Check if worktree exists on disk; recreate if it was cleaned up
+	gitMgr := git.NewManager(job.RepoPath, o.cfg.GitHub.DefaultBaseBranch)
+	if _, err := os.Stat(job.WorktreePath); os.IsNotExist(err) {
+		o.log(job.ID, "info", "Worktree missing, recreating from existing branch")
+		
+		// Extract identifier from Linear issue ID for worktree path
+		issue, err := o.linear.GetIssue(job.LinearIssueID)
+		if err != nil {
+			return fmt.Errorf("failed to get Linear issue: %w", err)
+		}
+		
+		worktree, err := gitMgr.RecreateWorktree(issue.Identifier, job.BranchName)
+		if err != nil {
+			return fmt.Errorf("failed to recreate worktree: %w", err)
+		}
+		
+		job.WorktreePath = worktree.Path
+		if err := o.db.UpdateJob(job); err != nil {
+			return fmt.Errorf("failed to update job with worktree path: %w", err)
+		}
+		
+		o.log(job.ID, "info", fmt.Sprintf("Recreated worktree at %s", worktree.Path))
+	} else if job.WorktreePath == "" {
+		return fmt.Errorf("job has no worktree path and cannot recreate")
 	}
 
 	o.log(job.ID, "info", "Received review feedback")
@@ -635,8 +662,7 @@ After making changes, confirm they are ready to push.`, feedback)
 
 	o.log(job.ID, "info", "OpenCode session completed, checking for new commits")
 
-	// Verify that new commits exist
-	gitMgr := git.NewManager(job.RepoPath, o.cfg.GitHub.DefaultBaseBranch)
+	// Verify that new commits exist (reuse gitMgr from earlier)
 	hasCommits, err := gitMgr.HasCommitsAheadOfBase(job.WorktreePath)
 	if err != nil {
 		o.log(job.ID, "error", fmt.Sprintf("Failed to check for commits: %v", err))
