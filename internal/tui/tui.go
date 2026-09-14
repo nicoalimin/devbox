@@ -18,28 +18,31 @@ type Pane int
 
 const (
 	JobsPane Pane = iota
-	LogsPane
+	ServerLogsPane
+	JobLogsPane
 	IntegrationsPane
 )
 
 // Model represents the TUI state
 type Model struct {
-	cfg             *config.Config
-	database        *db.DB
-	width           int
-	height          int
-	focusedPane     Pane
-	logsViewport    viewport.Model
-	jobsViewport    viewport.Model
-	errorsViewport  viewport.Model
-	lastUpdate      time.Time
-	currentJob      *db.Job
-	recentJobs      []*db.Job
-	blockedJobs     []*db.Job
-	recentLogs      []*db.JobLog
-	selectedJobIdx  int
-	quitting        bool
-	ready           bool
+	cfg                *config.Config
+	database           *db.DB
+	width              int
+	height             int
+	focusedPane        Pane
+	serverLogsViewport viewport.Model
+	jobLogsViewport    viewport.Model
+	jobsViewport       viewport.Model
+	errorsViewport     viewport.Model
+	lastUpdate         time.Time
+	currentJob         *db.Job
+	recentJobs         []*db.Job
+	blockedJobs        []*db.Job
+	serverLogs         []*db.JobLog
+	jobLogs            []*db.JobLog
+	selectedJobIdx     int
+	quitting           bool
+	ready              bool
 }
 
 type tickMsg time.Time
@@ -49,7 +52,7 @@ func NewModel(cfg *config.Config, database *db.DB) Model {
 	return Model{
 		cfg:            cfg,
 		database:       database,
-		focusedPane:    LogsPane,
+		focusedPane:    ServerLogsPane,
 		lastUpdate:     time.Now(),
 		selectedJobIdx: 0,
 	}
@@ -77,12 +80,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		case "tab":
 			// Cycle through panes
-			m.focusedPane = (m.focusedPane + 1) % 3
+			m.focusedPane = (m.focusedPane + 1) % 4
 			return m, nil
 
 		case "shift+tab":
 			// Cycle backward through panes
-			m.focusedPane = (m.focusedPane + 2) % 3
+			m.focusedPane = (m.focusedPane + 3) % 4
 			return m, nil
 
 		case "r":
@@ -95,11 +98,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case JobsPane:
 				if m.selectedJobIdx < len(m.recentJobs)-1 {
 					m.selectedJobIdx++
+					cmds = append(cmds, m.refreshJobLogs())
 				}
-			case LogsPane:
-				m.logsViewport.LineDown(1)
+			case ServerLogsPane:
+				m.serverLogsViewport.LineDown(1)
+			case JobLogsPane:
+				m.jobLogsViewport.LineDown(1)
 			}
-			return m, nil
+			return m, tea.Batch(cmds...)
 
 		case "k", "up":
 			// Navigate up in focused pane
@@ -107,21 +113,28 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case JobsPane:
 				if m.selectedJobIdx > 0 {
 					m.selectedJobIdx--
+					cmds = append(cmds, m.refreshJobLogs())
 				}
-			case LogsPane:
-				m.logsViewport.LineUp(1)
+			case ServerLogsPane:
+				m.serverLogsViewport.LineUp(1)
+			case JobLogsPane:
+				m.jobLogsViewport.LineUp(1)
 			}
-			return m, nil
+			return m, tea.Batch(cmds...)
+		
 
 		case "g":
 			// Go to top in focused pane
 			switch m.focusedPane {
 			case JobsPane:
 				m.selectedJobIdx = 0
-			case LogsPane:
-				m.logsViewport.GotoTop()
+				cmds = append(cmds, m.refreshJobLogs())
+			case ServerLogsPane:
+				m.serverLogsViewport.GotoTop()
+			case JobLogsPane:
+				m.jobLogsViewport.GotoTop()
 			}
-			return m, nil
+			return m, tea.Batch(cmds...)
 
 		case "G":
 			// Go to bottom in focused pane
@@ -129,20 +142,20 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case JobsPane:
 				if len(m.recentJobs) > 0 {
 					m.selectedJobIdx = len(m.recentJobs) - 1
+					cmds = append(cmds, m.refreshJobLogs())
 				}
-			case LogsPane:
-				m.logsViewport.GotoBottom()
+			case ServerLogsPane:
+				m.serverLogsViewport.GotoBottom()
+			case JobLogsPane:
+				m.jobLogsViewport.GotoBottom()
 			}
-			return m, nil
+			return m, tea.Batch(cmds...)
+		
 
 		case "enter":
-			// Show logs for selected job
-			if m.focusedPane == JobsPane && m.selectedJobIdx < len(m.recentJobs) {
-				selectedJob := m.recentJobs[m.selectedJobIdx]
-				logs, _ := m.database.GetLogs(selectedJob.ID, 100)
-				m.recentLogs = logs
-				m.logsViewport.SetContent(m.renderLogsContent())
-				m.focusedPane = LogsPane
+			// Switch focus to job logs pane
+			if m.focusedPane == JobsPane {
+				m.focusedPane = JobLogsPane
 			}
 			return m, nil
 		}
@@ -166,9 +179,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		//   jobs_content + errors_content = height - 13
 		//   Split equally: each = (height - 13) / 2
 		//
-		// Logs pane (with borders):
-		//   logs_content + 2 = height - 4
-		//   logs_content = height - 6
+		// Logs pane (split into server logs + job logs, stacked vertically):
+		//   Each log section needs: content + header (2 lines) + borders (2)
+		//   Total = (height - 4)
+		//   Split equally: each section content = (height - 4) / 2 - 4
 
 		sidebarWidth := 30
 		availableContentHeight := msg.Height - 4 // For the entire main content area
@@ -177,7 +191,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		sidebarJobsErrors := availableContentHeight - 5 // 5 for integrations bar
 		jobsHeight := sidebarJobsErrors/2 - 2           // -2 for each section's borders
 		errorsHeight := sidebarJobsErrors/2 - 2
-		logsHeight := availableContentHeight - 2        // -2 for logs border
+		
+		// Split logs pane into two sections (server logs + job logs)
+		// Each section needs: title (1) + subtitle (1) + content + borders (2) = content + 4
+		// Total available: availableContentHeight
+		// Each section: (availableContentHeight / 2) - 4 for content
+		logsSectionHeight := availableContentHeight / 2
+		serverLogsHeight := logsSectionHeight - 4  // Account for title, subtitle, borders
+		jobLogsHeight := logsSectionHeight - 4
 
 		// Ensure minimum heights
 		if jobsHeight < 3 {
@@ -186,20 +207,28 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if errorsHeight < 3 {
 			errorsHeight = 3
 		}
-		if logsHeight < 5 {
-			logsHeight = 5
+		if serverLogsHeight < 3 {
+			serverLogsHeight = 3
+		}
+		if jobLogsHeight < 3 {
+			jobLogsHeight = 3
 		}
 
 		if !m.ready {
 			// Initialize viewports with proper sizes
-			m.logsViewport = viewport.New(msg.Width-sidebarWidth-2, logsHeight)
+			logsWidth := msg.Width - sidebarWidth - 2
+			m.serverLogsViewport = viewport.New(logsWidth, serverLogsHeight)
+			m.jobLogsViewport = viewport.New(logsWidth, jobLogsHeight)
 			m.jobsViewport = viewport.New(sidebarWidth-2, jobsHeight)
 			m.errorsViewport = viewport.New(sidebarWidth-2, errorsHeight)
 			m.ready = true
 		} else {
 			// Update viewport sizes on resize
-			m.logsViewport.Width = msg.Width - sidebarWidth - 2
-			m.logsViewport.Height = logsHeight
+			logsWidth := msg.Width - sidebarWidth - 2
+			m.serverLogsViewport.Width = logsWidth
+			m.serverLogsViewport.Height = serverLogsHeight
+			m.jobLogsViewport.Width = logsWidth
+			m.jobLogsViewport.Height = jobLogsHeight
 			m.jobsViewport.Width = sidebarWidth - 2
 			m.jobsViewport.Height = jobsHeight
 			m.errorsViewport.Width = sidebarWidth - 2
@@ -218,16 +247,25 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.currentJob = msg.currentJob
 		m.recentJobs = msg.recentJobs
 		m.blockedJobs = msg.blockedJobs
-		m.recentLogs = msg.recentLogs
+		m.serverLogs = msg.serverLogs
+		m.jobLogs = msg.jobLogs
 
 		// Update viewport contents
 		if m.ready {
-			m.logsViewport.SetContent(m.renderLogsContent())
+			m.serverLogsViewport.SetContent(m.renderServerLogsContent())
+			m.jobLogsViewport.SetContent(m.renderJobLogsContent())
 			m.jobsViewport.SetContent(m.renderJobsContent())
 			m.errorsViewport.SetContent(m.renderErrorsContent())
 			
-			// Auto-scroll logs to bottom
-			m.logsViewport.GotoBottom()
+			// Auto-scroll server logs to bottom
+			m.serverLogsViewport.GotoBottom()
+		}
+		return m, nil
+	
+	case jobLogsRefreshMsg:
+		m.jobLogs = msg.jobLogs
+		if m.ready {
+			m.jobLogsViewport.SetContent(m.renderJobLogsContent())
 		}
 		return m, nil
 	}
@@ -235,8 +273,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	// Update active viewport
 	if m.ready {
 		switch m.focusedPane {
-		case LogsPane:
-			m.logsViewport, cmd = m.logsViewport.Update(msg)
+		case ServerLogsPane:
+			m.serverLogsViewport, cmd = m.serverLogsViewport.Update(msg)
+			cmds = append(cmds, cmd)
+		case JobLogsPane:
+			m.jobLogsViewport, cmd = m.jobLogsViewport.Update(msg)
 			cmds = append(cmds, cmd)
 		case JobsPane:
 			m.jobsViewport, cmd = m.jobsViewport.Update(msg)
@@ -499,46 +540,116 @@ func (m Model) renderIntegrationsBar() string {
 	return barStyle.Render(content)
 }
 
-// renderLogsPane renders the main logs pane
+// renderLogsPane renders the main logs pane with both server and job logs
 func (m Model) renderLogsPane() string {
-	logsStyle := lipgloss.NewStyle().
-		Width(m.width - 32).
-		Height(m.logsViewport.Height).
+	logsWidth := m.width - 32
+	
+	// Server Logs Section
+	serverLogsStyle := lipgloss.NewStyle().
+		Width(logsWidth).
+		Height(m.serverLogsViewport.Height + 4). // +4 for title, subtitle, and borders
 		BorderStyle(lipgloss.RoundedBorder()).
-		BorderForeground(m.getBorderColor(LogsPane))
+		BorderForeground(m.getBorderColor(ServerLogsPane))
 
-	title := lipgloss.NewStyle().
+	serverTitle := lipgloss.NewStyle().
 		Bold(true).
 		Foreground(lipgloss.Color("117")).
-		Render("LIVE LOGS")
+		Render("LIVE SERVER LOGS")
 
-	subtitle := dimStyle.Render("(streaming from current job)")
+	serverSubtitle := dimStyle.Render("(daemon orchestration logs)")
 
-	header := lipgloss.JoinVertical(
+	serverHeader := lipgloss.JoinVertical(
 		lipgloss.Left,
-		title,
-		subtitle,
+		serverTitle,
+		serverSubtitle,
 	)
 
-	content := lipgloss.JoinVertical(
+	serverContent := lipgloss.JoinVertical(
 		lipgloss.Left,
-		header,
-		m.logsViewport.View(),
+		serverHeader,
+		m.serverLogsViewport.View(),
 	)
 
-	return logsStyle.Render(content)
+	// Job Logs Section
+	jobLogsStyle := lipgloss.NewStyle().
+		Width(logsWidth).
+		Height(m.jobLogsViewport.Height + 4). // +4 for title, subtitle, and borders
+		BorderStyle(lipgloss.RoundedBorder()).
+		BorderForeground(m.getBorderColor(JobLogsPane))
+
+	jobTitle := lipgloss.NewStyle().
+		Bold(true).
+		Foreground(lipgloss.Color("213")).
+		Render("JOB LOGS")
+
+	var jobSubtitle string
+	if m.selectedJobIdx < len(m.recentJobs) {
+		selectedJob := m.recentJobs[m.selectedJobIdx]
+		jobSubtitle = dimStyle.Render(fmt.Sprintf("(showing logs for %s)", selectedJob.LinearIssueID))
+	} else if m.currentJob != nil {
+		jobSubtitle = dimStyle.Render(fmt.Sprintf("(showing logs for %s)", m.currentJob.LinearIssueID))
+	} else {
+		jobSubtitle = dimStyle.Render("(no job selected)")
+	}
+
+	jobHeader := lipgloss.JoinVertical(
+		lipgloss.Left,
+		jobTitle,
+		jobSubtitle,
+	)
+
+	jobContent := lipgloss.JoinVertical(
+		lipgloss.Left,
+		jobHeader,
+		m.jobLogsViewport.View(),
+	)
+
+	// Stack both sections vertically
+	return lipgloss.JoinVertical(
+		lipgloss.Left,
+		serverLogsStyle.Render(serverContent),
+		jobLogsStyle.Render(jobContent),
+	)
 }
 
-// renderLogsContent renders the scrollable logs content
-func (m Model) renderLogsContent() string {
+// renderServerLogsContent renders the scrollable server logs content
+func (m Model) renderServerLogsContent() string {
 	var s strings.Builder
 
-	if len(m.recentLogs) == 0 {
-		s.WriteString(dimStyle.Render("No logs available"))
+	if len(m.serverLogs) == 0 {
+		s.WriteString(dimStyle.Render("No server logs available"))
 		return s.String()
 	}
 
-	for _, log := range m.recentLogs {
+	for _, log := range m.serverLogs {
+		timestamp := dimStyle.Render(log.Timestamp.Format("15:04:05"))
+
+		var level string
+		switch strings.ToLower(log.Level) {
+		case "error":
+			level = errorStyle.Render("[ERROR]")
+		case "warn":
+			level = warningStyle.Render("[WARN] ")
+		default:
+			level = infoStyle.Render("[INFO] ")
+		}
+
+		s.WriteString(fmt.Sprintf("%s %s %s\n", timestamp, level, log.Message))
+	}
+
+	return s.String()
+}
+
+// renderJobLogsContent renders the scrollable job logs content
+func (m Model) renderJobLogsContent() string {
+	var s strings.Builder
+
+	if len(m.jobLogs) == 0 {
+		s.WriteString(dimStyle.Render("No job logs available"))
+		return s.String()
+	}
+
+	for _, log := range m.jobLogs {
 		timestamp := dimStyle.Render(log.Timestamp.Format("15:04:05"))
 
 		var level string
@@ -569,13 +680,15 @@ func (m Model) renderFooter() string {
 	switch m.focusedPane {
 	case JobsPane:
 		focusedPaneName = "Jobs"
-	case LogsPane:
-		focusedPaneName = "Logs"
+	case ServerLogsPane:
+		focusedPaneName = "Server Logs"
+	case JobLogsPane:
+		focusedPaneName = "Job Logs"
 	case IntegrationsPane:
 		focusedPaneName = "Integrations"
 	}
 
-	keybindings := fmt.Sprintf("Focus: %s │ Tab: switch pane │ ↑↓/jk: navigate │ Enter: view logs │ r: refresh │ q: quit",
+	keybindings := fmt.Sprintf("Focus: %s │ Tab: switch pane │ ↑↓/jk: navigate │ g/G: top/bottom │ r: refresh │ q: quit",
 		highlightStyle.Render(focusedPaneName))
 
 	return footerStyle.Render(keybindings)
@@ -596,32 +709,58 @@ func (m Model) refreshData() tea.Cmd {
 		recentJobs, _ := m.database.ListJobs(50)
 		blockedJobs, _ := m.database.GetBlockedJobs()
 
-		// Get logs from the global log buffer (live daemon logs)
-		// This includes HTTP access logs, job logs, etc.
-		var recentLogs []*db.JobLog
+		// Get server logs from the global log buffer (live daemon logs)
+		// This includes HTTP access logs, orchestration logs, etc.
+		var serverLogs []*db.JobLog
 		if globalLogBuffer != nil {
 			bufferLogs := globalLogBuffer.GetRecent(200)
 			for _, entry := range bufferLogs {
-				recentLogs = append(recentLogs, &db.JobLog{
+				serverLogs = append(serverLogs, &db.JobLog{
 					Timestamp: entry.Timestamp,
 					Level:     entry.Level,
 					Message:   entry.Message,
 				})
 			}
-		} else {
-			// Fallback to database logs if buffer not initialized
-			if currentJob != nil {
-				recentLogs, _ = m.database.GetLogs(currentJob.ID, 200)
-			} else if len(recentJobs) > 0 {
-				recentLogs, _ = m.database.GetLogs(recentJobs[0].ID, 200)
-			}
+		}
+
+		// Get job logs for the selected job or current job
+		var jobLogs []*db.JobLog
+		var targetJob *db.Job
+		
+		// Priority: selected job > current job
+		if len(recentJobs) > 0 && m.selectedJobIdx < len(recentJobs) {
+			targetJob = recentJobs[m.selectedJobIdx]
+		} else if currentJob != nil {
+			targetJob = currentJob
+		}
+		
+		if targetJob != nil {
+			jobLogs, _ = m.database.GetLogs(targetJob.ID, 200)
 		}
 
 		return dataRefreshMsg{
 			currentJob:  currentJob,
 			recentJobs:  recentJobs,
 			blockedJobs: blockedJobs,
-			recentLogs:  recentLogs,
+			serverLogs:  serverLogs,
+			jobLogs:     jobLogs,
+		}
+	}
+}
+
+// refreshJobLogs refreshes only the job logs when job selection changes
+func (m Model) refreshJobLogs() tea.Cmd {
+	return func() tea.Msg {
+		var jobLogs []*db.JobLog
+		
+		// Get logs for the selected job
+		if len(m.recentJobs) > 0 && m.selectedJobIdx < len(m.recentJobs) {
+			targetJob := m.recentJobs[m.selectedJobIdx]
+			jobLogs, _ = m.database.GetLogs(targetJob.ID, 200)
+		}
+		
+		return jobLogsRefreshMsg{
+			jobLogs: jobLogs,
 		}
 	}
 }
@@ -631,7 +770,13 @@ type dataRefreshMsg struct {
 	currentJob  *db.Job
 	recentJobs  []*db.Job
 	blockedJobs []*db.Job
-	recentLogs  []*db.JobLog
+	serverLogs  []*db.JobLog
+	jobLogs     []*db.JobLog
+}
+
+// jobLogsRefreshMsg carries refreshed job logs only
+type jobLogsRefreshMsg struct {
+	jobLogs []*db.JobLog
 }
 
 // tickCmd creates a tick command for auto-refresh

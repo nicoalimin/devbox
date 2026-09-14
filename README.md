@@ -90,25 +90,25 @@ When you run `devboxd --config devboxd.yaml` on a terminal, it launches an immer
 ┌─────────────────────────────────────────────────────────────────┐
 │ devboxd v0.1.0 │ BUSY │ Job: ENG-123 (coding) │ 2m15s          │ ← Status Bar
 ├──────────────────────┬──────────────────────────────────────────┤
-│ JOBS (12)            │ LIVE LOGS                                │
+│ JOBS (12)            │ LIVE SERVER LOGS                         │
 │ ┌──────────────────┐ │ ┌────────────────────────────────────┐  │
-│ │ ▸ ENG-123 coding │ │ │ [15:04:03] [INFO] Starting job     │  │
-│ │   ENG-124 done   │ │ │ [15:04:04] [INFO] Fetching Linear  │  │
-│ │   ENG-125 failed │ │ │ [15:04:05] [INFO] Creating branch  │  │ ← Main Logs
-│ │   ...            │ │ │ ...                                │  │   (scrollable)
-│ └──────────────────┘ │ │ (streaming, auto-follow)           │  │
-│                      │ └────────────────────────────────────┘  │
-│ ERRORS (2)           │                                          │
-│ ┌──────────────────┐ │                                          │
-│ │ • ENG-120        │ │                                          │
-│ │   needs input    │ │                                          │
+│ │ ▸ ENG-123 coding │ │ │ [15:04:03] [INFO] Server started   │  │
+│ │   ENG-124 done   │ │ │ [15:04:04] [INFO] Job assigned     │  │ ← Server Logs
+│ │   ENG-125 failed │ │ │ [15:04:05] [INFO] HTTP access log  │  │   (daemon logs)
+│ │   ...            │ │ └────────────────────────────────────┘  │
 │ └──────────────────┘ │                                          │
-│                      │                                          │
+│                      │ JOB LOGS                                 │
+│ ERRORS (2)           │ ┌────────────────────────────────────┐  │
+│ ┌──────────────────┐ │ │ [15:04:03] [INFO] Starting job     │  │
+│ │ • ENG-120        │ │ │ [15:04:04] [INFO] Fetching Linear  │  │ ← Job Logs
+│ │   needs input    │ │ │ [15:04:05] [INFO] Creating branch  │  │   (selected job)
+│ └──────────────────┘ │ │ ...                                │  │
+│                      │ └────────────────────────────────────┘  │
 │ INTEGRATIONS         │                                          │
 │ ✓ Linear ✓ GitHub   │                                          │
 │ ✓ OpenCode          │                                          │
 ├──────────────────────┴──────────────────────────────────────────┤
-│ Tab: switch | ↑↓/jk: nav | Enter: logs | r: refresh | q: quit  │ ← Help Bar
+│ Focus: Jobs | Tab: switch | ↑↓/jk: nav | r: refresh | q: quit  │ ← Help Bar
 └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -118,14 +118,16 @@ When you run `devboxd --config devboxd.yaml` on a terminal, it launches an immer
   - **Jobs**: Recent job list with states (done/busy/failed/blocked)
   - **Errors**: Blocked jobs requiring attention
   - **Integrations**: Health of Linear, GitHub, OpenCode, configured repos
-- **Main Pane** (right): Live streaming logs with auto-scroll
+- **Main Pane** (right): Split log view
+  - **Live Server Logs**: Daemon orchestration logs (HTTP access, job lifecycle)
+  - **Job Logs**: Logs for selected job (or current active job)
 - **Footer**: Keybindings help
 
 **TUI Keybindings:**
-- `Tab` / `Shift+Tab`: Switch focus between panes (Jobs → Logs → Integrations)
-- `↑` `↓` or `j` `k`: Navigate within focused pane
+- `Tab` / `Shift+Tab`: Switch focus between panes (Jobs → Server Logs → Job Logs → Integrations)
+- `↑` `↓` or `j` `k`: Navigate within focused pane (in Jobs pane, updates job logs for selected job)
 - `g` / `G`: Jump to top/bottom
-- `Enter`: View logs for selected job (when in Jobs pane)
+- `Enter`: Switch to Job Logs pane (when in Jobs pane)
 - `r`: Force refresh data
 - `q` or `Ctrl+C`: Quit and restore terminal
 
