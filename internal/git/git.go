@@ -179,3 +179,31 @@ func GetRepoURL(worktreePath string) (string, error) {
 	}
 	return strings.TrimSpace(string(output)), nil
 }
+
+// HasCommitsAheadOfBase checks if the branch has commits ahead of the base branch
+func (m *Manager) HasCommitsAheadOfBase(worktreePath string) (bool, error) {
+	// Get the current branch name
+	cmd := exec.Command("git", "rev-parse", "--abbrev-ref", "HEAD")
+	cmd.Dir = worktreePath
+	output, err := cmd.Output()
+	if err != nil {
+		return false, fmt.Errorf("failed to get current branch: %w", err)
+	}
+	currentBranch := strings.TrimSpace(string(output))
+	
+	// Count commits ahead of base
+	rangeSpec := fmt.Sprintf("origin/%s..%s", m.baseBranch, currentBranch)
+	cmd = exec.Command("git", "rev-list", "--count", rangeSpec)
+	cmd.Dir = worktreePath
+	output, err = cmd.Output()
+	if err != nil {
+		return false, fmt.Errorf("failed to count commits: %w", err)
+	}
+	
+	count := strings.TrimSpace(string(output))
+	if count == "" || count == "0" {
+		return false, nil
+	}
+	
+	return true, nil
+}
