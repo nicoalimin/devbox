@@ -4,6 +4,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -407,6 +408,123 @@ func TestRecreateWorktree_WithSuffix(t *testing.T) {
 
 	// Cleanup
 	mgr.RemoveWorktree(recreated.Path)
+}
+
+func TestCreateWorktree_UsesRemoteTip(t *testing.T) {
+	repoPath := setupTestRepo(t)
+	defer os.RemoveAll(repoPath)
+
+	mgr := NewManager(repoPath, "main")
+
+	// Get the current commit SHA of local main (initial state)
+	cmd := exec.Command("git", "rev-parse", "main")
+	cmd.Dir = repoPath
+	initialSHA, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("Failed to get initial main SHA: %v", err)
+	}
+	initialCommit := strings.TrimSpace(string(initialSHA))
+
+	// Simulate a remote update by:
+	// 1. Creating a new branch with an additional commit
+	// 2. Pushing that branch to update remote main
+	// 3. Not updating local main (keeping it stale)
+
+	// Create a temporary branch
+	cmd = exec.Command("git", "checkout", "-b", "temp-remote-update")
+	cmd.Dir = repoPath
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("Failed to create temp branch: %v", err)
+	}
+
+	// Create a new commit (simulating another developer's work pushed to remote)
+	updateFile := filepath.Join(repoPath, "update.txt")
+	if err := os.WriteFile(updateFile, []byte("remote update\n"), 0644); err != nil {
+		t.Fatalf("Failed to create update file: %v", err)
+	}
+
+	cmd = exec.Command("git", "add", "update.txt")
+	cmd.Dir = repoPath
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("Failed to add update file: %v", err)
+	}
+
+	cmd = exec.Command("git", "commit", "-m", "Remote update")
+	cmd.Dir = repoPath
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("Failed to commit: %v", err)
+	}
+
+	// Get the new commit SHA
+	cmd = exec.Command("git", "rev-parse", "HEAD")
+	cmd.Dir = repoPath
+	newSHA, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("Failed to get new SHA: %v", err)
+	}
+	newCommit := strings.TrimSpace(string(newSHA))
+
+	// Push this branch to remote main (updating remote without updating local main)
+	cmd = exec.Command("git", "push", "origin", "temp-remote-update:main", "--force")
+	cmd.Dir = repoPath
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("Failed to push to remote main: %v", err)
+	}
+
+	// Switch back to local main (which is still at the old commit)
+	cmd = exec.Command("git", "checkout", "main")
+	cmd.Dir = repoPath
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("Failed to checkout main: %v", err)
+	}
+
+	// Delete temp branch
+	cmd = exec.Command("git", "branch", "-D", "temp-remote-update")
+	cmd.Dir = repoPath
+	cmd.Run()
+
+	// Verify local main is still at the old commit
+	cmd = exec.Command("git", "rev-parse", "main")
+	cmd.Dir = repoPath
+	currentMainSHA, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("Failed to get current main SHA: %v", err)
+	}
+	currentMain := strings.TrimSpace(string(currentMainSHA))
+
+	if currentMain != initialCommit {
+		t.Fatal("Local main should still be at initial commit (stale)")
+	}
+
+	// Now CreateWorktree should fetch and use the up-to-date origin/main
+	worktree, err := mgr.CreateWorktree("TEST-REMOTE-TIP")
+	if err != nil {
+		t.Fatalf("CreateWorktree failed: %v", err)
+	}
+	defer mgr.RemoveWorktree(worktree.Path)
+
+	// Get the first commit of the new worktree's branch
+	// (the commit it branched from)
+	cmd = exec.Command("git", "rev-parse", worktree.BranchName+"~0")
+	cmd.Dir = repoPath
+	worktreeTipSHA, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("Failed to get worktree tip SHA: %v", err)
+	}
+	worktreeTip := strings.TrimSpace(string(worktreeTipSHA))
+
+	// The worktree should be at the new commit (remote tip), not the stale local main
+	if worktreeTip != newCommit {
+		t.Errorf("Worktree should be based on remote tip %s, but is at %s (stale local main: %s)", 
+			newCommit, worktreeTip, initialCommit)
+	}
+
+	// Additionally, verify that the update.txt file exists in the worktree
+	// (proving it was created from the remote tip, not the stale local main)
+	updateFilePath := filepath.Join(worktree.Path, "update.txt")
+	if _, err := os.Stat(updateFilePath); os.IsNotExist(err) {
+		t.Error("update.txt from remote tip not found in worktree - worktree was created from stale local main")
+	}
 }
 
 func TestHasCommitsAheadOfBase(t *testing.T) {
