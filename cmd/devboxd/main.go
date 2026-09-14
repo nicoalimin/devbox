@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"path/filepath"
 	"time"
 
 	"golang.org/x/term"
@@ -18,7 +19,7 @@ import (
 
 func main() {
 	configPath := flag.String("config", "devboxd.yaml", "path to configuration file")
-	dbPath := flag.String("db", "devboxd.db", "path to database file")
+	dbPath := flag.String("db", "", "path to database file (overrides config file)")
 	noTUI := flag.Bool("no-tui", false, "disable terminal UI (log output only)")
 	flag.Parse()
 
@@ -28,8 +29,22 @@ func main() {
 		log.Fatalf("Failed to load configuration: %v", err)
 	}
 
+	// Determine database path: CLI flag > config file > default
+	finalDBPath := *dbPath
+	if finalDBPath == "" {
+		finalDBPath = cfg.GetDBPath()
+	}
+
+	// Ensure database directory exists
+	dbDir := filepath.Dir(finalDBPath)
+	if dbDir != "." && dbDir != "" {
+		if err := os.MkdirAll(dbDir, 0755); err != nil {
+			log.Fatalf("Failed to create database directory: %v", err)
+		}
+	}
+
 	// Open database
-	database, err := db.Open(*dbPath)
+	database, err := db.Open(finalDBPath)
 	if err != nil {
 		log.Fatalf("Failed to open database: %v", err)
 	}
@@ -54,7 +69,7 @@ func main() {
 		// Log startup message to buffer
 		tui.LogInfo("devboxd version %s", api.Version)
 		tui.LogInfo("Configuration loaded from: %s", *configPath)
-		tui.LogInfo("Database: %s", *dbPath)
+		tui.LogInfo("Database: %s", finalDBPath)
 		
 		// Start server in background with custom logger
 		go func() {
@@ -80,7 +95,7 @@ func main() {
 		// Traditional headless mode - log to stdout
 		fmt.Printf("devboxd version %s\n", api.Version)
 		fmt.Printf("Configuration loaded from: %s\n", *configPath)
-		fmt.Printf("Database: %s\n", *dbPath)
+		fmt.Printf("Database: %s\n", finalDBPath)
 		fmt.Printf("Starting devboxd server on %s (headless mode)\n", cfg.Server.Listen)
 		
 		if err := server.Start(); err != nil {

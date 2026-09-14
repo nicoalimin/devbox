@@ -2,6 +2,11 @@ server:
   listen: "0.0.0.0:8080"
   # auth_token: "your-secret-token-here"  # or set DEVBOXD_AUTH_TOKEN env var
 
+database:
+  # path: ""  # Path to SQLite database file
+              # Default: ~/.local/share/devbox/jobs.db (or $XDG_DATA_HOME/devbox/jobs.db)
+              # Can also set DEVBOXD_DB_PATH env var or use --db CLI flag
+
 linear:
   # api_key: "lin_api_your_key_here"     # or set LINEAR_API_KEY env var
   assignee_id: ""                         # Optional: only process issues assigned to this user

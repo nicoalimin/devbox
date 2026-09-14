@@ -303,3 +303,211 @@ func TestJobLogs(t *testing.T) {
 		}
 	}
 }
+
+func TestRestartPersistence(t *testing.T) {
+	dbPath := "test_restart.db"
+	defer os.Remove(dbPath)
+
+	// Phase 1: Create database, write data, close
+	db1, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Failed to open database (phase 1): %v", err)
+	}
+
+	// Create jobs with various states
+	now := time.Now()
+	completedTime := now.Add(1 * time.Hour)
+	jobs := []*Job{
+		{
+			ID:              "job-restart-1",
+			LinearIssueID:   "ENG-1001",
+			LinearURL:       "https://linear.app/test/ENG-1001",
+			State:           StateDone,
+			RepoPath:        "/test/repo",
+			BranchName:      "eng-1001-test",
+			WorktreePath:    "/test/worktree/1001",
+			PRURL:           "https://github.com/test/repo/pull/1",
+			OperatorContext: "Test context 1",
+			CreatedAt:       now,
+			UpdatedAt:       now,
+			CompletedAt:     &completedTime,
+		},
+		{
+			ID:                "job-restart-2",
+			LinearIssueID:     "ENG-1002",
+			LinearURL:         "https://linear.app/test/ENG-1002",
+			State:             StateBlocked,
+			RepoPath:          "/test/repo",
+			BranchName:        "eng-1002-test",
+			WorktreePath:      "/test/worktree/1002",
+			BlockerReason:     "Needs clarification",
+			OpenCodeSessionID: "session-123",
+			OperatorContext:   "Test context 2",
+			ReviewFeedback:    "Please fix the formatting",
+			CreatedAt:         now,
+			UpdatedAt:         now,
+		},
+		{
+			ID:            "job-restart-3",
+			LinearIssueID: "ENG-1003",
+			LinearURL:     "https://linear.app/test/ENG-1003",
+			State:         StateCoding,
+			RepoPath:      "/test/repo",
+			BranchName:    "eng-1003-test",
+			WorktreePath:  "/test/worktree/1003",
+			CreatedAt:     now,
+			UpdatedAt:     now,
+		},
+	}
+
+	for _, job := range jobs {
+		if err := db1.CreateJob(job); err != nil {
+			t.Fatalf("Failed to create job %s: %v", job.ID, err)
+		}
+	}
+
+	// Add some logs for the first job
+	if err := db1.AddLog("job-restart-1", "info", "Job created"); err != nil {
+		t.Fatalf("Failed to add log: %v", err)
+	}
+	if err := db1.AddLog("job-restart-1", "info", "Job completed successfully"); err != nil {
+		t.Fatalf("Failed to add log: %v", err)
+	}
+
+	// Close the database (simulates restart)
+	if err := db1.Close(); err != nil {
+		t.Fatalf("Failed to close database: %v", err)
+	}
+
+	// Phase 2: Reopen database and verify all data persisted
+	db2, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Failed to reopen database (phase 2): %v", err)
+	}
+	defer db2.Close()
+
+	// Verify all jobs are still there
+	allJobs, err := db2.ListJobs(0)
+	if err != nil {
+		t.Fatalf("Failed to list jobs after restart: %v", err)
+	}
+
+	if len(allJobs) != 3 {
+		t.Errorf("Expected 3 jobs after restart, got %d", len(allJobs))
+	}
+
+	// Verify individual jobs with all fields
+	for _, originalJob := range jobs {
+		retrievedJob, err := db2.GetJob(originalJob.ID)
+		if err != nil {
+			t.Fatalf("Failed to get job %s after restart: %v", originalJob.ID, err)
+		}
+		if retrievedJob == nil {
+			t.Errorf("Job %s not found after restart", originalJob.ID)
+			continue
+		}
+
+		// Verify all critical fields
+		if retrievedJob.ID != originalJob.ID {
+			t.Errorf("Job ID mismatch: expected %s, got %s", originalJob.ID, retrievedJob.ID)
+		}
+		if retrievedJob.LinearIssueID != originalJob.LinearIssueID {
+			t.Errorf("Linear issue ID mismatch: expected %s, got %s", originalJob.LinearIssueID, retrievedJob.LinearIssueID)
+		}
+		if retrievedJob.LinearURL != originalJob.LinearURL {
+			t.Errorf("Linear URL mismatch: expected %s, got %s", originalJob.LinearURL, retrievedJob.LinearURL)
+		}
+		if retrievedJob.State != originalJob.State {
+			t.Errorf("State mismatch for %s: expected %s, got %s", originalJob.ID, originalJob.State, retrievedJob.State)
+		}
+		if retrievedJob.RepoPath != originalJob.RepoPath {
+			t.Errorf("Repo path mismatch: expected %s, got %s", originalJob.RepoPath, retrievedJob.RepoPath)
+		}
+		if retrievedJob.BranchName != originalJob.BranchName {
+			t.Errorf("Branch name mismatch: expected %s, got %s", originalJob.BranchName, retrievedJob.BranchName)
+		}
+		if retrievedJob.WorktreePath != originalJob.WorktreePath {
+			t.Errorf("Worktree path mismatch: expected %s, got %s", originalJob.WorktreePath, retrievedJob.WorktreePath)
+		}
+		if retrievedJob.PRURL != originalJob.PRURL {
+			t.Errorf("PR URL mismatch: expected %s, got %s", originalJob.PRURL, retrievedJob.PRURL)
+		}
+		if retrievedJob.BlockerReason != originalJob.BlockerReason {
+			t.Errorf("Blocker reason mismatch: expected %s, got %s", originalJob.BlockerReason, retrievedJob.BlockerReason)
+		}
+		if retrievedJob.OpenCodeSessionID != originalJob.OpenCodeSessionID {
+			t.Errorf("OpenCode session ID mismatch: expected %s, got %s", originalJob.OpenCodeSessionID, retrievedJob.OpenCodeSessionID)
+		}
+		if retrievedJob.OperatorContext != originalJob.OperatorContext {
+			t.Errorf("Operator context mismatch: expected %s, got %s", originalJob.OperatorContext, retrievedJob.OperatorContext)
+		}
+		if retrievedJob.ReviewFeedback != originalJob.ReviewFeedback {
+			t.Errorf("Review feedback mismatch: expected %s, got %s", originalJob.ReviewFeedback, retrievedJob.ReviewFeedback)
+		}
+
+		// Verify completed timestamp if present
+		if originalJob.CompletedAt != nil {
+			if retrievedJob.CompletedAt == nil {
+				t.Errorf("Completed timestamp missing for job %s", originalJob.ID)
+			} else if !retrievedJob.CompletedAt.Equal(*originalJob.CompletedAt) {
+				t.Errorf("Completed timestamp mismatch for job %s", originalJob.ID)
+			}
+		}
+	}
+
+	// Verify GetCurrentJob still works (should return the coding job)
+	currentJob, err := db2.GetCurrentJob()
+	if err != nil {
+		t.Fatalf("Failed to get current job after restart: %v", err)
+	}
+	if currentJob == nil || currentJob.ID != "job-restart-3" {
+		t.Errorf("Current job should be job-restart-3 after restart, got %v", currentJob)
+	}
+
+	// Verify GetBlockedJobs still works
+	blockedJobs, err := db2.GetBlockedJobs()
+	if err != nil {
+		t.Fatalf("Failed to get blocked jobs after restart: %v", err)
+	}
+	if len(blockedJobs) != 1 || blockedJobs[0].ID != "job-restart-2" {
+		t.Errorf("Expected 1 blocked job (job-restart-2) after restart, got %d", len(blockedJobs))
+	}
+
+	// Verify GetJobByLinearIssueID still works
+	jobByLinear, err := db2.GetJobByLinearIssueID("ENG-1001")
+	if err != nil {
+		t.Fatalf("Failed to get job by Linear ID after restart: %v", err)
+	}
+	if jobByLinear == nil || jobByLinear.ID != "job-restart-1" {
+		t.Errorf("Expected job-restart-1 when looking up by Linear ID, got %v", jobByLinear)
+	}
+
+	// Verify logs persisted
+	logs, err := db2.GetLogs("job-restart-1", 0)
+	if err != nil {
+		t.Fatalf("Failed to get logs after restart: %v", err)
+	}
+	if len(logs) != 2 {
+		t.Errorf("Expected 2 log entries after restart, got %d", len(logs))
+	}
+
+	// Verify we can still update jobs after restart
+	jobToUpdate, _ := db2.GetJob("job-restart-2")
+	jobToUpdate.State = StateCoding
+	jobToUpdate.BlockerReason = ""
+	if err := db2.UpdateJob(jobToUpdate); err != nil {
+		t.Fatalf("Failed to update job after restart: %v", err)
+	}
+
+	// Verify update persisted
+	updatedJob, err := db2.GetJob("job-restart-2")
+	if err != nil {
+		t.Fatalf("Failed to get updated job: %v", err)
+	}
+	if updatedJob.State != StateCoding {
+		t.Errorf("Job state update did not persist: expected %s, got %s", StateCoding, updatedJob.State)
+	}
+	if updatedJob.BlockerReason != "" {
+		t.Errorf("BlockerReason should be empty after update, got: %s", updatedJob.BlockerReason)
+	}
+}
