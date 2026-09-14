@@ -99,7 +99,53 @@ func Open(path string) (*DB, error) {
 		return nil, fmt.Errorf("failed to initialize schema: %w", err)
 	}
 
+	// Run migrations for existing databases
+	if err := runMigrations(conn); err != nil {
+		return nil, fmt.Errorf("failed to run migrations: %w", err)
+	}
+
 	return &DB{conn: conn}, nil
+}
+
+// runMigrations applies schema migrations to existing databases
+func runMigrations(conn *sql.DB) error {
+	// Check if coding_wait_started_at column exists
+	var codingColExists bool
+	err := conn.QueryRow(`
+		SELECT COUNT(*) > 0
+		FROM pragma_table_info('jobs')
+		WHERE name = 'coding_wait_started_at'
+	`).Scan(&codingColExists)
+	if err != nil {
+		return fmt.Errorf("failed to check for coding_wait_started_at column: %w", err)
+	}
+
+	// Add coding_wait_started_at if missing
+	if !codingColExists {
+		if _, err := conn.Exec(`ALTER TABLE jobs ADD COLUMN coding_wait_started_at TIMESTAMP`); err != nil {
+			return fmt.Errorf("failed to add coding_wait_started_at column: %w", err)
+		}
+	}
+
+	// Check if reviewing_wait_started_at column exists
+	var reviewingColExists bool
+	err = conn.QueryRow(`
+		SELECT COUNT(*) > 0
+		FROM pragma_table_info('jobs')
+		WHERE name = 'reviewing_wait_started_at'
+	`).Scan(&reviewingColExists)
+	if err != nil {
+		return fmt.Errorf("failed to check for reviewing_wait_started_at column: %w", err)
+	}
+
+	// Add reviewing_wait_started_at if missing
+	if !reviewingColExists {
+		if _, err := conn.Exec(`ALTER TABLE jobs ADD COLUMN reviewing_wait_started_at TIMESTAMP`); err != nil {
+			return fmt.Errorf("failed to add reviewing_wait_started_at column: %w", err)
+		}
+	}
+
+	return nil
 }
 
 // Close closes the database connection

@@ -1,9 +1,12 @@
 package db
 
 import (
+	"database/sql"
 	"os"
 	"testing"
 	"time"
+
+	_ "github.com/mattn/go-sqlite3"
 )
 
 func TestJobStateTransitions(t *testing.T) {
@@ -644,5 +647,263 @@ func TestGetCurrentJobWithMultipleStates(t *testing.T) {
 		t.Errorf("Expected job-coding, got nil")
 	} else if current.ID != "job-coding" {
 		t.Errorf("Expected job-coding, got %s", current.ID)
+	}
+}
+
+func TestMigration_OldSchemaToNew(t *testing.T) {
+	dbPath := "test_migration.db"
+	defer os.Remove(dbPath)
+
+	// Phase 1: Create database with old schema (without wait columns)
+	conn, err := sql.Open("sqlite3", dbPath)
+	if err != nil {
+		t.Fatalf("Failed to open database: %v", err)
+	}
+
+	// Create old schema without the new columns
+	oldSchema := `
+		CREATE TABLE IF NOT EXISTS jobs (
+			id TEXT PRIMARY KEY,
+			linear_issue_id TEXT NOT NULL,
+			linear_url TEXT,
+			state TEXT NOT NULL,
+			repo_path TEXT,
+			branch_name TEXT,
+			worktree_path TEXT,
+			pr_url TEXT,
+			blocker_reason TEXT,
+			opencode_session_id TEXT,
+			operator_context TEXT,
+			review_feedback TEXT,
+			created_at TIMESTAMP NOT NULL,
+			updated_at TIMESTAMP NOT NULL,
+			completed_at TIMESTAMP
+		);
+	`
+	if _, err := conn.Exec(oldSchema); err != nil {
+		t.Fatalf("Failed to create old schema: %v", err)
+	}
+
+	// Insert a job using old schema
+	now := time.Now()
+	_, err = conn.Exec(`
+		INSERT INTO jobs (
+			id, linear_issue_id, linear_url, state, repo_path, branch_name,
+			worktree_path, pr_url, blocker_reason, opencode_session_id,
+			operator_context, review_feedback,
+			created_at, updated_at, completed_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, "old-job-1", "ENG-999", "https://linear.app/test/ENG-999",
+		"coding", "/test/repo", "eng-999-test", "/test/worktree",
+		"", "", "session-old", "Old context", "", now, now, nil)
+	if err != nil {
+		t.Fatalf("Failed to insert job with old schema: %v", err)
+	}
+
+	conn.Close()
+
+	// Phase 2: Reopen with new code (should trigger migration)
+	db, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Failed to open database after migration: %v", err)
+	}
+	defer db.Close()
+
+	// Verify the old job still exists and can be queried
+	job, err := db.GetJob("old-job-1")
+	if err != nil {
+		t.Fatalf("Failed to get job after migration: %v", err)
+	}
+	if job == nil {
+		t.Fatal("Job not found after migration")
+	}
+
+	// Verify all old fields are intact
+	if job.ID != "old-job-1" {
+		t.Errorf("ID mismatch: expected old-job-1, got %s", job.ID)
+	}
+	if job.LinearIssueID != "ENG-999" {
+		t.Errorf("LinearIssueID mismatch: expected ENG-999, got %s", job.LinearIssueID)
+	}
+	if job.State != StateCoding {
+		t.Errorf("State mismatch: expected coding, got %s", job.State)
+	}
+	if job.OpenCodeSessionID != "session-old" {
+		t.Errorf("OpenCodeSessionID mismatch: expected session-old, got %s", job.OpenCodeSessionID)
+	}
+
+	// Verify new columns exist and are nullable
+	if job.CodingWaitStartedAt != nil {
+		t.Errorf("CodingWaitStartedAt should be nil for migrated job, got %v", job.CodingWaitStartedAt)
+	}
+	if job.ReviewingWaitStartedAt != nil {
+		t.Errorf("ReviewingWaitStartedAt should be nil for migrated job, got %v", job.ReviewingWaitStartedAt)
+	}
+
+	// Verify we can update the job with new columns
+	waitTime := time.Now()
+	job.CodingWaitStartedAt = &waitTime
+	if err := db.UpdateJob(job); err != nil {
+		t.Fatalf("Failed to update job with new column: %v", err)
+	}
+
+	// Verify the update persisted
+	updated, err := db.GetJob("old-job-1")
+	if err != nil {
+		t.Fatalf("Failed to get updated job: %v", err)
+	}
+	if updated.CodingWaitStartedAt == nil {
+		t.Error("CodingWaitStartedAt should not be nil after update")
+	} else if !updated.CodingWaitStartedAt.Equal(waitTime) {
+		t.Errorf("CodingWaitStartedAt mismatch: expected %v, got %v", waitTime, updated.CodingWaitStartedAt)
+	}
+
+	// Verify we can create new jobs with all columns
+	newJob := &Job{
+		ID:                     "new-job-1",
+		LinearIssueID:          "ENG-1000",
+		State:                  StateReviewing,
+		CodingWaitStartedAt:    &waitTime,
+		ReviewingWaitStartedAt: &waitTime,
+		CreatedAt:              time.Now(),
+		UpdatedAt:              time.Now(),
+	}
+	if err := db.CreateJob(newJob); err != nil {
+		t.Fatalf("Failed to create new job after migration: %v", err)
+	}
+
+	// Verify new job was created with all columns
+	retrieved, err := db.GetJob("new-job-1")
+	if err != nil {
+		t.Fatalf("Failed to get new job: %v", err)
+	}
+	if retrieved.CodingWaitStartedAt == nil {
+		t.Error("CodingWaitStartedAt should not be nil for new job")
+	}
+	if retrieved.ReviewingWaitStartedAt == nil {
+		t.Error("ReviewingWaitStartedAt should not be nil for new job")
+	}
+
+	// Verify GetCurrentJob works after migration
+	current, err := db.GetCurrentJob()
+	if err != nil {
+		t.Fatalf("Failed to get current job after migration: %v", err)
+	}
+	if current == nil {
+		t.Error("Expected to find a current job (reviewing state)")
+	} else if current.ID != "new-job-1" {
+		t.Errorf("Expected new-job-1, got %s", current.ID)
+	}
+
+	// Verify ListJobs works after migration
+	jobs, err := db.ListJobs(0)
+	if err != nil {
+		t.Fatalf("Failed to list jobs after migration: %v", err)
+	}
+	if len(jobs) != 2 {
+		t.Errorf("Expected 2 jobs after migration, got %d", len(jobs))
+	}
+}
+
+func TestMigration_Idempotent(t *testing.T) {
+	dbPath := "test_migration_idempotent.db"
+	defer os.Remove(dbPath)
+
+	// Create database with old schema
+	conn, err := sql.Open("sqlite3", dbPath)
+	if err != nil {
+		t.Fatalf("Failed to open database: %v", err)
+	}
+
+	oldSchema := `
+		CREATE TABLE IF NOT EXISTS jobs (
+			id TEXT PRIMARY KEY,
+			linear_issue_id TEXT NOT NULL,
+			state TEXT NOT NULL,
+			created_at TIMESTAMP NOT NULL,
+			updated_at TIMESTAMP NOT NULL
+		);
+	`
+	if _, err := conn.Exec(oldSchema); err != nil {
+		t.Fatalf("Failed to create old schema: %v", err)
+	}
+	conn.Close()
+
+	// Open multiple times (each should run migration safely)
+	for i := 0; i < 3; i++ {
+		db, err := Open(dbPath)
+		if err != nil {
+			t.Fatalf("Failed to open database (iteration %d): %v", i, err)
+		}
+
+		// Verify columns exist
+		var count int
+		err = db.conn.QueryRow(`
+			SELECT COUNT(*)
+			FROM pragma_table_info('jobs')
+			WHERE name IN ('coding_wait_started_at', 'reviewing_wait_started_at')
+		`).Scan(&count)
+		if err != nil {
+			t.Fatalf("Failed to query columns (iteration %d): %v", i, err)
+		}
+		if count != 2 {
+			t.Errorf("Expected 2 wait columns after migration (iteration %d), got %d", i, count)
+		}
+
+		db.Close()
+	}
+}
+
+func TestMigration_FreshDatabase(t *testing.T) {
+	dbPath := "test_migration_fresh.db"
+	defer os.Remove(dbPath)
+
+	// Open a fresh database (should create with full schema, no migration needed)
+	db, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Failed to open fresh database: %v", err)
+	}
+	defer db.Close()
+
+	// Verify all columns exist
+	var count int
+	err = db.conn.QueryRow(`
+		SELECT COUNT(*)
+		FROM pragma_table_info('jobs')
+		WHERE name IN ('coding_wait_started_at', 'reviewing_wait_started_at')
+	`).Scan(&count)
+	if err != nil {
+		t.Fatalf("Failed to query columns: %v", err)
+	}
+	if count != 2 {
+		t.Errorf("Expected 2 wait columns in fresh database, got %d", count)
+	}
+
+	// Create and retrieve a job to verify everything works
+	now := time.Now()
+	waitTime := time.Now()
+	job := &Job{
+		ID:                     "fresh-job-1",
+		LinearIssueID:          "ENG-2000",
+		State:                  StateCoding,
+		CodingWaitStartedAt:    &waitTime,
+		ReviewingWaitStartedAt: nil,
+		CreatedAt:              now,
+		UpdatedAt:              now,
+	}
+
+	if err := db.CreateJob(job); err != nil {
+		t.Fatalf("Failed to create job in fresh database: %v", err)
+	}
+
+	retrieved, err := db.GetJob("fresh-job-1")
+	if err != nil {
+		t.Fatalf("Failed to get job from fresh database: %v", err)
+	}
+	if retrieved.CodingWaitStartedAt == nil {
+		t.Error("CodingWaitStartedAt should not be nil")
+	}
+	if retrieved.ReviewingWaitStartedAt != nil {
+		t.Error("ReviewingWaitStartedAt should be nil")
 	}
 }

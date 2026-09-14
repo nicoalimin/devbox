@@ -1157,6 +1157,9 @@ func TestWaitTimeoutPersistence_ClearOnSuccess(t *testing.T) {
 	}
 
 	orch := NewOrchestrator(cfg, database)
+	if orch == nil {
+		t.Fatal("Failed to create orchestrator")
+	}
 
 	// Create a job with wait started
 	waitStartedAt := time.Now().Add(-5 * time.Minute)
