@@ -234,8 +234,19 @@ func (o *Orchestrator) executeCoding(job *db.Job) error {
 	o.log(job.ID, "info", "Sent task to OpenCode, waiting for completion")
 
 	// Wait for OpenCode to complete the coding task
-	if err := o.opencode.WaitForSessionIdle(session.ID, o.cfg.OpenCode.Timeout); err != nil {
-		return fmt.Errorf("OpenCode session timed out or failed: %w", err)
+	logFunc := func(msg string) {
+		o.log(job.ID, "info", msg)
+	}
+	
+	if err := o.opencode.WaitForSessionIdle(session.ID, o.cfg.OpenCode.Timeout, job.WorktreePath, logFunc); err != nil {
+		// Timeout or error - mark as blocked for human review
+		o.log(job.ID, "error", fmt.Sprintf("OpenCode session did not complete: %v", err))
+		job.State = db.StateBlocked
+		job.BlockerReason = fmt.Sprintf("OpenCode session timed out or failed: %v", err)
+		if updateErr := o.db.UpdateJob(job); updateErr != nil {
+			return fmt.Errorf("failed to mark job as blocked: %w (original error: %v)", updateErr, err)
+		}
+		return nil // Don't fail the job, just block it for human intervention
 	}
 
 	o.log(job.ID, "info", "OpenCode coding session completed")
@@ -268,7 +279,11 @@ If you find issues, fix them now. If everything looks good, confirm the changes 
 	o.log(job.ID, "info", "Sent review prompt, waiting for completion")
 
 	// Wait for review to complete
-	if err := o.opencode.WaitForSessionIdle(job.OpenCodeSessionID, o.cfg.OpenCode.Timeout); err != nil {
+	logFunc := func(msg string) {
+		o.log(job.ID, "info", msg)
+	}
+	
+	if err := o.opencode.WaitForSessionIdle(job.OpenCodeSessionID, o.cfg.OpenCode.Timeout, job.WorktreePath, logFunc); err != nil {
 		return fmt.Errorf("OpenCode review timed out or failed: %w", err)
 	}
 
@@ -609,7 +624,11 @@ After making changes, confirm they are ready to push.`, feedback)
 	o.log(job.ID, "info", "Review feedback sent to OpenCode, waiting for completion")
 
 	// Wait for OpenCode session to become idle
-	if err := o.opencode.WaitForSessionIdle(sessionID, o.cfg.OpenCode.Timeout); err != nil {
+	logFunc := func(msg string) {
+		o.log(job.ID, "info", msg)
+	}
+	
+	if err := o.opencode.WaitForSessionIdle(sessionID, o.cfg.OpenCode.Timeout, job.WorktreePath, logFunc); err != nil {
 		o.log(job.ID, "error", fmt.Sprintf("OpenCode session did not complete: %v", err))
 		return fmt.Errorf("OpenCode session timeout or error: %w", err)
 	}
