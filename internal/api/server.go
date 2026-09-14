@@ -260,7 +260,7 @@ func (s *Server) handleReplyToJob(w http.ResponseWriter, r *http.Request) {
 
 // handleReviewJob handles review feedback requests
 func (s *Server) handleReviewJob(w http.ResponseWriter, r *http.Request) {
-	jobID := chi.URLParam(r, "id")
+	jobIDOrLinearID := chi.URLParam(r, "id")
 
 	var req ReviewRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -273,8 +273,34 @@ func (s *Server) handleReviewJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Start review processing asynchronously (like CreateJob does)
-	go s.orchestrator.ReviewJob(jobID, req.Feedback)
+	// Validate job exists before accepting the review request
+	// Try by job ID first, then by Linear issue ID
+	job, err := s.db.GetJob(jobIDOrLinearID)
+	if err != nil {
+		s.writeError(w, http.StatusInternalServerError, fmt.Sprintf("failed to get job: %v", err))
+		return
+	}
+	if job == nil {
+		// Try finding by Linear issue ID
+		job, err = s.db.GetJobByLinearIssueID(jobIDOrLinearID)
+		if err != nil {
+			s.writeError(w, http.StatusInternalServerError, fmt.Sprintf("failed to get job by Linear ID: %v", err))
+			return
+		}
+		if job == nil {
+			s.writeError(w, http.StatusNotFound, fmt.Sprintf("job not found: %s", jobIDOrLinearID))
+			return
+		}
+	}
+
+	// Validate job has a PR (can't review without one)
+	if job.PRURL == "" {
+		s.writeError(w, http.StatusBadRequest, fmt.Sprintf("job does not have a pull request yet (state: %s)", job.State))
+		return
+	}
+
+	// Start review processing asynchronously
+	go s.orchestrator.ReviewJob(jobIDOrLinearID, req.Feedback)
 
 	// Return 202 Accepted immediately
 	s.writeJSON(w, http.StatusAccepted, map[string]interface{}{
