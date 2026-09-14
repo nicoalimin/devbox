@@ -222,3 +222,327 @@ func TestReplyToJob(t *testing.T) {
 	_ = orch.ReplyToJob(job.ID, "Use blue")
 	// We'd need to mock OpenCode to test success case
 }
+
+func TestResumeInFlightJobs_SkipsTerminalStates(t *testing.T) {
+	// Setup
+	dbPath := "test_resume_terminal.db"
+	defer os.Remove(dbPath)
+
+	database, err := db.Open(dbPath)
+	if err != nil {
+		t.Fatalf("Failed to open database: %v", err)
+	}
+	defer database.Close()
+
+	cfg := &config.Config{
+		Linear: config.LinearConfig{
+			APIKey: "test-key",
+		},
+		OpenCode: config.OpenCodeConfig{
+			BaseURL: "http://localhost:3000",
+			Timeout: 30 * time.Minute,
+		},
+		Repos: []config.RepoConfig{
+			{
+				Match: config.RepoMatch{Team: "ENG"},
+				Repo:  config.RepoInfo{Path: "/tmp/repo", BaseBranch: "main"},
+			},
+		},
+	}
+
+	orch := NewOrchestrator(cfg, database)
+
+	// Create jobs in terminal states
+	now := time.Now()
+	doneJob := &db.Job{
+		ID:            "job-done",
+		LinearIssueID: "ENG-100",
+		State:         db.StateDone,
+		CreatedAt:     time.Now(),
+		UpdatedAt:     time.Now(),
+		CompletedAt:   &now,
+	}
+	failedJob := &db.Job{
+		ID:            "job-failed",
+		LinearIssueID: "ENG-101",
+		State:         db.StateFailed,
+		CreatedAt:     time.Now(),
+		UpdatedAt:     time.Now(),
+		CompletedAt:   &now,
+	}
+	cancelledJob := &db.Job{
+		ID:            "job-cancelled",
+		LinearIssueID: "ENG-102",
+		State:         db.StateCancelled,
+		CreatedAt:     time.Now(),
+		UpdatedAt:     time.Now(),
+		CompletedAt:   &now,
+	}
+
+	if err := database.CreateJob(doneJob); err != nil {
+		t.Fatalf("Failed to create done job: %v", err)
+	}
+	if err := database.CreateJob(failedJob); err != nil {
+		t.Fatalf("Failed to create failed job: %v", err)
+	}
+	if err := database.CreateJob(cancelledJob); err != nil {
+		t.Fatalf("Failed to create cancelled job: %v", err)
+	}
+
+	// Resume in-flight jobs (should skip all terminal jobs)
+	if err := orch.ResumeInFlightJobs(); err != nil {
+		t.Fatalf("ResumeInFlightJobs failed: %v", err)
+	}
+
+	// Verify no jobs are marked as active
+	if orch.isJobActive("job-done") {
+		t.Error("Terminal job should not be marked active")
+	}
+	if orch.isJobActive("job-failed") {
+		t.Error("Terminal job should not be marked active")
+	}
+	if orch.isJobActive("job-cancelled") {
+		t.Error("Terminal job should not be marked active")
+	}
+}
+
+func TestResumeInFlightJobs_SkipsBlockedState(t *testing.T) {
+	// Setup
+	dbPath := "test_resume_blocked.db"
+	defer os.Remove(dbPath)
+
+	database, err := db.Open(dbPath)
+	if err != nil {
+		t.Fatalf("Failed to open database: %v", err)
+	}
+	defer database.Close()
+
+	cfg := &config.Config{
+		Linear: config.LinearConfig{
+			APIKey: "test-key",
+		},
+		OpenCode: config.OpenCodeConfig{
+			BaseURL: "http://localhost:3000",
+			Timeout: 30 * time.Minute,
+		},
+		Repos: []config.RepoConfig{
+			{
+				Match: config.RepoMatch{Team: "ENG"},
+				Repo:  config.RepoInfo{Path: "/tmp/repo", BaseBranch: "main"},
+			},
+		},
+	}
+
+	orch := NewOrchestrator(cfg, database)
+
+	// Create a blocked job (not IsBusy())
+	blockedJob := &db.Job{
+		ID:            "job-blocked",
+		LinearIssueID: "ENG-200",
+		State:         db.StateBlocked,
+		BlockerReason: "Needs clarification",
+		CreatedAt:     time.Now(),
+		UpdatedAt:     time.Now(),
+	}
+
+	if err := database.CreateJob(blockedJob); err != nil {
+		t.Fatalf("Failed to create blocked job: %v", err)
+	}
+
+	// Resume in-flight jobs (should skip blocked job)
+	if err := orch.ResumeInFlightJobs(); err != nil {
+		t.Fatalf("ResumeInFlightJobs failed: %v", err)
+	}
+
+	// Verify blocked job is not marked as active
+	if orch.isJobActive("job-blocked") {
+		t.Error("Blocked job should not be marked active")
+	}
+}
+
+func TestResumeInFlightJobs_HandlesInFlightJobs(t *testing.T) {
+	// Setup
+	dbPath := "test_resume_inflight.db"
+	defer os.Remove(dbPath)
+
+	database, err := db.Open(dbPath)
+	if err != nil {
+		t.Fatalf("Failed to open database: %v", err)
+	}
+	defer database.Close()
+
+	cfg := &config.Config{
+		Linear: config.LinearConfig{
+			APIKey: "test-key",
+		},
+		OpenCode: config.OpenCodeConfig{
+			BaseURL: "http://localhost:3000",
+			Timeout: 30 * time.Minute,
+		},
+		Repos: []config.RepoConfig{
+			{
+				Match: config.RepoMatch{Team: "ENG"},
+				Repo:  config.RepoInfo{Path: "/tmp/repo", BaseBranch: "main"},
+			},
+		},
+	}
+
+	orch := NewOrchestrator(cfg, database)
+
+	// Create in-flight jobs (without OpenCode session ID to force quick failure)
+	codingJob := &db.Job{
+		ID:            "job-coding",
+		LinearIssueID: "ENG-300",
+		State:         db.StateCoding,
+		CreatedAt:     time.Now(),
+		UpdatedAt:     time.Now(),
+		// Missing OpenCodeSessionID - should fail gracefully
+	}
+	reviewingJob := &db.Job{
+		ID:            "job-reviewing",
+		LinearIssueID: "ENG-301",
+		State:         db.StateReviewing,
+		CreatedAt:     time.Now(),
+		UpdatedAt:     time.Now(),
+		// Missing OpenCodeSessionID - should fail gracefully
+	}
+
+	if err := database.CreateJob(codingJob); err != nil {
+		t.Fatalf("Failed to create coding job: %v", err)
+	}
+	if err := database.CreateJob(reviewingJob); err != nil {
+		t.Fatalf("Failed to create reviewing job: %v", err)
+	}
+
+	// Resume in-flight jobs
+	if err := orch.ResumeInFlightJobs(); err != nil {
+		t.Fatalf("ResumeInFlightJobs failed: %v", err)
+	}
+
+	// Give goroutines a moment to start
+	time.Sleep(100 * time.Millisecond)
+
+	// Verify jobs were marked as active (they should be processing)
+	// Note: They will fail quickly due to missing session IDs, but should have been attempted
+	
+	// Check that jobs transitioned to failed state due to missing session ID
+	codingJobAfter, err := database.GetJob("job-coding")
+	if err != nil {
+		t.Fatalf("Failed to get coding job after resume: %v", err)
+	}
+	if codingJobAfter.State != db.StateFailed {
+		t.Errorf("Expected coding job to fail due to missing session ID, got state %s", codingJobAfter.State)
+	}
+
+	reviewingJobAfter, err := database.GetJob("job-reviewing")
+	if err != nil {
+		t.Fatalf("Failed to get reviewing job after resume: %v", err)
+	}
+	if reviewingJobAfter.State != db.StateFailed {
+		t.Errorf("Expected reviewing job to fail due to missing session ID, got state %s", reviewingJobAfter.State)
+	}
+}
+
+func TestJobActiveTracking(t *testing.T) {
+	// Setup
+	dbPath := "test_active_tracking.db"
+	defer os.Remove(dbPath)
+
+	database, err := db.Open(dbPath)
+	if err != nil {
+		t.Fatalf("Failed to open database: %v", err)
+	}
+	defer database.Close()
+
+	cfg := &config.Config{
+		Linear: config.LinearConfig{
+			APIKey: "test-key",
+		},
+		OpenCode: config.OpenCodeConfig{
+			BaseURL: "http://localhost:3000",
+			Timeout: 30 * time.Minute,
+		},
+	}
+
+	orch := NewOrchestrator(cfg, database)
+
+	// Test marking jobs as active/inactive
+	jobID := "test-job-1"
+
+	if orch.isJobActive(jobID) {
+		t.Error("Job should not be active initially")
+	}
+
+	orch.markJobActive(jobID)
+	if !orch.isJobActive(jobID) {
+		t.Error("Job should be active after marking")
+	}
+
+	orch.markJobInactive(jobID)
+	if orch.isJobActive(jobID) {
+		t.Error("Job should not be active after unmarking")
+	}
+}
+
+func TestResumeInFlightJobs_SkipsAlreadyActive(t *testing.T) {
+	// Setup
+	dbPath := "test_resume_already_active.db"
+	defer os.Remove(dbPath)
+
+	database, err := db.Open(dbPath)
+	if err != nil {
+		t.Fatalf("Failed to open database: %v", err)
+	}
+	defer database.Close()
+
+	cfg := &config.Config{
+		Linear: config.LinearConfig{
+			APIKey: "test-key",
+		},
+		OpenCode: config.OpenCodeConfig{
+			BaseURL: "http://localhost:3000",
+			Timeout: 30 * time.Minute,
+		},
+		Repos: []config.RepoConfig{
+			{
+				Match: config.RepoMatch{Team: "ENG"},
+				Repo:  config.RepoInfo{Path: "/tmp/repo", BaseBranch: "main"},
+			},
+		},
+	}
+
+	orch := NewOrchestrator(cfg, database)
+
+	// Create a job and mark it as active
+	job := &db.Job{
+		ID:            "job-active",
+		LinearIssueID: "ENG-400",
+		State:         db.StateCoding,
+		CreatedAt:     time.Now(),
+		UpdatedAt:     time.Now(),
+	}
+	if err := database.CreateJob(job); err != nil {
+		t.Fatalf("Failed to create job: %v", err)
+	}
+
+	// Mark as active (simulating already running)
+	orch.markJobActive("job-active")
+
+	// Resume in-flight jobs (should skip already active job)
+	if err := orch.ResumeInFlightJobs(); err != nil {
+		t.Fatalf("ResumeInFlightJobs failed: %v", err)
+	}
+
+	// Give a moment for any goroutines
+	time.Sleep(100 * time.Millisecond)
+
+	// Verify job is still in coding state (not failed due to missing session ID)
+	// because it was skipped
+	jobAfter, err := database.GetJob("job-active")
+	if err != nil {
+		t.Fatalf("Failed to get job after resume: %v", err)
+	}
+	if jobAfter.State != db.StateCoding {
+		t.Errorf("Expected job to remain in coding state (skipped), got state %s", jobAfter.State)
+	}
+}
