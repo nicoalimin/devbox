@@ -563,6 +563,7 @@ func (o *Orchestrator) ReviewJob(jobIDOrLinearID, feedback string) error {
 
 	// Store review feedback
 	job.ReviewFeedback = feedback
+	job.State = db.StateReviewing
 	if err := o.db.UpdateJob(job); err != nil {
 		return fmt.Errorf("failed to update job: %w", err)
 	}
@@ -605,22 +606,59 @@ After making changes, confirm they are ready to push.`, feedback)
 		return fmt.Errorf("failed to send review feedback to OpenCode: %w", err)
 	}
 
-	o.log(job.ID, "info", "Review feedback sent to OpenCode")
+	o.log(job.ID, "info", "Review feedback sent to OpenCode, waiting for completion")
 
-	// TODO: Wait for OpenCode session to be idle (WaitForSessionIdle)
-	// For now, we return and expect the operator to monitor progress
-	// In the future, we should:
-	// 1. Poll session status until idle
-	// 2. Check for new commits
-	// 3. Auto-push if there are changes
+	// Wait for OpenCode session to become idle
+	if err := o.opencode.WaitForSessionIdle(sessionID, o.cfg.OpenCode.Timeout); err != nil {
+		o.log(job.ID, "error", fmt.Sprintf("OpenCode session did not complete: %v", err))
+		return fmt.Errorf("OpenCode session timeout or error: %w", err)
+	}
 
-	o.log(job.ID, "info", "Review in progress - monitor OpenCode session for completion")
+	o.log(job.ID, "info", "OpenCode session completed, checking for new commits")
 
-	// Update state to reviewing
-	job.State = db.StateReviewing
+	// Verify that new commits exist
+	gitMgr := git.NewManager(job.RepoPath, o.cfg.GitHub.DefaultBaseBranch)
+	hasCommits, err := gitMgr.HasCommitsAheadOfBase(job.WorktreePath)
+	if err != nil {
+		o.log(job.ID, "error", fmt.Sprintf("Failed to check for commits: %v", err))
+		return fmt.Errorf("failed to check for commits: %w", err)
+	}
+
+	if !hasCommits {
+		o.log(job.ID, "warn", "No new commits found after review - OpenCode may not have made changes")
+		// Don't fail, just update state back to pr_open
+		job.State = db.StatePROpen
+		if err := o.db.UpdateJob(job); err != nil {
+			return fmt.Errorf("failed to update job state: %w", err)
+		}
+		return fmt.Errorf("no new commits found after review iteration")
+	}
+
+	o.log(job.ID, "info", "New commits detected, pushing to existing branch")
+
+	// Push to the same branch (updates the existing PR)
+	if err := gitMgr.PushBranch(job.WorktreePath, job.BranchName); err != nil {
+		o.log(job.ID, "error", fmt.Sprintf("Failed to push branch: %v", err))
+		return fmt.Errorf("failed to push branch: %w", err)
+	}
+
+	o.log(job.ID, "info", fmt.Sprintf("Successfully pushed updates to branch %s (PR: %s)", job.BranchName, job.PRURL))
+
+	// Update job state back to pr_open (still has active PR)
+	job.State = db.StatePROpen
 	if err := o.db.UpdateJob(job); err != nil {
 		return fmt.Errorf("failed to update job state: %w", err)
 	}
 
+	// Add comment to Linear about the review iteration
+	issue, err := o.linear.GetIssue(job.LinearIssueID)
+	if err == nil {
+		comment := fmt.Sprintf("✅ Review Feedback Addressed\n\nOpenCode has addressed the review feedback and pushed updates to the PR.\n\nPR: %s\n\n*Automated by devboxd*", job.PRURL)
+		if err := o.linear.AddComment(issue.ID, comment); err != nil {
+			o.log(job.ID, "warn", fmt.Sprintf("Failed to add Linear comment: %v", err))
+		}
+	}
+
+	o.log(job.ID, "info", "Review iteration completed successfully")
 	return nil
 }
