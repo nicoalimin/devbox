@@ -603,3 +603,54 @@ func TestHasCommitsAheadOfBase(t *testing.T) {
 		t.Error("Expected commits ahead of base after adding multiple commits")
 	}
 }
+
+func TestExtractPRURLFromError(t *testing.T) {
+	tests := []struct {
+		name     string
+		output   string
+		expected string
+	}{
+		{
+			name:     "standard error format with URL on same line",
+			output:   "a pull request for branch \"devbox/test-123\" into branch \"main\" already exists: https://github.com/owner/repo/pull/9",
+			expected: "https://github.com/owner/repo/pull/9",
+		},
+		{
+			name: "multiline error with URL on next line",
+			output: `Error: a pull request for branch "devbox/test-456" already exists
+https://github.com/owner/repo/pull/15`,
+			expected: "https://github.com/owner/repo/pull/15",
+		},
+		{
+			name: "exact production error format from UTA-12",
+			output: `a pull request for branch "devbox/uta-12-2" into branch "main" already exists:
+https://github.com/nicoalimin/tokoboss/pull/9`,
+			expected: "https://github.com/nicoalimin/tokoboss/pull/9",
+		},
+		{
+			name:     "error with extra whitespace",
+			output:   "a pull request for branch ... already exists:    https://github.com/owner/repo/pull/42   ",
+			expected: "https://github.com/owner/repo/pull/42",
+		},
+		{
+			name:     "no URL in error",
+			output:   "some other error message",
+			expected: "",
+		},
+		{
+			name:     "already exists but no URL",
+			output:   "a pull request for branch ... already exists but no URL provided",
+			expected: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := extractPRURLFromError(tt.output)
+			if result != tt.expected {
+				t.Errorf("expected '%s', got '%s'", tt.expected, result)
+			}
+		})
+	}
+}
+

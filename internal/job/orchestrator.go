@@ -365,7 +365,7 @@ func (o *Orchestrator) createPullRequest(job *db.Job) error {
 		return err
 	}
 
-	o.log(job.ID, "info", fmt.Sprintf("Pull request created: %s", prURL))
+	o.log(job.ID, "info", fmt.Sprintf("Pull request ready: %s", prURL))
 
 	// Add comment to Linear
 	comment := fmt.Sprintf("🚀 Pull Request Ready\n\nPR: %s\n\n*Automated by devboxd*", prURL)
