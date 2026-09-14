@@ -27,7 +27,7 @@ func TestSingleFlightEnforcement(t *testing.T) {
 			APIKey: "test-key",
 		},
 		OpenCode: config.OpenCodeConfig{
-			BaseURL: "http://localhost:3000",
+			BaseURL: "http://127.0.0.1:3000",
 			Timeout: 30 * time.Minute,
 		},
 		Repos: []config.RepoConfig{
@@ -106,7 +106,7 @@ func TestCancelJob(t *testing.T) {
 			APIKey: "test-key",
 		},
 		OpenCode: config.OpenCodeConfig{
-			BaseURL: "http://localhost:3000",
+			BaseURL: "http://127.0.0.1:3000",
 		},
 		Repos: []config.RepoConfig{
 			{
@@ -172,7 +172,7 @@ func TestReplyToJob(t *testing.T) {
 			APIKey: "test-key",
 		},
 		OpenCode: config.OpenCodeConfig{
-			BaseURL: "http://localhost:3000",
+			BaseURL: "http://127.0.0.1:3000",
 		},
 		Repos: []config.RepoConfig{
 			{
@@ -240,7 +240,7 @@ func TestResumeInFlightJobs_SkipsTerminalStates(t *testing.T) {
 			APIKey: "test-key",
 		},
 		OpenCode: config.OpenCodeConfig{
-			BaseURL: "http://localhost:3000",
+			BaseURL: "http://127.0.0.1:3000",
 			Timeout: 30 * time.Minute,
 		},
 		Repos: []config.RepoConfig{
@@ -323,7 +323,7 @@ func TestResumeInFlightJobs_SkipsBlockedState(t *testing.T) {
 			APIKey: "test-key",
 		},
 		OpenCode: config.OpenCodeConfig{
-			BaseURL: "http://localhost:3000",
+			BaseURL: "http://127.0.0.1:3000",
 			Timeout: 30 * time.Minute,
 		},
 		Repos: []config.RepoConfig{
@@ -377,7 +377,7 @@ func TestResumeInFlightJobs_HandlesInFlightJobs(t *testing.T) {
 			APIKey: "test-key",
 		},
 		OpenCode: config.OpenCodeConfig{
-			BaseURL: "http://localhost:3000",
+			BaseURL: "http://127.0.0.1:3000",
 			Timeout: 30 * time.Minute,
 		},
 		Repos: []config.RepoConfig{
@@ -460,7 +460,7 @@ func TestJobActiveTracking(t *testing.T) {
 			APIKey: "test-key",
 		},
 		OpenCode: config.OpenCodeConfig{
-			BaseURL: "http://localhost:3000",
+			BaseURL: "http://127.0.0.1:3000",
 			Timeout: 30 * time.Minute,
 		},
 	}
@@ -501,7 +501,7 @@ func TestHealSession_CodingPhase(t *testing.T) {
 			APIKey: "test-key",
 		},
 		OpenCode: config.OpenCodeConfig{
-			BaseURL:  "http://localhost:3000",
+			BaseURL:  "http://127.0.0.1:3000",
 			Timeout:  30 * time.Minute,
 			Username: "test",
 			Password: "test",
@@ -561,7 +561,7 @@ func TestHealSession_ReviewingPhase(t *testing.T) {
 			APIKey: "test-key",
 		},
 		OpenCode: config.OpenCodeConfig{
-			BaseURL:  "http://localhost:3000",
+			BaseURL:  "http://127.0.0.1:3000",
 			Timeout:  30 * time.Minute,
 			Username: "test",
 			Password: "test",
@@ -614,7 +614,7 @@ func TestHealingAttemptLimit(t *testing.T) {
 			APIKey: "test-key",
 		},
 		OpenCode: config.OpenCodeConfig{
-			BaseURL:  "http://localhost:3000",
+			BaseURL:  "http://127.0.0.1:3000",
 			Timeout:  30 * time.Minute,
 			Username: "test",
 			Password: "test",
@@ -676,7 +676,7 @@ func TestHealSession_InvalidPhase(t *testing.T) {
 			APIKey: "test-key",
 		},
 		OpenCode: config.OpenCodeConfig{
-			BaseURL:  "http://localhost:3000",
+			BaseURL:  "http://127.0.0.1:3000",
 			Timeout:  30 * time.Minute,
 			Username: "test",
 			Password: "test",
@@ -724,7 +724,7 @@ func TestResumeInFlightJobs_SkipsAlreadyActive(t *testing.T) {
 			APIKey: "test-key",
 		},
 		OpenCode: config.OpenCodeConfig{
-			BaseURL: "http://localhost:3000",
+			BaseURL: "http://127.0.0.1:3000",
 			Timeout: 30 * time.Minute,
 		},
 		Repos: []config.RepoConfig{
@@ -791,7 +791,7 @@ func TestCodingTimeoutFailsJob(t *testing.T) {
 			APIKey: "test-key",
 		},
 		OpenCode: config.OpenCodeConfig{
-			BaseURL:  "http://localhost:3000",
+			BaseURL:  "http://127.0.0.1:3000",
 			Timeout:  1 * time.Second, // Very short timeout to trigger failure quickly
 			Username: "test",
 			Password: "test",
@@ -894,7 +894,7 @@ func TestWaitTimeoutPersistence_BrandNewJob(t *testing.T) {
 
 	cfg := &config.Config{
 		OpenCode: config.OpenCodeConfig{
-			BaseURL: "http://localhost:3000",
+			BaseURL: "http://127.0.0.1:3000",
 			Timeout: 30 * time.Minute,
 			Version: "v2",
 		},
@@ -973,7 +973,7 @@ func TestWaitTimeoutPersistence_ResumeFromPriorElapsed(t *testing.T) {
 
 	cfg := &config.Config{
 		OpenCode: config.OpenCodeConfig{
-			BaseURL: "http://localhost:3000",
+			BaseURL: "http://127.0.0.1:3000",
 			Timeout: 10 * time.Second, // Short timeout for testing
 			Version: "v2",
 		},
@@ -1031,7 +1031,7 @@ func TestWaitTimeoutPersistence_AlreadyExhausted(t *testing.T) {
 
 	cfg := &config.Config{
 		OpenCode: config.OpenCodeConfig{
-			BaseURL: "http://localhost:3000",
+			BaseURL: "http://127.0.0.1:3000",
 			Timeout: 10 * time.Second,
 			Version: "v2",
 		},
@@ -1091,7 +1091,7 @@ func TestWaitTimeoutPersistence_ReviewingPhase(t *testing.T) {
 
 	cfg := &config.Config{
 		OpenCode: config.OpenCodeConfig{
-			BaseURL: "http://localhost:3000",
+			BaseURL: "http://127.0.0.1:3000",
 			Timeout: 10 * time.Second,
 			Version: "v2",
 		},
@@ -1150,7 +1150,7 @@ func TestWaitTimeoutPersistence_ClearOnSuccess(t *testing.T) {
 
 	cfg := &config.Config{
 		OpenCode: config.OpenCodeConfig{
-			BaseURL: "http://localhost:3000",
+			BaseURL: "http://127.0.0.1:3000",
 			Timeout: 30 * time.Minute,
 			Version: "v2",
 		},
