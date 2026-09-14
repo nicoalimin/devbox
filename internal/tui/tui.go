@@ -164,29 +164,35 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width = msg.Width
 		m.height = msg.Height
 
+		// Calculate actual header and footer heights accounting for text wrapping.
+		// This is critical: on narrow terminals (e.g. 80 cols), the footer can wrap
+		// to 2+ lines, and the header may also wrap if showing a long job name.
+		headerHeight := m.getHeaderHeight()
+		footerHeight := m.getFooterHeight()
+		
 		// Calculate viewport heights to fit layout exactly:
-		// Layout: Header (1) + newline (1) + Main Content + newline (1) + Footer (1) = height
-		// So: Main Content must be exactly (height - 4)
-		//
+		// Layout: Header (headerHeight) + newline (1) + Main Content + newline (1) + Footer (footerHeight) = height
+		// So: Main Content must be exactly (height - headerHeight - footerHeight - 2)
+		availableContentHeight := msg.Height - headerHeight - footerHeight - 2
+		
 		// Sidebar (stacked vertically):
 		//   - Jobs section: title (1) + viewport content + borders (2) = viewport + 3
 		//   - Errors section: title (1) + viewport content + borders (2) = viewport + 3
 		//   - Integrations bar: 5 lines (3 content + 2 borders)
 		//   Total sidebar = (jobsViewport + 3) + (errorsViewport + 3) + 5 = jobsViewport + errorsViewport + 11
 		//
-		// For sidebar to equal (height - 4):
-		//   jobsViewport + errorsViewport + 11 = height - 4
-		//   jobsViewport + errorsViewport = height - 15
-		//   Split equally: each = (height - 15) / 2
+		// For sidebar to equal availableContentHeight:
+		//   jobsViewport + errorsViewport + 11 = availableContentHeight
+		//   jobsViewport + errorsViewport = availableContentHeight - 11
+		//   Split equally: each = (availableContentHeight - 11) / 2
 		//
 		// Logs pane (split into server logs + job logs, stacked vertically):
 		//   Each log section: title (1) + subtitle (1) + viewport + borders (2) = viewport + 4
-		//   Total = (serverLogsViewport + 4) + (jobLogsViewport + 4) = height - 4
-		//   serverLogsViewport + jobLogsViewport = height - 12
-		//   Split equally: each = (height - 12) / 2
+		//   Total = (serverLogsViewport + 4) + (jobLogsViewport + 4) = availableContentHeight
+		//   serverLogsViewport + jobLogsViewport = availableContentHeight - 8
+		//   Split equally: each = (availableContentHeight - 8) / 2
 
 		sidebarWidth := 30
-		availableContentHeight := msg.Height - 4 // For the entire main content area
 		
 		// Jobs and errors split the available height, accounting for integrations bar (~5 lines)
 		// Each section needs: title (1) + viewport + borders (2) = viewport + 3
@@ -690,7 +696,8 @@ func (m Model) renderFooter() string {
 		focusedPaneName = "Integrations"
 	}
 
-	keybindings := fmt.Sprintf("Focus: %s │ Tab: switch pane │ ↑↓/jk: navigate │ g/G: top/bottom │ r: refresh │ q: quit",
+	// Shortened keybindings to reduce wrapping on narrow terminals
+	keybindings := fmt.Sprintf("Focus: %s │ Tab: switch │ ↑↓/jk: nav │ g/G: jump │ r: refresh │ q: quit",
 		highlightStyle.Render(focusedPaneName))
 
 	return footerStyle.Render(keybindings)
@@ -797,6 +804,66 @@ func formatDuration(d time.Duration) string {
 		return fmt.Sprintf("%dm%ds", int(d.Minutes()), int(d.Seconds())%60)
 	}
 	return fmt.Sprintf("%dh%dm", int(d.Hours()), int(d.Minutes())%60)
+}
+
+// calculateRenderedHeight calculates how many lines a text string will occupy
+// when rendered with lipgloss at a given width, accounting for padding.
+// This is critical for proper TUI height calculations when text wraps.
+func calculateRenderedHeight(text string, width int, horizontalPadding int) int {
+	if width <= 0 {
+		return 1
+	}
+	
+	// Account for padding on both sides
+	effectiveWidth := width - (2 * horizontalPadding)
+	if effectiveWidth <= 0 {
+		effectiveWidth = 1
+	}
+	
+	// Calculate how many lines the text will occupy
+	textLen := len(text)
+	if textLen == 0 {
+		return 1
+	}
+	
+	lines := (textLen + effectiveWidth - 1) / effectiveWidth // Ceiling division
+	if lines < 1 {
+		lines = 1
+	}
+	
+	return lines
+}
+
+// getHeaderHeight estimates the height of the header including wrapping.
+// Uses worst-case text length to ensure we never under-allocate.
+func (m Model) getHeaderHeight() int {
+	if m.width <= 0 {
+		return 1
+	}
+	
+	// Worst-case header text (with a running job):
+	// "devboxd v1.0.0 │ BUSY │ Job: LINEAR-123456789012 (running) │ 999h99m"
+	// This is approximately 75 characters in the worst case
+	worstCaseHeaderLen := 75
+	
+	// Header has padding of 1 on each side
+	return calculateRenderedHeight(strings.Repeat("X", worstCaseHeaderLen), m.width, 1)
+}
+
+// getFooterHeight estimates the height of the footer including wrapping.
+// Uses worst-case text length (longest pane name) to ensure we never under-allocate.
+func (m Model) getFooterHeight() int {
+	if m.width <= 0 {
+		return 1
+	}
+	
+	// Worst-case footer text (with "Integrations" as the focused pane):
+	// "Focus: Integrations │ Tab: switch │ ↑↓/jk: nav │ g/G: jump │ r: refresh │ q: quit"
+	// This is approximately 85 characters
+	worstCaseFooterLen := 85
+	
+	// Footer has padding of 1 on each side
+	return calculateRenderedHeight(strings.Repeat("X", worstCaseFooterLen), m.width, 1)
 }
 
 // Styles
