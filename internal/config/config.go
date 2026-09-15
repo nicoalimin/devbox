@@ -11,13 +11,14 @@ import (
 
 // Config represents the server configuration
 type Config struct {
-	Server   ServerConfig   `yaml:"server"`
-	Database DatabaseConfig `yaml:"database"`
-	Linear   LinearConfig   `yaml:"linear"`
-	OpenCode OpenCodeConfig `yaml:"opencode"`
-	GitHub   GitHubConfig   `yaml:"github"`
-	Repos    []RepoConfig   `yaml:"repos"`
-	Queue    QueueConfig    `yaml:"queue"`
+	Server     ServerConfig     `yaml:"server"`
+	Database   DatabaseConfig   `yaml:"database"`
+	Linear     LinearConfig     `yaml:"linear"`
+	OpenCode   OpenCodeConfig   `yaml:"opencode"`
+	GitHub     GitHubConfig     `yaml:"github"`
+	Repos      []RepoConfig     `yaml:"repos"`
+	Queue      QueueConfig      `yaml:"queue"`
+	Reconciler ReconcilerConfig `yaml:"reconciler"`
 }
 
 // ServerConfig defines HTTP server settings
@@ -77,6 +78,46 @@ type QueueConfig struct {
 	MaxDepth int  `yaml:"max_depth"` // Max queued jobs
 }
 
+// ReconcilerConfig defines the periodic GitHub PR reconciler settings.
+//
+// The reconciler polls GitHub for jobs stuck in pr_open and advances them
+// to a terminal state when the PR is merged or closed.
+// PR-not-found is treated as CLOSED/cancelled (see orchestrator.reconcileJobs).
+type ReconcilerConfig struct {
+	Enabled  bool          `yaml:"enabled"`
+	Interval time.Duration `yaml:"interval"`
+}
+
+// UnmarshalYAML applies defaults (enabled=true, interval=2m) while still
+// allowing explicit `enabled: false` or a custom interval.
+func (r *ReconcilerConfig) UnmarshalYAML(value *yaml.Node) error {
+	// Defaults.
+	r.Enabled = true
+	r.Interval = 2 * time.Minute
+
+	// Alias to avoid recursion.
+	type plain ReconcilerConfig
+	var p plain
+	if err := value.Decode(&p); err != nil {
+		return err
+	}
+	// value.Decode into plain loses the "was field present?" signal for
+	// Enabled (false could mean unset or explicit false). Decode into a map
+	// first to detect explicit presence.
+	var raw map[string]any
+	if err := value.Decode(&raw); err == nil && raw != nil {
+		if _, ok := raw["enabled"]; ok {
+			r.Enabled = p.Enabled
+		} // else keep default true
+	} else {
+		r.Enabled = p.Enabled
+	}
+	if p.Interval != 0 {
+		r.Interval = p.Interval
+	}
+	return nil
+}
+
 // LoadConfig loads configuration from a YAML file, with env var overrides
 func LoadConfig(path string) (*Config, error) {
 	data, err := os.ReadFile(path)
@@ -132,6 +173,49 @@ func LoadConfig(path string) (*Config, error) {
 	}
 	if cfg.GitHub.DefaultBaseBranch == "" {
 		cfg.GitHub.DefaultBaseBranch = "main"
+	}
+	// Reconciler defaults: enabled=true, interval=2m.
+	// UnmarshalYAML already applies these when the `reconciler:` section is
+	// present. When the section is absent entirely, the zero value remains
+	// (Enabled=false, Interval=0) — detect via Interval==0 and apply defaults.
+	if cfg.Reconciler.Interval == 0 {
+		// Distinguish "section missing" (Interval==0) from explicit config.
+		// Explicit `enabled: false` without interval still gets Interval=2m
+		// from UnmarshalYAML, so Interval==0 reliably means missing section.
+		cfg.Reconciler.Interval = 2 * time.Minute
+		// Only default Enabled=true when the section was missing. If the user
+		// explicitly set enabled:false with interval:0s (nonsensical), we still
+		// enable with 2m — interval 0 would spin the loop.
+		// To preserve an explicit enabled:false with no interval, users should
+		// set an interval; but missing section is the common case.
+		// Check raw file for a reconciler key to be precise.
+		hasReconcilerKey := false
+		// Best-effort: re-parse as generic map (ignore errors, defaults already set).
+		var generic map[string]any
+		if err := yaml.Unmarshal(data, &generic); err == nil {
+			_, hasReconcilerKey = generic["reconciler"]
+		}
+		if !hasReconcilerKey {
+			cfg.Reconciler.Enabled = true
+		}
+	}
+
+	// Environment variable overrides for reconciler
+	if v := os.Getenv("DEVBOXD_RECONCILER_ENABLED"); v != "" {
+		switch v {
+		case "1", "true", "TRUE", "True", "yes", "YES":
+			cfg.Reconciler.Enabled = true
+		case "0", "false", "FALSE", "False", "no", "NO":
+			cfg.Reconciler.Enabled = false
+		}
+	}
+	if v := os.Getenv("DEVBOXD_RECONCILER_INTERVAL"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d > 0 {
+			cfg.Reconciler.Interval = d
+		}
+	}
+	if cfg.Reconciler.Interval <= 0 {
+		cfg.Reconciler.Interval = 2 * time.Minute
 	}
 
 	// Validation

@@ -26,6 +26,7 @@ type Orchestrator struct {
 	healingAttempts map[string]int               // Track session healing attempts per job (jobID -> count)
 	streamStopFuncs map[string]func()            // Stop functions for active event streams (jobID -> stopFunc)
 	streamMu        sync.Mutex                   // Mutex to protect streamStopFuncs map
+	prStatusFunc    func(prURL string) (PRStatus, int, error) // Injectable for tests; nil = use gh CLI
 }
 
 const (
