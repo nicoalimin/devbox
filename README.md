@@ -429,6 +429,68 @@ Devboxd integrates with [OpenCode](https://github.com/nicoalimin/opencode) via i
 2. **Task Prompt**: `POST /api/session/:id/prompt` with issue details
 3. **Review Prompt**: Another message for code review
 
+### OpenCode Telemetry
+
+Devboxd automatically logs detailed telemetry for OpenCode operations to help diagnose issues:
+
+**Session Events:**
+- Session create (ID, status, response code)
+- Prompt send (phase coding/review, message size, hash, response code)
+- Event stream lifecycle (connect, disconnect, heartbeat every 30s when quiet)
+- Mapped OpenCode events (session status changes, tool calls, text generation, errors)
+- Stale-active warnings (when `/api/session/active` shows active but no progress for 60s)
+
+All telemetry is automatically logged to:
+- **Server logs** (OpenCode HTTP operations, event stream status)
+- **Job logs** (OpenCode session activity, progress updates)
+
+View these logs in the TUI or via `devbox logs <job-id>`.
+
+### Enabling OpenCode Debug Logs
+
+For deeper debugging of OpenCode itself (not just devboxd's integration), enable OpenCode's debug logging:
+
+**Method 1: Environment Variable (recommended for `opencode serve`)**
+```bash
+export OPENCODE_LOG_LEVEL=DEBUG
+opencode serve
+```
+
+**Method 2: CLI Flag**
+```bash
+opencode serve --log-level DEBUG --print-logs
+```
+
+**Method 3: Config File (`~/.config/opencode/opencode.json`)**
+```json
+{
+  "logLevel": "DEBUG"
+}
+```
+
+**OpenCode Log Files:**
+- **macOS/Linux**: `~/.local/share/opencode/log/`
+- **Windows**: `%USERPROFILE%\.local\share\opencode\log`
+
+Logs are timestamped (e.g., `2026-01-15T123456.log`) and the most recent 10 are kept.
+
+**Advanced: Streaming OpenCode Logs to Devbox**
+
+If you want OpenCode's debug logs to appear in devbox job logs:
+
+1. Start OpenCode with `--print-logs` to mirror logs to stderr:
+   ```bash
+   OPENCODE_LOG_LEVEL=DEBUG opencode serve --print-logs 2>&1 | tee opencode.log
+   ```
+
+2. Tail the log file from within devbox workflows (future enhancement)
+
+For session-specific history (prompts, responses, token usage):
+```bash
+opencode export <session-id>  # Export full session data
+opencode stats                 # View token usage and costs
+```
+
 ### OpenCode 2.0.3+ Authentication
 
 OpenCode 2.0.3 and later require **HTTP Basic Authentication** when `OPENCODE_SERVER_PASSWORD` is set on the OpenCode server. Devboxd automatically sends credentials with every request.

@@ -34,11 +34,19 @@ const (
 
 // NewOrchestrator creates a new job orchestrator
 func NewOrchestrator(cfg *config.Config, database *db.DB) *Orchestrator {
+	oc := opencode.NewClient(cfg.OpenCode.BaseURL, cfg.OpenCode.Username, cfg.OpenCode.Password, cfg.OpenCode.Version)
+	
+	// Set up OpenCode telemetry logging (logs to server logs, not job logs)
+	oc.SetLogFunc(func(level, message string) {
+		// Log to standard logger for server logs
+		log.Printf("[OpenCode:%s] %s", level, message)
+	})
+	
 	return &Orchestrator{
 		cfg:             cfg,
 		db:              database,
 		linear:          linear.NewClient(cfg.Linear.APIKey),
-		opencode:        opencode.NewClient(cfg.OpenCode.BaseURL, cfg.OpenCode.Username, cfg.OpenCode.Password, cfg.OpenCode.Version),
+		opencode:        oc,
 		activeJobs:      make(map[string]bool),
 		healingAttempts: make(map[string]int),
 		streamStopFuncs: make(map[string]func()),
