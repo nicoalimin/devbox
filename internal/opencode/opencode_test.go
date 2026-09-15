@@ -492,7 +492,7 @@ func TestIsSessionBusyV2(t *testing.T) {
 				if r.URL.Path != "/api/session/active" {
 					t.Errorf("Expected path /api/session/active, got %s", r.URL.Path)
 				}
-				
+
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(http.StatusOK)
 				json.NewEncoder(w).Encode(V2ActiveSessionsResponse{
@@ -588,10 +588,14 @@ func TestWaitForSessionIdleV2RaceCondition(t *testing.T) {
 	// should NOT immediately return success - must wait for session to become active first
 	callCount := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
 		callCount++
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		
+
 		// Simulate race condition:
 		// Call 1-2: session not yet active (OpenCode hasn't started processing)
 		// Call 3-4: session becomes active
@@ -611,28 +615,28 @@ func TestWaitForSessionIdleV2RaceCondition(t *testing.T) {
 			// Completed (not in active map)
 			response = V2ActiveSessionsResponse{Data: map[string]SessionActive{}}
 		}
-		
+
 		json.NewEncoder(w).Encode(response)
 	}))
 	defer server.Close()
 
 	client := NewClient(server.URL, "", "", "v2")
-	
+
 	var logMessages []string
 	logFunc := func(msg string) {
 		logMessages = append(logMessages, msg)
 	}
-	
+
 	err := client.WaitForSessionIdle("ses_test", 30*time.Second, "", logFunc)
 	if err != nil {
 		t.Fatalf("Expected success, got error: %v", err)
 	}
-	
+
 	// Should have made at least 5 calls (waiting for active, then idle)
 	if callCount < 5 {
 		t.Errorf("Expected at least 5 API calls to handle race condition, got %d", callCount)
 	}
-	
+
 	// Should have logged the transition
 	if len(logMessages) < 2 {
 		t.Errorf("Expected at least 2 log messages, got %d: %v", len(logMessages), logMessages)
@@ -643,10 +647,14 @@ func TestWaitForSessionIdleV2ImmediatelyActive(t *testing.T) {
 	// Test that if session is immediately active, we wait for it to complete
 	callCount := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
 		callCount++
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		
+
 		// Session is active on first check, then completes
 		var response V2ActiveSessionsResponse
 		if callCount <= 2 {
@@ -658,20 +666,168 @@ func TestWaitForSessionIdleV2ImmediatelyActive(t *testing.T) {
 		} else {
 			response = V2ActiveSessionsResponse{Data: map[string]SessionActive{}}
 		}
-		
+
 		json.NewEncoder(w).Encode(response)
 	}))
 	defer server.Close()
 
 	client := NewClient(server.URL, "", "", "v2")
-	
+
 	err := client.WaitForSessionIdle("ses_test", 30*time.Second, "", nil)
 	if err != nil {
 		t.Fatalf("Expected success, got error: %v", err)
 	}
-	
+
 	if callCount < 3 {
 		t.Errorf("Expected at least 3 API calls, got %d", callCount)
+	}
+}
+
+func TestWaitForSessionIdleV2UsesWaitEndpoint(t *testing.T) {
+	var activePolls int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			activePolls++
+			t.Errorf("expected POST, got %s", r.Method)
+		}
+		if r.URL.Path != "/api/session/ses_test/wait" {
+			t.Errorf("expected v2 wait path, got %s", r.URL.Path)
+		}
+		username, password, ok := r.BasicAuth()
+		if !ok || username != "opencode" || password != "secret" {
+			t.Errorf("expected OpenCode basic auth credentials")
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL, "opencode", "secret", "v2")
+	var logs []string
+	err := client.WaitForSessionIdle("ses_test", time.Second, "", func(message string) {
+		logs = append(logs, message)
+	})
+	if err != nil {
+		t.Fatalf("expected success, got %v", err)
+	}
+	if activePolls != 0 {
+		t.Fatalf("expected no active-session polling, got %d polls", activePolls)
+	}
+	if len(logs) != 2 || !contains(logs[0], "v2 wait endpoint") || !contains(logs[1], "completed") {
+		t.Fatalf("unexpected wait logs: %v", logs)
+	}
+}
+
+func TestWaitForSessionIdleV2WaitEndpointTimeout(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-r.Context().Done()
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL, "", "", "v2")
+	client.httpClient.Timeout = 10 * time.Millisecond
+
+	start := time.Now()
+	err := client.WaitForSessionIdle("ses_test", 100*time.Millisecond, "", nil)
+	if err == nil || !contains(err.Error(), "timeout waiting for session") {
+		t.Fatalf("expected session timeout, got %v", err)
+	}
+	if elapsed := time.Since(start); elapsed < 75*time.Millisecond {
+		t.Fatalf("ordinary HTTP timeout was incorrectly used for wait request: %v", elapsed)
+	}
+}
+
+func TestWaitForSessionIdleV2WaitEndpointError(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, `{"error":"session missing"}`, http.StatusNotFound)
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL, "", "", "v2")
+	err := client.WaitForSessionIdle("ses_missing", time.Second, "", nil)
+	if err == nil || !contains(err.Error(), "404") || !contains(err.Error(), "session missing") {
+		t.Fatalf("expected detailed HTTP error, got %v", err)
+	}
+}
+
+func TestWaitForSessionIdleV2RetriesTransientGatewayErrors(t *testing.T) {
+	for _, statusCode := range []int{
+		http.StatusBadGateway,
+		http.StatusServiceUnavailable,
+		http.StatusGatewayTimeout,
+	} {
+		t.Run(http.StatusText(statusCode), func(t *testing.T) {
+			requestCount := 0
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				requestCount++
+				if requestCount == 1 {
+					http.Error(w, `{"message":"temporary gateway failure","service":"proxy"}`, statusCode)
+					return
+				}
+				w.WriteHeader(http.StatusNoContent)
+			}))
+			defer server.Close()
+
+			client := NewClient(server.URL, "", "", "v2")
+			if err := client.WaitForSessionIdle("ses_test", time.Second, "", nil); err != nil {
+				t.Fatalf("expected transient %d retry to succeed, got %v", statusCode, err)
+			}
+			if requestCount != 2 {
+				t.Fatalf("expected 2 wait requests, got %d", requestCount)
+			}
+		})
+	}
+}
+
+func TestWaitForSessionIdleV2RetriesTransportFailure(t *testing.T) {
+	requestCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestCount++
+		if requestCount == 1 {
+			hijacker, ok := w.(http.Hijacker)
+			if !ok {
+				t.Fatal("test server does not support hijacking")
+			}
+			conn, _, err := hijacker.Hijack()
+			if err != nil {
+				t.Fatalf("failed to hijack connection: %v", err)
+			}
+			conn.Close()
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL, "", "", "v2")
+	if err := client.WaitForSessionIdle("ses_test", time.Second, "", nil); err != nil {
+		t.Fatalf("expected transport retry to succeed, got %v", err)
+	}
+	if requestCount != 2 {
+		t.Fatalf("expected 2 wait requests, got %d", requestCount)
+	}
+}
+
+func TestWaitForSessionIdleV2FallbackPreservesTimeoutBudget(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			time.Sleep(80 * time.Millisecond)
+			http.Error(w, `{"name":"OperationUnavailableError","message":"operation unavailable"}`, http.StatusServiceUnavailable)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(V2ActiveSessionsResponse{Data: map[string]SessionActive{}})
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL, "", "", "v2")
+	start := time.Now()
+	err := client.WaitForSessionIdle("ses_test", 150*time.Millisecond, "", nil)
+	elapsed := time.Since(start)
+	if err == nil || !contains(err.Error(), "timeout") {
+		t.Fatalf("expected timeout, got %v", err)
+	}
+	if elapsed > 350*time.Millisecond {
+		t.Fatalf("fallback reset the timeout budget: elapsed %v", elapsed)
 	}
 }
 
@@ -682,7 +838,7 @@ func TestWaitForSessionIdleClassic(t *testing.T) {
 		callCount++
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		
+
 		// First 2 calls: busy, then idle
 		var status SessionStatus
 		if callCount <= 2 {
@@ -694,18 +850,18 @@ func TestWaitForSessionIdleClassic(t *testing.T) {
 				"session-123": SessionInfo{Status: "idle", Busy: false},
 			}
 		}
-		
+
 		json.NewEncoder(w).Encode(status)
 	}))
 	defer server.Close()
 
 	client := NewClient(server.URL, "", "", "classic")
-	
+
 	err := client.WaitForSessionIdle("session-123", 30*time.Second, "", nil)
 	if err != nil {
 		t.Fatalf("Expected success, got error: %v", err)
 	}
-	
+
 	if callCount < 3 {
 		t.Errorf("Expected at least 3 API calls, got %d", callCount)
 	}
@@ -714,6 +870,10 @@ func TestWaitForSessionIdleClassic(t *testing.T) {
 func TestWaitForSessionIdleTimeout(t *testing.T) {
 	// Test timeout is enforced
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
 		// Always return active
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
@@ -726,13 +886,13 @@ func TestWaitForSessionIdleTimeout(t *testing.T) {
 	defer server.Close()
 
 	client := NewClient(server.URL, "", "", "v2")
-	
+
 	// Use very short timeout
 	err := client.WaitForSessionIdle("ses_test", 3*time.Second, "", nil)
 	if err == nil {
 		t.Fatal("Expected timeout error, got nil")
 	}
-	
+
 	if !contains(err.Error(), "timeout") {
 		t.Errorf("Expected timeout error message, got: %v", err)
 	}
@@ -743,10 +903,14 @@ func TestWaitForSessionIdleReusedSessionNeverActive(t *testing.T) {
 	// This reproduces the bug where review phase hangs when session doesn't process the prompt
 	callCount := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
 		callCount++
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		
+
 		// Session never appears in active map (simulating OpenCode not processing the reused session)
 		response := V2ActiveSessionsResponse{Data: map[string]SessionActive{}}
 		json.NewEncoder(w).Encode(response)
@@ -754,26 +918,26 @@ func TestWaitForSessionIdleReusedSessionNeverActive(t *testing.T) {
 	defer server.Close()
 
 	client := NewClient(server.URL, "", "", "v2")
-	
+
 	var logMessages []string
 	logFunc := func(msg string) {
 		logMessages = append(logMessages, msg)
 		t.Logf("LOG: %s", msg)
 	}
-	
+
 	// Use shorter timeout to make test faster
 	err := client.WaitForSessionIdle("ses_reused", 10*time.Second, "", logFunc)
-	
+
 	// Should timeout or return an error, not hang forever
 	if err == nil {
 		t.Fatal("Expected timeout or error when session never becomes active, got nil")
 	}
-	
+
 	// Should have logged about waiting
 	if len(logMessages) == 0 {
 		t.Error("Expected log messages during wait, got none")
 	}
-	
+
 	t.Logf("Error (expected): %v", err)
 	t.Logf("Log messages: %v", logMessages)
 }
@@ -783,10 +947,14 @@ func TestWaitForSessionIdleReusedSessionStaleActive(t *testing.T) {
 	// but never transitions to idle (stuck in stale state)
 	callCount := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
 		callCount++
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		
+
 		var response V2ActiveSessionsResponse
 		if callCount <= 1 {
 			// Appears active immediately (stale from previous use)
@@ -800,22 +968,22 @@ func TestWaitForSessionIdleReusedSessionStaleActive(t *testing.T) {
 			// This simulates the case where OpenCode thinks it's done but hasn't actually processed the new prompt
 			response = V2ActiveSessionsResponse{Data: map[string]SessionActive{}}
 		}
-		
+
 		json.NewEncoder(w).Encode(response)
 	}))
 	defer server.Close()
 
 	client := NewClient(server.URL, "", "", "v2")
-	
+
 	var logMessages []string
 	logFunc := func(msg string) {
 		logMessages = append(logMessages, msg)
 		t.Logf("LOG: %s", msg)
 	}
-	
+
 	// Use shorter timeout to make test faster
 	err := client.WaitForSessionIdle("ses_reused", 10*time.Second, "", logFunc)
-	
+
 	// This scenario is tricky - if we see it become active briefly then idle,
 	// current code would treat it as complete (which might be wrong for a reused session).
 	// But at minimum, it should not hang - either return success or timeout
@@ -823,12 +991,12 @@ func TestWaitForSessionIdleReusedSessionStaleActive(t *testing.T) {
 		// Timeout is acceptable
 		t.Logf("Got error (acceptable for this edge case): %v", err)
 	}
-	
+
 	// Should have logged something
 	if len(logMessages) == 0 {
 		t.Error("Expected log messages during wait, got none")
 	}
-	
+
 	t.Logf("Result: %v, logs: %v", err, logMessages)
 }
 
@@ -838,53 +1006,57 @@ func TestWaitForSessionIdleReusedSessionHangsActive(t *testing.T) {
 	// This simulates what happens when OpenCode gets stuck processing a reused session
 	callCount := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
 		callCount++
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		
+
 		// Session is always active (stuck)
 		response := V2ActiveSessionsResponse{
 			Data: map[string]SessionActive{
 				"ses_reused": {ID: "ses_reused", Status: "active"},
 			},
 		}
-		
+
 		json.NewEncoder(w).Encode(response)
 	}))
 	defer server.Close()
 
 	client := NewClient(server.URL, "", "", "v2")
-	
+
 	var logMessages []string
 	logFunc := func(msg string) {
 		logMessages = append(logMessages, msg)
 		t.Logf("LOG: %s", msg)
 	}
-	
+
 	// Use shorter timeout to make test faster
 	start := time.Now()
 	err := client.WaitForSessionIdle("ses_reused", 12*time.Second, "", logFunc)
 	elapsed := time.Since(start)
-	
+
 	// Should timeout, not hang forever
 	if err == nil {
 		t.Fatal("Expected timeout error when session stays active forever, got nil")
 	}
-	
+
 	if !contains(err.Error(), "timeout") {
 		t.Errorf("Expected timeout error, got: %v", err)
 	}
-	
+
 	// Should have logged multiple heartbeats during the wait
 	// With 12s timeout and 30s log interval, we won't see heartbeats in Phase 2
 	// But we should at least see the initial logs from Phase 1
 	t.Logf("Call count: %d, elapsed: %v", callCount, elapsed)
 	t.Logf("Log messages (%d): %v", len(logMessages), logMessages)
-	
+
 	if len(logMessages) < 2 {
 		t.Errorf("Expected at least 2 log messages (start + active), got %d: %v", len(logMessages), logMessages)
 	}
-	
+
 	// Should have seen "session is now active" message
 	hasActiveLog := false
 	for _, msg := range logMessages {
@@ -931,7 +1103,7 @@ func TestStreamSessionEventsV2(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			receivedEvents := []SessionEvent{}
-			
+
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				// Check that it's trying the right endpoint
 				if r.URL.Path != tt.endpointPath {
@@ -962,7 +1134,7 @@ func TestStreamSessionEventsV2(t *testing.T) {
 			defer server.Close()
 
 			client := NewClient(server.URL, "", "", "v2")
-			
+
 			handler := func(event SessionEvent) error {
 				receivedEvents = append(receivedEvents, event)
 				if len(receivedEvents) >= 2 {
@@ -1008,10 +1180,10 @@ func TestStreamSessionEventsEndpointFallback(t *testing.T) {
 	// Test that client tries multiple endpoints and succeeds with fallback
 	sessionID := "ses_test"
 	attempts := []string{}
-	
+
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		attempts = append(attempts, r.URL.Path)
-		
+
 		// First 3 endpoints return 404
 		if len(attempts) <= 3 {
 			http.NotFound(w, r)
@@ -1026,7 +1198,7 @@ func TestStreamSessionEventsEndpointFallback(t *testing.T) {
 	defer server.Close()
 
 	client := NewClient(server.URL, "", "", "v2")
-	
+
 	stopFunc, err := client.StreamSessionEvents(sessionID, func(event SessionEvent) error {
 		return nil
 	})
@@ -1049,11 +1221,11 @@ func TestStreamSessionEventsAllEndpointsFail(t *testing.T) {
 	defer server.Close()
 
 	client := NewClient(server.URL, "", "", "v2")
-	
+
 	_, err := client.StreamSessionEvents("ses_test", func(event SessionEvent) error {
 		return nil
 	})
-	
+
 	if err == nil {
 		t.Fatal("Expected error when all endpoints fail, got nil")
 	}
@@ -1066,11 +1238,11 @@ func TestStreamSessionEventsAllEndpointsFail(t *testing.T) {
 func TestStreamSessionEventsClassicUnsupported(t *testing.T) {
 	// Test that classic version returns error
 	client := NewClient("http://localhost", "", "", "classic")
-	
+
 	_, err := client.StreamSessionEvents("session-123", func(event SessionEvent) error {
 		return nil
 	})
-	
+
 	if err == nil {
 		t.Fatal("Expected error for classic version, got nil")
 	}
@@ -1240,7 +1412,7 @@ func TestAuthorizationHeaderOnAllEndpoints(t *testing.T) {
 				// Success response based on path
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(http.StatusOK)
-				
+
 				switch {
 				case contains(r.URL.Path, "/api/session/active"):
 					json.NewEncoder(w).Encode(V2ActiveSessionsResponse{Data: map[string]SessionActive{}})
@@ -1301,7 +1473,7 @@ func TestStreamSessionEventsWithAuth(t *testing.T) {
 	defer server.Close()
 
 	client := NewClient(server.URL, username, password, "v2")
-	
+
 	stopFunc, err := client.StreamSessionEvents("ses_test", func(event SessionEvent) error {
 		return nil
 	})
@@ -1334,7 +1506,7 @@ func TestStreamSessionEventsWithoutAuth401(t *testing.T) {
 	defer server.Close()
 
 	client := NewClient(server.URL, "", "", "v2")
-	
+
 	_, err := client.StreamSessionEvents("ses_test", func(event SessionEvent) error {
 		return nil
 	})
