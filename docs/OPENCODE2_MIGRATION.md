@@ -14,6 +14,7 @@ OpenCode2 introduced breaking changes to the HTTP API:
 |-----------|------------------|-----------|
 | Create Session | `POST /session?directory=<path>` | `POST /api/session` with `location: {directory}` in body |
 | Send Message | `POST /session/{id}/message?directory=<path>` | `POST /api/session/{id}/prompt` with `location: {directory}` in body |
+| Wait for Completion | Poll `GET /session/status` | `POST /api/session/{id}/wait` (OpenCode 2.0.3+) |
 | Event Stream | N/A | `GET /event` or `GET /global/event` (SSE) |
 | Response Format | `{id: "string", status: "string"}` | `{data: {id: {value: "string"}}}` |
 
@@ -24,6 +25,7 @@ OpenCode2 introduced breaking changes to the HTTP API:
 3. **Endpoint Names**: `/message` → `/prompt` for sending prompts to sessions
 4. **Response Structure**: Wrapped in `{data: ...}` envelope with nested ID objects
 5. **Event Streaming**: OpenCode2 provides SSE event streams at `/event` (directory-scoped) or `/global/event` for real-time session updates
+6. **Completion Waiting**: OpenCode 2.0.3 provides an authoritative wait operation; devboxd uses it instead of relying on active-session snapshots that can lag or become stale
 
 ## Configuration
 

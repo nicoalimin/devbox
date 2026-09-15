@@ -3,11 +3,13 @@ package opencode
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -140,13 +142,13 @@ type SessionEvent struct {
 // HealthCheck checks if OpenCode is healthy
 func (c *Client) HealthCheck() (bool, error) {
 	var health HealthResponse
-	
+
 	// OpenCode2 uses /api/health, classic uses /global/health
 	healthPath := "/global/health"
 	if c.version == "v2" {
 		healthPath = "/api/health"
 	}
-	
+
 	if err := c.get(healthPath, &health); err != nil {
 		return false, err
 	}
@@ -173,11 +175,11 @@ func (c *Client) CreateSession(title, directory string) (*Session, error) {
 // createSessionV2 creates a session using OpenCode2 API
 func (c *Client) createSessionV2(title, directory string) (*Session, error) {
 	c.log("info", fmt.Sprintf("Creating OpenCode session (title: %s, directory: %s)", title, directory))
-	
+
 	body := map[string]interface{}{
 		"title": title,
 	}
-	
+
 	// Add location with directory for OpenCode2
 	if directory != "" {
 		body["location"] = map[string]interface{}{
@@ -206,7 +208,7 @@ func (c *Client) createSessionV2(title, directory string) (*Session, error) {
 	}
 
 	c.log("info", fmt.Sprintf("Session created successfully (id: %s, status: active)", sessionID))
-	
+
 	return &Session{
 		ID:     sessionID,
 		Status: "active",
@@ -289,7 +291,7 @@ func (c *Client) IsSessionBusy(sessionID string, directory string) (bool, error)
 // isSessionBusyV2 checks if a session is busy using OpenCode2 /api/session/active
 func (c *Client) isSessionBusyV2(sessionID string, directory string) (bool, error) {
 	path := "/api/session/active"
-	
+
 	// Add directory header if provided (for instance-scoped routing)
 	var response V2ActiveSessionsResponse
 	if directory != "" {
@@ -297,11 +299,11 @@ func (c *Client) isSessionBusyV2(sessionID string, directory string) (bool, erro
 		// If we need per-request routing, we'd add x-opencode-directory header here
 		// or ?directory= query parameter
 	}
-	
+
 	if err := c.get(path, &response); err != nil {
 		return false, fmt.Errorf("failed to get active sessions: %w", err)
 	}
-	
+
 	// Session is busy if it's present in the active map
 	_, isActive := response.Data[sessionID]
 	return isActive, nil
@@ -313,14 +315,14 @@ func (c *Client) isSessionBusyClassic(sessionID string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	
+
 	sessionInfo, exists := status[sessionID]
 	if !exists {
 		// Session not in status map - could mean completed or not started yet
 		// Return false (not busy) - caller should handle this case
 		return false, nil
 	}
-	
+
 	return sessionInfo.Busy, nil
 }
 
@@ -329,29 +331,179 @@ func (c *Client) isSessionBusyClassic(sessionID string) (bool, error) {
 // directory parameter is optional and used for v2 instance-scoped routing
 // logFunc is called periodically with status updates (can be nil)
 func (c *Client) WaitForSessionIdle(sessionID string, timeout time.Duration, directory string, logFunc func(string)) error {
+	if c.version == "v2" {
+		waitStarted := time.Now()
+		supported, err := c.waitForSessionIdleV2(sessionID, timeout, logFunc)
+		if supported {
+			return err
+		}
+		timeout -= time.Since(waitStarted)
+		if timeout <= 0 {
+			return fmt.Errorf("timeout waiting for session %s after v2 wait endpoint fallback", sessionID)
+		}
+		if logFunc != nil {
+			logFunc("OpenCode wait endpoint is unavailable; falling back to active-session polling")
+		}
+	}
+
+	return c.waitForSessionIdleByPolling(sessionID, timeout, directory, logFunc)
+}
+
+// waitForSessionIdleV2 uses the authoritative wait operation added to the
+// OpenCode v2 API. Unlike the active-session snapshot, this operation is tied
+// directly to the session execution coordinator and cannot remain stale after
+// an execution settles.
+//
+// The bool result reports whether the endpoint is supported. Some older
+// OpenCode2 releases omitted the operation or returned an explicit
+// not-implemented response, so callers retain polling as a compatibility
+// fallback.
+func (c *Client) waitForSessionIdleV2(sessionID string, timeout time.Duration, logFunc func(string)) (bool, error) {
+	if timeout <= 0 {
+		return true, fmt.Errorf("timeout waiting for session %s after %v", sessionID, timeout)
+	}
+
+	if logFunc != nil {
+		logFunc(fmt.Sprintf("Waiting for OpenCode session %s to complete using the v2 wait endpoint", sessionID))
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	// Session executions commonly run longer than the client's ordinary
+	// 60-second request timeout. The caller-provided context is the sole timeout
+	// for this long-poll request.
+	waitClient := *c.httpClient
+	waitClient.Timeout = 0
+	path := fmt.Sprintf("/api/session/%s/wait", url.PathEscape(sessionID))
+	fullURL := c.baseURL + path
+	var lastErr error
+
+	for {
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, fullURL, nil)
+		if err != nil {
+			return true, fmt.Errorf("failed to create session wait request: %w", err)
+		}
+		if c.username != "" && c.password != "" {
+			req.SetBasicAuth(c.username, c.password)
+		}
+
+		resp, err := waitClient.Do(req)
+		if err != nil {
+			if ctx.Err() != nil {
+				return true, fmt.Errorf("timeout waiting for session %s after %v: %w", sessionID, timeout, ctx.Err())
+			}
+			lastErr = fmt.Errorf("session wait request failed: %w", err)
+			if logFunc != nil {
+				logFunc(fmt.Sprintf("OpenCode wait connection interrupted; retrying: %v", err))
+			}
+			if !sleepWithContext(ctx, 250*time.Millisecond) {
+				return true, fmt.Errorf("timeout waiting for session %s after %v: %w", sessionID, timeout, lastErr)
+			}
+			continue
+		}
+
+		respBody, readErr := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if readErr != nil {
+			lastErr = fmt.Errorf("failed to read session wait response: %w", readErr)
+			if !sleepWithContext(ctx, 250*time.Millisecond) {
+				return true, fmt.Errorf("timeout waiting for session %s after %v: %w", sessionID, timeout, lastErr)
+			}
+			continue
+		}
+		if resp.StatusCode == http.StatusNoContent {
+			if logFunc != nil {
+				logFunc(fmt.Sprintf("OpenCode session %s completed", sessionID))
+			}
+			return true, nil
+		}
+
+		if waitEndpointUnavailable(resp.StatusCode, respBody) {
+			return false, nil
+		}
+
+		httpErr := &HTTPError{
+			Method:       http.MethodPost,
+			URL:          fullURL,
+			StatusCode:   resp.StatusCode,
+			Status:       resp.Status,
+			ResponseBody: strings.TrimSpace(string(respBody)),
+			AllowHeader:  resp.Header.Get("Allow"),
+		}
+		if !retryableWaitStatus(resp.StatusCode) {
+			return true, httpErr
+		}
+
+		// Reverse proxies commonly end long-poll requests with 502 or 504, while a
+		// live endpoint can temporarily return 503. Retry all three within the same
+		// overall timeout budget.
+		lastErr = httpErr
+		if !sleepWithContext(ctx, 250*time.Millisecond) {
+			return true, fmt.Errorf("timeout waiting for session %s after %v: %w", sessionID, timeout, lastErr)
+		}
+	}
+}
+
+func retryableWaitStatus(statusCode int) bool {
+	return statusCode == http.StatusBadGateway ||
+		statusCode == http.StatusServiceUnavailable ||
+		statusCode == http.StatusGatewayTimeout
+}
+
+func waitEndpointUnavailable(statusCode int, body []byte) bool {
+	if statusCode == http.StatusMethodNotAllowed || statusCode == http.StatusNotImplemented {
+		return true
+	}
+	if statusCode != http.StatusServiceUnavailable {
+		return false
+	}
+
+	message := strings.ToLower(string(body))
+	return strings.Contains(message, "operationunavailableerror") ||
+		strings.Contains(message, "operation unavailable") ||
+		strings.Contains(message, "not implemented") ||
+		strings.Contains(message, "not available yet")
+}
+
+func sleepWithContext(ctx context.Context, duration time.Duration) bool {
+	timer := time.NewTimer(duration)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
+}
+
+// waitForSessionIdleByPolling retains compatibility with classic OpenCode and
+// OpenCode2 beta servers that do not implement the v2 wait operation.
+func (c *Client) waitForSessionIdleByPolling(sessionID string, timeout time.Duration, directory string, logFunc func(string)) error {
 	start := time.Now()
+	deadline := start.Add(timeout)
 	pollInterval := 5 * time.Second
-	logInterval := 10 * time.Second // Reduced from 30s to 10s for more frequent heartbeats
+	logInterval := 10 * time.Second          // Reduced from 30s to 10s for more frequent heartbeats
 	staleActiveThreshold := 60 * time.Second // Warn if session is active but no events for 60s
 	lastLog := time.Now()
 	lastActiveCheck := time.Now()
-	
+
 	// Phase 1: Wait for session to become active (race condition protection)
 	// For v2: after sending prompt, OpenCode may take a moment to start processing
 	// Don't treat "not in active map" as idle until we've seen it become active at least once
 	sawActive := false
 	warmupDeadline := start.Add(30 * time.Second) // Give it 30s to start
-	warmupLogTimer := time.Now() // Separate timer for warmup phase logging
-	
+	warmupLogTimer := time.Now()                  // Separate timer for warmup phase logging
+
 	if logFunc != nil {
 		logFunc(fmt.Sprintf("Waiting for OpenCode session %s to start (version: %s)", sessionID, c.version))
 	}
-	
+
 	for !sawActive && time.Now().Before(warmupDeadline) {
 		if time.Now().After(start.Add(timeout)) {
 			return fmt.Errorf("timeout waiting for session %s to start after %v", sessionID, timeout)
 		}
-		
+
 		busy, err := c.IsSessionBusy(sessionID, directory)
 		if err != nil {
 			// Log error but continue - might be temporary
@@ -359,10 +511,12 @@ func (c *Client) WaitForSessionIdle(sessionID string, timeout time.Duration, dir
 				logFunc(fmt.Sprintf("Warning: failed to check session status: %v", err))
 				warmupLogTimer = time.Now()
 			}
-			time.Sleep(pollInterval)
+			if !sleepUntil(deadline, pollInterval) {
+				continue
+			}
 			continue
 		}
-		
+
 		if busy {
 			sawActive = true
 			if logFunc != nil {
@@ -370,18 +524,20 @@ func (c *Client) WaitForSessionIdle(sessionID string, timeout time.Duration, dir
 			}
 			break
 		}
-		
+
 		// Not yet active, log progress periodically during warmup
 		if logFunc != nil && time.Now().Sub(warmupLogTimer) >= logInterval {
 			warmupElapsed := time.Since(start)
 			logFunc(fmt.Sprintf("Still waiting for session %s to start (elapsed: %v)", sessionID, warmupElapsed))
 			warmupLogTimer = time.Now()
 		}
-		
+
 		// Not yet active, wait a bit
-		time.Sleep(pollInterval)
+		if !sleepUntil(deadline, pollInterval) {
+			continue
+		}
 	}
-	
+
 	// If we never saw the session become active after warmup period, that's a problem
 	// For reused sessions, this likely means OpenCode didn't process the new prompt
 	if !sawActive {
@@ -392,7 +548,7 @@ func (c *Client) WaitForSessionIdle(sessionID string, timeout time.Duration, dir
 		// If it's truly done quickly, Phase 2 will detect it and return success
 		// If it's stuck, Phase 2 will timeout
 	}
-	
+
 	// Phase 2: Wait for session to become idle
 	lastLog = time.Now()
 	loopCount := 0
@@ -405,10 +561,10 @@ func (c *Client) WaitForSessionIdle(sessionID string, timeout time.Duration, dir
 			if sawActive {
 				state = "became active but never completed"
 			}
-			return fmt.Errorf("timeout waiting for session %s after %v (%s, checked %d times)", 
+			return fmt.Errorf("timeout waiting for session %s after %v (%s, checked %d times)",
 				sessionID, elapsed, state, loopCount)
 		}
-		
+
 		busy, err := c.IsSessionBusy(sessionID, directory)
 		if err != nil {
 			// Log error but continue - might be temporary
@@ -416,10 +572,12 @@ func (c *Client) WaitForSessionIdle(sessionID string, timeout time.Duration, dir
 				logFunc(fmt.Sprintf("Warning: failed to check session status: %v (elapsed: %v)", err, elapsed))
 				lastLog = time.Now()
 			}
-			time.Sleep(pollInterval)
+			if !sleepUntil(deadline, pollInterval) {
+				continue
+			}
 			continue
 		}
-		
+
 		// Session is idle only if we saw it active before OR it's not in the map
 		if !busy {
 			if sawActive || c.version == "classic" {
@@ -443,7 +601,7 @@ func (c *Client) WaitForSessionIdle(sessionID string, timeout time.Duration, dir
 				logFunc(fmt.Sprintf("Still waiting for OpenCode session %s (elapsed: %v)", sessionID, elapsed))
 				lastLog = time.Now()
 			}
-			
+
 			// Check for stale-active condition: session says active but no activity
 			// This is a heuristic based on polling interval - in production, event stream tracking would be more accurate
 			timeSinceLastCheck := time.Since(lastActiveCheck)
@@ -455,9 +613,23 @@ func (c *Client) WaitForSessionIdle(sessionID string, timeout time.Duration, dir
 			}
 			lastActiveCheck = time.Now()
 		}
-		
-		time.Sleep(pollInterval)
+
+		if !sleepUntil(deadline, pollInterval) {
+			continue
+		}
 	}
+}
+
+func sleepUntil(deadline time.Time, duration time.Duration) bool {
+	remaining := time.Until(deadline)
+	if remaining <= 0 {
+		return false
+	}
+	if duration > remaining {
+		duration = remaining
+	}
+	time.Sleep(duration)
+	return true
 }
 
 // sendMessageV2 sends a message using OpenCode2 /api/session/{sessionID}/prompt
@@ -466,7 +638,7 @@ func (c *Client) sendMessageV2(sessionID, message, directory string) error {
 	messageSize := len(message)
 	messageHash := fmt.Sprintf("%x", hashString(message))
 	c.log("info", fmt.Sprintf("Sending prompt to session %s (size: %d bytes, hash: %s)", sessionID, messageSize, messageHash[:8]))
-	
+
 	// OpenCode2 beta-19135 expects FLAT structure with text at root level:
 	//   {"text": "message"}
 	// NOT nested: {"prompt": {"text": "message"}}
@@ -476,18 +648,18 @@ func (c *Client) sendMessageV2(sessionID, message, directory string) error {
 	}
 
 	// Directory is NOT sent in prompt body - it's set at session creation
-	
+
 	var result map[string]interface{}
 	path := fmt.Sprintf("/api/session/%s/prompt", sessionID)
 	err := c.post(path, body, &result)
-	
+
 	// Log request body on failure for debugging
 	if err != nil {
 		bodyBytes, _ := json.Marshal(body)
 		c.log("error", fmt.Sprintf("Failed to send prompt: %v", err))
 		return fmt.Errorf("%w (request body: %s)", err, string(bodyBytes))
 	}
-	
+
 	c.log("info", fmt.Sprintf("Prompt sent successfully (response: OK)"))
 	return nil
 }
@@ -573,7 +745,7 @@ func (c *Client) post(path string, body interface{}, result interface{}) error {
 
 	// Read response body for error reporting
 	respBody, _ := io.ReadAll(resp.Body)
-	
+
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
 		return &HTTPError{
 			Method:       "POST",
@@ -743,7 +915,7 @@ func (c *Client) StreamSessionEvents(sessionID string, handler func(SessionEvent
 			// Parse SSE data line
 			if strings.HasPrefix(line, "data: ") {
 				data := strings.TrimPrefix(line, "data: ")
-				
+
 				var event SessionEvent
 				if err := json.Unmarshal([]byte(data), &event); err != nil {
 					// Skip malformed events
