@@ -17,7 +17,7 @@ linear:
 
 opencode:
   version: v2
-  base_url: "http://localhost:3000"       # or set OPENCODE_BASE_URL env var
+  base_url: "http://127.0.0.1:3000"       # or set OPENCODE_BASE_URL env var
   timeout: "30m"                          # Mark blocked after this timeout
   
   # HTTP Basic Authentication for OpenCode 2.0.3+ (when OPENCODE_SERVER_PASSWORD is set)

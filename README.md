@@ -230,7 +230,7 @@ linear:
   workspace_id: ""                        # Optional: workspace ID
 
 opencode:
-  base_url: "http://localhost:3000"
+  base_url: "http://127.0.0.1:3000"
   timeout: "30m"                          # Mark blocked after this timeout
 
   # HTTP Basic Authentication (OpenCode 2.0.3+)
@@ -438,7 +438,7 @@ OpenCode 2.0.3 and later require **HTTP Basic Authentication** when `OPENCODE_SE
 1. **Config file** (`devboxd.yaml`):
 ```yaml
 opencode:
-  base_url: "http://localhost:3000"
+  base_url: "http://127.0.0.1:3000"
   username: "opencode"           # Default username
   password: "your-password-here" # Match OPENCODE_SERVER_PASSWORD
 ```
@@ -742,7 +742,7 @@ mv .devbox/jobs.db /var/lib/devboxd/jobs.db
 ### OpenCode Issues
 
 **Error**: `request failed` when contacting OpenCode
-- Verify OpenCode is running: `curl http://localhost:3000/global/health`
+- Verify OpenCode is running: `curl http://127.0.0.1:3000/global/health`
 - Check `opencode.base_url` in config matches your OpenCode server
 
 ## Migration from n8n

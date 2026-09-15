@@ -31,7 +31,7 @@ Add `version` field to your `config.yaml`:
 
 ```yaml
 opencode:
-  base_url: http://localhost:3000
+  base_url: http://127.0.0.1:3000
   version: v2  # Use "v2" for OpenCode2, "classic" for legacy OpenCode
   username: opencode  # Optional basic auth
   password: secret    # Optional basic auth
@@ -43,7 +43,7 @@ opencode:
 
 ```yaml
 opencode:
-  base_url: http://localhost:3000
+  base_url: http://127.0.0.1:3000
   version: v2
 ```
 
@@ -63,12 +63,12 @@ Create a session manually to verify the server responds correctly:
 
 ```bash
 # Without auth
-curl -X POST http://localhost:3000/api/session \
+curl -X POST http://127.0.0.1:3000/api/session \
   -H "Content-Type: application/json" \
   -d '{"title": "Test Session", "location": {"directory": "/tmp/test"}}'
 
 # With basic auth
-curl -X POST http://localhost:3000/api/session \
+curl -X POST http://127.0.0.1:3000/api/session \
   -u opencode:yourpassword \
   -H "Content-Type: application/json" \
   -d '{"title": "Test Session", "location": {"directory": "/tmp/test"}}'
@@ -111,7 +111,7 @@ Failed to execute coding: API returned status 405:
 
 **After** (actionable):
 ```
-POST http://localhost:3000/api/session returned 405 Method Not Allowed (Allow: GET, PUT): 
+POST http://127.0.0.1:3000/api/session returned 405 Method Not Allowed (Allow: GET, PUT): 
 {"error": "endpoint requires GET or PUT"}
 ```
 
@@ -126,12 +126,12 @@ The error now includes:
 
 ### 405 Method Not Allowed
 
-**Symptom**: `POST http://localhost:3000/session returned 405 Method Not Allowed`
+**Symptom**: `POST http://127.0.0.1:3000/session returned 405 Method Not Allowed`
 
 **Cause**: You're running OpenCode2 but config is set to `version: classic` (or you're hitting the wrong endpoint).
 
 **Fix**: 
-1. Verify OpenCode2 is running: `curl http://localhost:3000/api/session`
+1. Verify OpenCode2 is running: `curl http://127.0.0.1:3000/api/session`
 2. Update config: `version: v2`
 3. Restart devboxd
 
@@ -162,7 +162,7 @@ The error now includes:
 
 **Fix**:
 1. Start OpenCode2: `opencode serve` (default port 3000)
-2. Verify: `curl http://localhost:3000/global/health`
+2. Verify: `curl http://127.0.0.1:3000/global/health`
 3. Update `base_url` in config if using non-default port
 
 ## Version Compatibility Matrix
@@ -186,7 +186,7 @@ linear:
   assignee_id: "user-abc123"
 
 opencode:
-  base_url: http://localhost:3000
+  base_url: http://127.0.0.1:3000
   version: v2
 
 github:

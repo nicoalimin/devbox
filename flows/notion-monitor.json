@@ -24,7 +24,7 @@
       "name": "HTTP Request",
       "type": "http-request",
       "parameters": {
-        "url": "http://localhost:3000/opencode-endpoint",
+        "url": "http://127.0.0.1:3000/opencode-endpoint",
         "method": "POST",
         "body": "{{ $json }}"
       },

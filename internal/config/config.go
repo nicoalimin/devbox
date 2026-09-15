@@ -122,7 +122,7 @@ func LoadConfig(path string) (*Config, error) {
 		cfg.Server.Listen = "0.0.0.0:8080"
 	}
 	if cfg.OpenCode.BaseURL == "" {
-		cfg.OpenCode.BaseURL = "http://localhost:3000"
+		cfg.OpenCode.BaseURL = "http://127.0.0.1:3000"
 	}
 	if cfg.OpenCode.Version == "" {
 		cfg.OpenCode.Version = "v2"
