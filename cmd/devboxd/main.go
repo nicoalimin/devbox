@@ -59,6 +59,10 @@ func main() {
 		// Don't fail startup, just log the warning
 	}
 
+	// Start the periodic GitHub reconciler for stuck pr_open jobs (UTA-68).
+	// It no-ops immediately when disabled in config.
+	go orchestrator.StartReconciler()
+
 	// Create server
 	server := api.NewServer(cfg, database, orchestrator)
 	

@@ -1,9 +1,12 @@
 package job
 
 import (
+	"encoding/json"
 	"fmt"
 	"log"
 	"os"
+	"os/exec"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -22,10 +25,11 @@ type Orchestrator struct {
 	db              *db.DB
 	linear          *linear.Client
 	opencode        *opencode.Client
-	activeJobs      map[string]bool              // Track actively running jobs to prevent double-resume
-	healingAttempts map[string]int               // Track session healing attempts per job (jobID -> count)
-	streamStopFuncs map[string]func()            // Stop functions for active event streams (jobID -> stopFunc)
-	streamMu        sync.Mutex                   // Mutex to protect streamStopFuncs map
+	activeJobs      map[string]bool                           // Track actively running jobs to prevent double-resume
+	healingAttempts map[string]int                            // Track session healing attempts per job (jobID -> count)
+	streamStopFuncs map[string]func()                         // Stop functions for active event streams (jobID -> stopFunc)
+	streamMu        sync.Mutex                                // Mutex to protect streamStopFuncs map
+	prStatusFn      func(prURL string) (prStatus, int, error) // Override for getPRStatus (tests)
 }
 
 const (
@@ -1238,5 +1242,195 @@ func (o *Orchestrator) stopEventStream(jobID string) {
 	if stopFunc, exists := o.streamStopFuncs[jobID]; exists {
 		stopFunc()
 		delete(o.streamStopFuncs, jobID)
+	}
+}
+
+// prStatus is the lifecycle state of a GitHub PR as seen by the reconciler.
+type prStatus string
+
+const (
+	prStatusOpen     prStatus = "open"
+	prStatusMerged   prStatus = "merged"
+	prStatusClosed   prStatus = "closed"
+	prStatusNotFound prStatus = "not_found"
+)
+
+// StartReconciler polls GitHub periodically for jobs stuck in pr_open and
+// advances them to a terminal state (UTA-68). It blocks forever; callers
+// should run it in a goroutine. If the reconciler is disabled in config,
+// it logs and returns immediately.
+func (o *Orchestrator) StartReconciler() {
+	if !o.cfg.ReconcilerEnabled() {
+		log.Printf("[reconciler] disabled, not starting")
+		return
+	}
+	interval := o.cfg.ReconcilerInterval()
+	log.Printf("[reconciler] starting (interval=%s)", interval)
+
+	// Reconcile once at startup so a restart picks up merged/closed PRs
+	// without waiting a full interval, then tick.
+	o.reconcileJobs()
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for range ticker.C {
+		o.reconcileJobs()
+	}
+}
+
+// reconcileJobs checks every pr_open job against GitHub PR state and moves
+// merged PRs to done and closed/unmerged PRs to cancelled. Jobs in other
+// states and jobs without a pr_url are never mutated.
+func (o *Orchestrator) reconcileJobs() {
+	if !o.cfg.ReconcilerEnabled() {
+		return
+	}
+
+	jobs, err := o.db.ListJobs(0)
+	if err != nil {
+		log.Printf("[reconciler] failed to list jobs: %v", err)
+		return
+	}
+
+	for _, j := range jobs {
+		if j.State != db.StatePROpen {
+			continue
+		}
+		if strings.TrimSpace(j.PRURL) == "" {
+			log.Printf("[reconciler] job %s in pr_open has no pr_url, skipping", j.ID)
+			continue
+		}
+
+		status, prNumber, err := o.getPRStatus(j.PRURL)
+		if err != nil {
+			log.Printf("[reconciler] job %s: failed to check PR %s: %v", j.ID, j.PRURL, err)
+			continue
+		}
+
+		switch status {
+		case prStatusMerged:
+			now := time.Now()
+			j.State = db.StateDone
+			j.CompletedAt = &now
+			if err := o.db.UpdateJob(j); err != nil {
+				log.Printf("[reconciler] job %s: failed to mark done: %v", j.ID, err)
+				continue
+			}
+			o.log(j.ID, "info", fmt.Sprintf("PR %s merged → done", prRef(prNumber, j.PRURL)))
+			log.Printf("[reconciler] job %s PR %s merged → done", j.ID, prRef(prNumber, j.PRURL))
+			o.cleanupWorktreeBestEffort(j)
+		case prStatusClosed, prStatusNotFound:
+			reason := "PR closed without merge"
+			jobMsg := fmt.Sprintf("PR %s closed without merge → cancelled", prRef(prNumber, j.PRURL))
+			if status == prStatusNotFound {
+				// A PR that no longer exists on GitHub (deleted repo, force-deleted
+				// ref, or bogus URL) will never merge, so treat it as closed
+				// rather than leaving the job stuck in pr_open forever.
+				reason = "PR not found on GitHub (treated as closed without merge)"
+				jobMsg = fmt.Sprintf("PR %s not found on GitHub → cancelled", prRef(prNumber, j.PRURL))
+			}
+			now := time.Now()
+			j.State = db.StateCancelled
+			j.BlockerReason = reason
+			j.CompletedAt = &now
+			if err := o.db.UpdateJob(j); err != nil {
+				log.Printf("[reconciler] job %s: failed to mark cancelled: %v", j.ID, err)
+				continue
+			}
+			o.log(j.ID, "info", jobMsg)
+			log.Printf("[reconciler] job %s PR %s closed → cancelled", j.ID, prRef(prNumber, j.PRURL))
+			o.cleanupWorktreeBestEffort(j)
+		case prStatusOpen:
+			// Still waiting on external review — leave unchanged.
+		default:
+			log.Printf("[reconciler] job %s: unknown PR status %q for %s, skipping", j.ID, status, j.PRURL)
+		}
+	}
+}
+
+// getPRStatus returns the current lifecycle state of a GitHub PR. Tests can
+// stub it via the prStatusFn field; otherwise it shells out to `gh pr view`.
+func (o *Orchestrator) getPRStatus(prURL string) (prStatus, int, error) {
+	if o.prStatusFn != nil {
+		return o.prStatusFn(prURL)
+	}
+	return defaultGetPRStatus(prURL)
+}
+
+// defaultGetPRStatus queries GitHub for a PR's state via the gh CLI.
+func defaultGetPRStatus(prURL string) (prStatus, int, error) {
+	cmd := exec.Command("gh", "pr", "view", prURL, "--json", "number,state")
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		lowered := strings.ToLower(string(output))
+		if strings.Contains(lowered, "not found") ||
+			strings.Contains(lowered, "no pull requests") ||
+			strings.Contains(lowered, "could not resolve") ||
+			strings.Contains(lowered, "404") {
+			return prStatusNotFound, prNumberFromURL(prURL), nil
+		}
+		return "", 0, fmt.Errorf("gh pr view failed: %w (output: %s)", err, strings.TrimSpace(string(output)))
+	}
+
+	var pr struct {
+		Number int    `json:"number"`
+		State  string `json:"state"`
+	}
+	if err := json.Unmarshal(output, &pr); err != nil {
+		return "", 0, fmt.Errorf("failed to parse gh pr view output: %w", err)
+	}
+
+	number := pr.Number
+	if number == 0 {
+		number = prNumberFromURL(prURL)
+	}
+
+	// gh reports state as OPEN, CLOSED, or MERGED.
+	switch strings.ToUpper(strings.TrimSpace(pr.State)) {
+	case "MERGED":
+		return prStatusMerged, number, nil
+	case "CLOSED":
+		return prStatusClosed, number, nil
+	case "OPEN":
+		return prStatusOpen, number, nil
+	default:
+		return "", number, fmt.Errorf("unknown PR state %q", pr.State)
+	}
+}
+
+// prNumberFromURL extracts the PR number from a GitHub PR URL
+// (e.g. https://github.com/owner/repo/pull/123 -> 123), or 0 if unparseable.
+func prNumberFromURL(prURL string) int {
+	idx := strings.LastIndex(prURL, "/pull/")
+	if idx == -1 {
+		return 0
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(prURL[idx+len("/pull/"):]))
+	if err != nil {
+		return 0
+	}
+	return n
+}
+
+// prRef formats a PR reference for log lines, preferring #N when known.
+func prRef(number int, prURL string) string {
+	if number > 0 {
+		return fmt.Sprintf("#%d", number)
+	}
+	return prURL
+}
+
+// cleanupWorktreeBestEffort removes a reconciled job's worktree without
+// failing the state transition if cleanup fails.
+func (o *Orchestrator) cleanupWorktreeBestEffort(j *db.Job) {
+	if j.WorktreePath == "" {
+		return
+	}
+	if _, err := os.Stat(j.WorktreePath); os.IsNotExist(err) {
+		return
+	}
+	gitMgr := git.NewManager(j.RepoPath, o.cfg.GitHub.DefaultBaseBranch)
+	if err := gitMgr.RemoveWorktree(j.WorktreePath); err != nil {
+		o.log(j.ID, "warn", fmt.Sprintf("Failed to remove worktree: %v", err))
 	}
 }
