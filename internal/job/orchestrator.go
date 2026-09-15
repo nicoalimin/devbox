@@ -25,10 +25,10 @@ type Orchestrator struct {
 	db              *db.DB
 	linear          *linear.Client
 	opencode        *opencode.Client
-	activeJobs      map[string]bool              // Track actively running jobs to prevent double-resume
-	healingAttempts map[string]int               // Track session healing attempts per job (jobID -> count)
-	streamStopFuncs map[string]func()            // Stop functions for active event streams (jobID -> stopFunc)
-	streamMu        sync.Mutex                   // Mutex to protect streamStopFuncs map
+	activeJobs      map[string]bool                           // Track actively running jobs to prevent double-resume
+	healingAttempts map[string]int                            // Track session healing attempts per job (jobID -> count)
+	streamStopFuncs map[string]func()                         // Stop functions for active event streams (jobID -> stopFunc)
+	streamMu        sync.Mutex                                // Mutex to protect streamStopFuncs map
 	prStatusFn      func(prURL string) (prStatus, int, error) // Override for getPRStatus (tests)
 }
 
@@ -1321,11 +1321,13 @@ func (o *Orchestrator) reconcileJobs() {
 			o.cleanupWorktreeBestEffort(j)
 		case prStatusClosed, prStatusNotFound:
 			reason := "PR closed without merge"
+			jobMsg := fmt.Sprintf("PR %s closed without merge → cancelled", prRef(prNumber, j.PRURL))
 			if status == prStatusNotFound {
 				// A PR that no longer exists on GitHub (deleted repo, force-deleted
 				// ref, or bogus URL) will never merge, so treat it as closed
 				// rather than leaving the job stuck in pr_open forever.
 				reason = "PR not found on GitHub (treated as closed without merge)"
+				jobMsg = fmt.Sprintf("PR %s not found on GitHub → cancelled", prRef(prNumber, j.PRURL))
 			}
 			now := time.Now()
 			j.State = db.StateCancelled
@@ -1335,7 +1337,7 @@ func (o *Orchestrator) reconcileJobs() {
 				log.Printf("[reconciler] job %s: failed to mark cancelled: %v", j.ID, err)
 				continue
 			}
-			o.log(j.ID, "info", fmt.Sprintf("PR %s closed without merge → cancelled", prRef(prNumber, j.PRURL)))
+			o.log(j.ID, "info", jobMsg)
 			log.Printf("[reconciler] job %s PR %s closed → cancelled", j.ID, prRef(prNumber, j.PRURL))
 			o.cleanupWorktreeBestEffort(j)
 		case prStatusOpen:

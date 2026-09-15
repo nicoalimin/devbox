@@ -196,6 +196,21 @@ func TestReconcileJobs_NotFoundToCancelled(t *testing.T) {
 	if job.BlockerReason == "" {
 		t.Error("Expected BlockerReason to be set for not-found PR")
 	}
+
+	logs, err := orch.db.GetLogs("job-gone", 0)
+	if err != nil {
+		t.Fatalf("Failed to get logs: %v", err)
+	}
+	found := false
+	for _, l := range logs {
+		if strings.Contains(l.Message, "not found") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Error("Expected job log mentioning PR not found")
+	}
 }
 
 func TestReconcileJobs_OpenUnchanged(t *testing.T) {

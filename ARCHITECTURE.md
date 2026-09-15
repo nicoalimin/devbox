@@ -182,6 +182,10 @@ repos:
 queue:
   enabled: false  # Default: reject when busy
   max_depth: 1    # Only if enabled
+
+reconciler:
+  enabled: true   # Periodic GitHub check for stuck pr_open jobs (merged -> done, closed -> cancelled)
+  interval: "2m"  # Poll interval (~1-5m recommended)
 ```
 
 ## Single-Flight Enforcement
