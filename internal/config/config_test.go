@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestOpenCodeAuthEnvVars(t *testing.T) {
@@ -218,5 +219,103 @@ repos:
 
 	if cfg.OpenCode.Password != "env-pass" {
 		t.Errorf("Expected password 'env-pass' (from env), got %q", cfg.OpenCode.Password)
+	}
+}
+
+func writeReconcilerTestConfig(t *testing.T, content string) string {
+	t.Helper()
+	tmpDir := t.TempDir()
+	configPath := filepath.Join(tmpDir, "test-config.yaml")
+	if err := os.WriteFile(configPath, []byte(content), 0644); err != nil {
+		t.Fatalf("Failed to write test config: %v", err)
+	}
+	return configPath
+}
+
+func baseReconcilerTestConfig() string {
+	return `
+server:
+  listen: "0.0.0.0:8080"
+  auth_token: "test-token"
+
+linear:
+  api_key: "test-api-key"
+
+repos:
+  - match:
+      team: "TEST"
+    repo:
+      path: "/tmp/test"
+      base_branch: "main"
+`
+}
+
+func TestReconcilerDefaultsWhenSectionMissing(t *testing.T) {
+	os.Unsetenv("DEVBOXD_RECONCILER_ENABLED")
+	os.Unsetenv("DEVBOXD_RECONCILER_INTERVAL")
+	path := writeReconcilerTestConfig(t, baseReconcilerTestConfig())
+	cfg, err := LoadConfig(path)
+	if err != nil {
+		t.Fatalf("LoadConfig failed: %v", err)
+	}
+	if !cfg.Reconciler.Enabled {
+		t.Error("Expected reconciler enabled by default, got disabled")
+	}
+	if cfg.Reconciler.Interval != 2*time.Minute {
+		t.Errorf("Expected default interval 2m, got %s", cfg.Reconciler.Interval)
+	}
+}
+
+func TestReconcilerExplicitDisabledPreserved(t *testing.T) {
+	os.Unsetenv("DEVBOXD_RECONCILER_ENABLED")
+	os.Unsetenv("DEVBOXD_RECONCILER_INTERVAL")
+	content := baseReconcilerTestConfig() + "\nreconciler:\n  enabled: false\n"
+	path := writeReconcilerTestConfig(t, content)
+	cfg, err := LoadConfig(path)
+	if err != nil {
+		t.Fatalf("LoadConfig failed: %v", err)
+	}
+	if cfg.Reconciler.Enabled {
+		t.Error("Expected reconciler disabled when explicitly set, got enabled")
+	}
+	if cfg.Reconciler.Interval != 2*time.Minute {
+		t.Errorf("Expected default interval 2m with explicit disabled, got %s", cfg.Reconciler.Interval)
+	}
+}
+
+func TestReconcilerCustomInterval(t *testing.T) {
+	os.Unsetenv("DEVBOXD_RECONCILER_ENABLED")
+	os.Unsetenv("DEVBOXD_RECONCILER_INTERVAL")
+	content := baseReconcilerTestConfig() + "\nreconciler:\n  interval: \"5m\"\n"
+	path := writeReconcilerTestConfig(t, content)
+	cfg, err := LoadConfig(path)
+	if err != nil {
+		t.Fatalf("LoadConfig failed: %v", err)
+	}
+	if !cfg.Reconciler.Enabled {
+		t.Error("Expected reconciler enabled by default when only interval set")
+	}
+	if cfg.Reconciler.Interval != 5*time.Minute {
+		t.Errorf("Expected custom interval 5m, got %s", cfg.Reconciler.Interval)
+	}
+}
+
+func TestReconcilerEnvOverrides(t *testing.T) {
+	os.Setenv("DEVBOXD_RECONCILER_ENABLED", "false")
+	os.Setenv("DEVBOXD_RECONCILER_INTERVAL", "1m")
+	defer func() {
+		os.Unsetenv("DEVBOXD_RECONCILER_ENABLED")
+		os.Unsetenv("DEVBOXD_RECONCILER_INTERVAL")
+	}()
+	path := writeReconcilerTestConfig(t, baseReconcilerTestConfig())
+	cfg, err := LoadConfig(path)
+	if err != nil {
+		t.Fatalf("LoadConfig failed: %v", err)
+	}
+	if cfg.Reconciler.Enabled {
+		t.Error("Expected env DEVBOXD_RECONCILER_ENABLED=false to disable")
+	}
+	if cfg.Reconciler.Interval != time.Minute {
+		t.Errorf("Expected env interval 1m, got %s", cfg.Reconciler.Interval)
 	}
 }
