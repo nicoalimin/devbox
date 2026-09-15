@@ -265,6 +265,10 @@ repos:
 queue:
   enabled: false  # Default: reject when busy
   max_depth: 1    # Only if enabled
+
+reconciler:
+  enabled: true   # Periodic GitHub reconciler for stuck pr_open jobs (default: true)
+  interval: "2m"  # Poll interval, ~1-5m recommended; rate-limit friendly (default: 2m)
 ```
 
 **Environment Variable Overrides:**
@@ -275,6 +279,8 @@ queue:
 - `OPENCODE_BASE_URL` - OpenCode server URL
 - `DEVBOXD_OPENCODE_USERNAME` or `OPENCODE_SERVER_USERNAME` - OpenCode HTTP Basic Auth username
 - `DEVBOXD_OPENCODE_PASSWORD` or `OPENCODE_SERVER_PASSWORD` - OpenCode HTTP Basic Auth password
+- `DEVBOXD_RECONCILER_ENABLED` - Periodic GitHub reconciler on/off (default: true)
+- `DEVBOXD_RECONCILER_INTERVAL` - Reconciler poll interval, e.g. `1m` (default: `2m`)
 
 ### Client Configuration
 
@@ -384,6 +390,11 @@ queued -> fetching -> preparing -> coding -> reviewing -> pushing -> pr_open -> 
              
 blocked -> (reply received) -> coding/reviewing (resume)
 ```
+
+**PR reconciler:** jobs waiting in `pr_open` are periodically re-checked against
+GitHub (see `reconciler:` config, default every 2m). A merged PR advances the
+job to `done`; a PR closed without merge (or not found) moves it to
+`cancelled` with a blocker reason. Open PRs are left unchanged.
 
 ## Integration with Grok Bot
 
