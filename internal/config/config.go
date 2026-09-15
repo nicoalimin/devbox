@@ -11,13 +11,14 @@ import (
 
 // Config represents the server configuration
 type Config struct {
-	Server   ServerConfig   `yaml:"server"`
-	Database DatabaseConfig `yaml:"database"`
-	Linear   LinearConfig   `yaml:"linear"`
-	OpenCode OpenCodeConfig `yaml:"opencode"`
-	GitHub   GitHubConfig   `yaml:"github"`
-	Repos    []RepoConfig   `yaml:"repos"`
-	Queue    QueueConfig    `yaml:"queue"`
+	Server     ServerConfig     `yaml:"server"`
+	Database   DatabaseConfig   `yaml:"database"`
+	Linear     LinearConfig     `yaml:"linear"`
+	OpenCode   OpenCodeConfig   `yaml:"opencode"`
+	GitHub     GitHubConfig     `yaml:"github"`
+	Repos      []RepoConfig     `yaml:"repos"`
+	Queue      QueueConfig      `yaml:"queue"`
+	Reconciler ReconcilerConfig `yaml:"reconciler"`
 }
 
 // ServerConfig defines HTTP server settings
@@ -77,6 +78,32 @@ type QueueConfig struct {
 	MaxDepth int  `yaml:"max_depth"` // Max queued jobs
 }
 
+// DefaultReconcilerInterval is the default poll interval for the PR reconciler.
+// Kept at ~2m to stay rate-limit friendly (each pr_open job = 1 `gh pr view` call per tick).
+const DefaultReconcilerInterval = 2 * time.Minute
+
+// ReconcilerConfig defines the periodic GitHub reconciler settings.
+// The reconciler polls GitHub for jobs stuck in pr_open after the PR was
+// merged/closed elsewhere, since devboxd has no webhook for third-party state.
+type ReconcilerConfig struct {
+	Enabled  bool          `yaml:"enabled"`  // Default: true (poll GitHub periodically)
+	Interval time.Duration `yaml:"interval"` // Default: 2m (poll interval, ~1-5m recommended)
+}
+
+// ReconcilerEnabled reports whether the reconciler loop should run.
+func (c *Config) ReconcilerEnabled() bool {
+	return c.Reconciler.Enabled
+}
+
+// ReconcilerInterval returns the poll interval, falling back to the default
+// when unset or non-positive (e.g. Config built programmatically in tests).
+func (c *Config) ReconcilerInterval() time.Duration {
+	if c.Reconciler.Interval <= 0 {
+		return DefaultReconcilerInterval
+	}
+	return c.Reconciler.Interval
+}
+
 // LoadConfig loads configuration from a YAML file, with env var overrides
 func LoadConfig(path string) (*Config, error) {
 	data, err := os.ReadFile(path)
@@ -85,6 +112,11 @@ func LoadConfig(path string) (*Config, error) {
 	}
 
 	var cfg Config
+	// Defaults for fields where the zero value is not the desired default.
+	// Pre-populated before unmarshal so a missing `reconciler:` section (or
+	// missing keys within it) keeps defaults; explicit keys still override.
+	cfg.Reconciler.Enabled = true
+	cfg.Reconciler.Interval = DefaultReconcilerInterval
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
 		return nil, fmt.Errorf("failed to parse config file: %w", err)
 	}
@@ -132,6 +164,9 @@ func LoadConfig(path string) (*Config, error) {
 	}
 	if cfg.GitHub.DefaultBaseBranch == "" {
 		cfg.GitHub.DefaultBaseBranch = "main"
+	}
+	if cfg.Reconciler.Interval <= 0 {
+		cfg.Reconciler.Interval = DefaultReconcilerInterval
 	}
 
 	// Validation

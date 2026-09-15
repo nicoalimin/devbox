@@ -54,3 +54,10 @@ repos:
 queue:
   enabled: false  # Default: reject when busy
   max_depth: 1    # Only if enabled
+
+# Periodic GitHub reconciler for stuck pr_open jobs (UTA-68).
+# Polls GitHub for jobs waiting on external PR state and advances them to a
+# terminal state (merged -> done, closed unmerged -> cancelled).
+reconciler:
+  enabled: true   # Default: true (set false to disable polling)
+  interval: "2m"  # Default: 2m (~1-5m recommended; rate-limit friendly)
