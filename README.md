@@ -79,12 +79,12 @@ devboxd --config devboxd.yaml
 The server will:
 - Listen on `0.0.0.0:8080` (configurable)
 - Create a persistent SQLite database (default: `~/.local/share/devbox/jobs.db`)
-- Display an interactive terminal UI dashboard (when run in a TTY)
+- Display an interactive terminal UI dashboard by default
 - Wait for job assignments via the HTTP API
 
 **Full-Screen Interactive TUI**
 
-When you run `devboxd --config devboxd.yaml` on a terminal, it launches an immersive full-screen interface:
+When you run `devboxd --config devboxd.yaml`, it launches an immersive full-screen interface:
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
@@ -166,14 +166,14 @@ devboxd --config devboxd.yaml --no-tui
 # Option 2: Environment variable
 DEVBOX_NO_TUI=1 devboxd --config devboxd.yaml
 
-# Option 3: Redirect output (auto-detected)
-devboxd --config devboxd.yaml > devboxd.log 2>&1
 ```
 
-The server will automatically disable the TUI when:
+The server disables the TUI only when:
 - `--no-tui` flag is provided
 - `DEVBOX_NO_TUI` environment variable is set
-- stdout is not a TTY (e.g., piped, redirected, or running as a service)
+
+Redirecting output does not implicitly select headless mode; services and scripts
+must use one of the explicit options above.
 
 ### 3. Install the Client (Grok Bot Host)
 

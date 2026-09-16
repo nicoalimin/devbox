@@ -3,6 +3,7 @@ package api
 import (
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"strconv"
 	"time"
@@ -39,6 +40,18 @@ func (s *Server) Start() error {
 
 // StartWithLogger starts the HTTP server with optional custom logger
 func (s *Server) StartWithLogger(customLogger func(string, ...interface{})) error {
+	listener, err := net.Listen("tcp", s.cfg.Server.Listen)
+	if err != nil {
+		return err
+	}
+
+	return s.ServeWithLogger(listener, customLogger)
+}
+
+// ServeWithLogger serves the HTTP API on an already-bound listener. Accepting
+// the listener separately lets callers surface bind failures before starting a
+// full-screen UI or other long-running foreground work.
+func (s *Server) ServeWithLogger(listener net.Listener, customLogger func(string, ...interface{})) error {
 	r := chi.NewRouter()
 
 	// Middleware
@@ -48,7 +61,7 @@ func (s *Server) StartWithLogger(customLogger func(string, ...interface{})) erro
 			return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				ww := middleware.NewWrapResponseWriter(w, r.ProtoMajor)
 				t1 := time.Now()
-				
+
 				defer func() {
 					elapsed := time.Since(t1)
 					customLogger("%s %s %s from %s - %d in %s",
@@ -59,7 +72,7 @@ func (s *Server) StartWithLogger(customLogger func(string, ...interface{})) erro
 						ww.Status(),
 						elapsed)
 				}()
-				
+
 				next.ServeHTTP(ww, r)
 			})
 		})
@@ -92,7 +105,7 @@ func (s *Server) StartWithLogger(customLogger func(string, ...interface{})) erro
 	} else {
 		customLogger("Starting devboxd server on %s", s.cfg.Server.Listen)
 	}
-	return http.ListenAndServe(s.cfg.Server.Listen, r)
+	return http.Serve(listener, r)
 }
 
 // authMiddleware validates the bearer token
