@@ -11,7 +11,7 @@ import (
 // setupTestRepo creates a temporary git repository for testing
 func setupTestRepo(t *testing.T) string {
 	t.Helper()
-	
+
 	// Create a "remote" repo first
 	remoteDir, err := os.MkdirTemp("", "devbox-git-remote-*")
 	if err != nil {
@@ -107,7 +107,7 @@ func setupTestRepo(t *testing.T) string {
 // createBranch creates a branch in the test repo
 func createBranch(t *testing.T, repoPath, branchName string) {
 	t.Helper()
-	
+
 	cmd := exec.Command("git", "branch", branchName)
 	cmd.Dir = repoPath
 	if err := cmd.Run(); err != nil {
@@ -120,7 +120,7 @@ func TestCreateWorktree_Success(t *testing.T) {
 	defer os.RemoveAll(repoPath)
 
 	mgr := NewManager(repoPath, "main")
-	
+
 	worktree, err := mgr.CreateWorktree("TEST-123")
 	if err != nil {
 		t.Fatalf("CreateWorktree failed: %v", err)
@@ -149,7 +149,7 @@ func TestCreateWorktree_CollisionHandling(t *testing.T) {
 	defer os.RemoveAll(repoPath)
 
 	mgr := NewManager(repoPath, "main")
-	
+
 	// Create a branch that will conflict
 	createBranch(t, repoPath, "devbox/test-456")
 
@@ -183,7 +183,7 @@ func TestCreateWorktree_MultipleCollisions(t *testing.T) {
 	defer os.RemoveAll(repoPath)
 
 	mgr := NewManager(repoPath, "main")
-	
+
 	// Create branches that will conflict
 	createBranch(t, repoPath, "devbox/test-789")
 	createBranch(t, repoPath, "devbox/test-789-2")
@@ -214,7 +214,7 @@ func TestBranchExists(t *testing.T) {
 	defer os.RemoveAll(repoPath)
 
 	mgr := NewManager(repoPath, "main")
-	
+
 	// Test non-existent branch
 	if mgr.branchExists("devbox/nonexistent") {
 		t.Error("branchExists returned true for non-existent branch")
@@ -232,30 +232,30 @@ func TestFindUniqueBranchName(t *testing.T) {
 	defer os.RemoveAll(repoPath)
 
 	mgr := NewManager(repoPath, "main")
-	
+
 	tests := []struct {
-		name           string
-		baseName       string
+		name             string
+		baseName         string
 		existingBranches []string
-		expected       string
+		expected         string
 	}{
 		{
-			name:           "no collision",
-			baseName:       "devbox/test-1",
+			name:             "no collision",
+			baseName:         "devbox/test-1",
 			existingBranches: []string{},
-			expected:       "devbox/test-1",
+			expected:         "devbox/test-1",
 		},
 		{
-			name:           "one collision",
-			baseName:       "devbox/test-2",
+			name:             "one collision",
+			baseName:         "devbox/test-2",
 			existingBranches: []string{"devbox/test-2"},
-			expected:       "devbox/test-2-2",
+			expected:         "devbox/test-2-2",
 		},
 		{
-			name:           "multiple collisions",
-			baseName:       "devbox/test-3",
+			name:             "multiple collisions",
+			baseName:         "devbox/test-3",
 			existingBranches: []string{"devbox/test-3", "devbox/test-3-2", "devbox/test-3-3"},
-			expected:       "devbox/test-3-4",
+			expected:         "devbox/test-3-4",
 		},
 	}
 
@@ -296,7 +296,7 @@ func TestRecreateWorktree_Success(t *testing.T) {
 	}
 
 	branchName := worktree.BranchName
-	
+
 	// Add a commit to the worktree
 	testFile := filepath.Join(worktree.Path, "test.txt")
 	if err := os.WriteFile(testFile, []byte("test content\n"), 0644); err != nil {
@@ -515,7 +515,7 @@ func TestCreateWorktree_UsesRemoteTip(t *testing.T) {
 
 	// The worktree should be at the new commit (remote tip), not the stale local main
 	if worktreeTip != newCommit {
-		t.Errorf("Worktree should be based on remote tip %s, but is at %s (stale local main: %s)", 
+		t.Errorf("Worktree should be based on remote tip %s, but is at %s (stale local main: %s)",
 			newCommit, worktreeTip, initialCommit)
 	}
 
@@ -604,6 +604,72 @@ func TestHasCommitsAheadOfBase(t *testing.T) {
 	}
 }
 
+func TestCommitAllCreatesFallbackCommit(t *testing.T) {
+	repoPath := setupTestRepo(t)
+	defer os.RemoveAll(repoPath)
+
+	mgr := NewManager(repoPath, "main")
+	worktree, err := mgr.CreateWorktree("TEST-FALLBACK-COMMIT")
+	if err != nil {
+		t.Fatalf("CreateWorktree failed: %v", err)
+	}
+	defer mgr.RemoveWorktree(worktree.Path)
+
+	hasChanges, err := mgr.HasUncommittedChanges(worktree.Path)
+	if err != nil {
+		t.Fatalf("HasUncommittedChanges failed: %v", err)
+	}
+	if hasChanges {
+		t.Fatal("fresh worktree unexpectedly contains changes")
+	}
+
+	if err := os.WriteFile(filepath.Join(worktree.Path, "generated.txt"), []byte("agent output\n"), 0644); err != nil {
+		t.Fatalf("failed to create generated file: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(worktree.Path, "README.md"), []byte("# Updated by agent\n"), 0644); err != nil {
+		t.Fatalf("failed to modify tracked file: %v", err)
+	}
+
+	hasChanges, err = mgr.HasUncommittedChanges(worktree.Path)
+	if err != nil {
+		t.Fatalf("HasUncommittedChanges failed: %v", err)
+	}
+	if !hasChanges {
+		t.Fatal("expected staged, unstaged, or untracked changes to be detected")
+	}
+
+	const message = "[TEST-123] Apply automated changes"
+	if err := mgr.CommitAll(worktree.Path, message); err != nil {
+		t.Fatalf("CommitAll failed: %v", err)
+	}
+
+	hasChanges, err = mgr.HasUncommittedChanges(worktree.Path)
+	if err != nil {
+		t.Fatalf("HasUncommittedChanges failed after commit: %v", err)
+	}
+	if hasChanges {
+		t.Fatal("worktree remained dirty after fallback commit")
+	}
+
+	hasCommits, err := mgr.HasCommitsAheadOfBase(worktree.Path)
+	if err != nil {
+		t.Fatalf("HasCommitsAheadOfBase failed: %v", err)
+	}
+	if !hasCommits {
+		t.Fatal("fallback commit is not ahead of the base branch")
+	}
+
+	cmd := exec.Command("git", "log", "-1", "--pretty=%s")
+	cmd.Dir = worktree.Path
+	output, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("failed to read fallback commit message: %v", err)
+	}
+	if got := strings.TrimSpace(string(output)); got != message {
+		t.Fatalf("fallback commit message = %q, want %q", got, message)
+	}
+}
+
 func TestExtractPRURLFromError(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -653,4 +719,3 @@ https://github.com/nicoalimin/tokoboss/pull/9`,
 		})
 	}
 }
-

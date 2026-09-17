@@ -37,7 +37,7 @@ func (m *Manager) CreateWorktree(identifier string) (*WorktreeInfo, error) {
 
 	// Generate base branch name (e.g., devbox/eng-123)
 	baseBranchName := fmt.Sprintf("devbox/%s", strings.ToLower(identifier))
-	
+
 	// Find a unique branch name by adding suffix if needed
 	branchName, err := m.findUniqueBranchName(baseBranchName)
 	if err != nil {
@@ -174,6 +174,44 @@ func (m *Manager) PushBranch(worktreePath, branchName string) error {
 	return nil
 }
 
+// HasUncommittedChanges reports whether a worktree contains staged, unstaged,
+// or untracked changes.
+func (m *Manager) HasUncommittedChanges(worktreePath string) (bool, error) {
+	cmd := exec.Command("git", "status", "--porcelain")
+	cmd.Dir = worktreePath
+	output, err := cmd.Output()
+	if err != nil {
+		return false, fmt.Errorf("failed to inspect worktree changes: %w", err)
+	}
+	return len(output) > 0, nil
+}
+
+// CommitAll commits every staged, unstaged, and untracked change in a
+// worktree. It is the delivery fallback when an agent edits files but does not
+// create the commit requested by the orchestrator.
+func (m *Manager) CommitAll(worktreePath, message string) error {
+	cmd := exec.Command("git", "add", "--all")
+	cmd.Dir = worktreePath
+	if output, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("failed to stage worktree changes: %w\nOutput: %s", err, string(output))
+	}
+
+	// Use a command-scoped identity so headless hosts do not depend on global Git
+	// configuration. This does not modify the repository's local config.
+	cmd = exec.Command(
+		"git",
+		"-c", "user.name=Devbox",
+		"-c", "user.email=devbox@localhost",
+		"commit", "-m", message,
+	)
+	cmd.Dir = worktreePath
+	if output, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("failed to commit worktree changes: %w\nOutput: %s", err, string(output))
+	}
+
+	return nil
+}
+
 // fetchBaseBranch fetches the latest changes for the base branch
 func (m *Manager) fetchBaseBranch() error {
 	cmd := exec.Command("git", "fetch", "origin", m.baseBranch)
@@ -207,13 +245,13 @@ func CreatePR(worktreePath, title, body, baseBranch string) (string, error) {
 			if prURL := extractPRURLFromError(outputStr); prURL != "" {
 				return prURL, nil
 			}
-			
+
 			// Fallback: use gh pr view to get existing PR URL
 			if prURL, viewErr := getExistingPRURL(worktreePath); viewErr == nil {
 				return prURL, nil
 			}
 		}
-		
+
 		return "", fmt.Errorf("failed to create PR: %w\nOutput: %s", err, string(output))
 	}
 
@@ -235,10 +273,10 @@ func extractPRURLFromError(output string) string {
 	// Example: "a pull request for branch ... already exists: https://github.com/owner/repo/pull/123"
 	lines := strings.Split(output, "\n")
 	foundAlreadyExists := false
-	
+
 	for _, line := range lines {
 		line = strings.TrimSpace(line)
-		
+
 		if strings.Contains(line, "already exists:") {
 			// Find URL after "already exists:"
 			parts := strings.SplitN(line, "already exists:", 2)
@@ -268,12 +306,12 @@ func getExistingPRURL(worktreePath string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("failed to get existing PR URL: %w", err)
 	}
-	
+
 	url := strings.TrimSpace(string(output))
 	if url == "" || !strings.HasPrefix(url, "http") {
 		return "", fmt.Errorf("invalid PR URL: %s", url)
 	}
-	
+
 	return url, nil
 }
 
@@ -298,7 +336,7 @@ func (m *Manager) HasCommitsAheadOfBase(worktreePath string) (bool, error) {
 		return false, fmt.Errorf("failed to get current branch: %w", err)
 	}
 	currentBranch := strings.TrimSpace(string(output))
-	
+
 	// Count commits ahead of base
 	rangeSpec := fmt.Sprintf("origin/%s..%s", m.baseBranch, currentBranch)
 	cmd = exec.Command("git", "rev-list", "--count", rangeSpec)
@@ -307,11 +345,11 @@ func (m *Manager) HasCommitsAheadOfBase(worktreePath string) (bool, error) {
 	if err != nil {
 		return false, fmt.Errorf("failed to count commits: %w", err)
 	}
-	
+
 	count := strings.TrimSpace(string(output))
 	if count == "" || count == "0" {
 		return false, nil
 	}
-	
+
 	return true, nil
 }

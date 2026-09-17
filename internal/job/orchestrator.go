@@ -39,13 +39,13 @@ const (
 // NewOrchestrator creates a new job orchestrator
 func NewOrchestrator(cfg *config.Config, database *db.DB) *Orchestrator {
 	oc := opencode.NewClient(cfg.OpenCode.BaseURL, cfg.OpenCode.Username, cfg.OpenCode.Password, cfg.OpenCode.Version)
-	
+
 	// Set up OpenCode telemetry logging (logs to server logs, not job logs)
 	oc.SetLogFunc(func(level, message string) {
 		// Log to standard logger for server logs
 		log.Printf("[OpenCode:%s] %s", level, message)
 	})
-	
+
 	return &Orchestrator{
 		cfg:             cfg,
 		db:              database,
@@ -288,7 +288,7 @@ func (o *Orchestrator) executeCoding(job *db.Job) error {
 	logFunc := func(msg string) {
 		o.log(job.ID, "info", msg)
 	}
-	
+
 	sessionID, err := o.waitForSessionWithHealing(job, "coding", logFunc)
 	if err != nil {
 		o.log(job.ID, "error", fmt.Sprintf("OpenCode session did not complete: %v", err))
@@ -344,7 +344,7 @@ If you find issues, fix them now. If everything looks good, confirm the changes 
 	logFunc := func(msg string) {
 		o.log(job.ID, "info", msg)
 	}
-	
+
 	sessionID, err := o.waitForSessionWithHealing(job, "reviewing", logFunc)
 	if err != nil {
 		return fmt.Errorf("OpenCode review timed out or failed: %w", err)
@@ -372,15 +372,31 @@ func (o *Orchestrator) pushBranch(job *db.Job) error {
 	o.log(job.ID, "info", "Verifying commits before push")
 
 	gitMgr := git.NewManager(job.RepoPath, o.cfg.GitHub.DefaultBaseBranch)
-	
+
+	// OpenCode occasionally edits the worktree successfully but exits without
+	// committing. Devbox owns the delivery contract, so turn those edits into a
+	// commit before checking whether the branch can be pushed.
+	hasChanges, err := gitMgr.HasUncommittedChanges(job.WorktreePath)
+	if err != nil {
+		return fmt.Errorf("failed to inspect worktree before push: %w", err)
+	}
+	if hasChanges {
+		o.log(job.ID, "warn", "OpenCode left uncommitted changes; creating fallback commit")
+		message := fmt.Sprintf("[%s] Apply automated changes", job.LinearIssueID)
+		if err := gitMgr.CommitAll(job.WorktreePath, message); err != nil {
+			return fmt.Errorf("failed to create fallback commit: %w", err)
+		}
+		o.log(job.ID, "info", "Created fallback commit from OpenCode worktree changes")
+	}
+
 	// Check if there are commits ahead of base
 	hasCommits, err := gitMgr.HasCommitsAheadOfBase(job.WorktreePath)
 	if err != nil {
 		return fmt.Errorf("failed to check for commits: %w", err)
 	}
-	
+
 	if !hasCommits {
-		return fmt.Errorf("no commits found on branch %s compared to base branch - OpenCode may have completed without making changes", job.BranchName)
+		return fmt.Errorf("no file changes or commits found on branch %s compared to base branch; there is nothing to push or open as a pull request", job.BranchName)
 	}
 
 	o.log(job.ID, "info", "Commits verified, pushing branch to remote")
@@ -481,9 +497,19 @@ func (o *Orchestrator) failJob(job *db.Job, reason string) {
 
 	o.log(job.ID, "error", fmt.Sprintf("Job failed: %s", reason))
 
-	// Clean up worktree if it exists
+	// Never force-remove uncommitted agent output. If delivery failed before the
+	// fallback commit could be created, preserve the worktree for recovery.
 	if job.WorktreePath != "" {
 		gitMgr := git.NewManager(job.RepoPath, o.cfg.GitHub.DefaultBaseBranch)
+		hasChanges, err := gitMgr.HasUncommittedChanges(job.WorktreePath)
+		if err != nil {
+			o.log(job.ID, "warn", fmt.Sprintf("Preserving failed worktree because its state could not be inspected: %v", err))
+			return
+		}
+		if hasChanges {
+			o.log(job.ID, "warn", fmt.Sprintf("Preserving failed worktree with uncommitted changes at %s", job.WorktreePath))
+			return
+		}
 		if err := gitMgr.RemoveWorktree(job.WorktreePath); err != nil {
 			o.log(job.ID, "warn", fmt.Sprintf("Failed to remove worktree: %v", err))
 		}
@@ -539,7 +565,7 @@ func (o *Orchestrator) log(jobID, level, message string) {
 		// Log to stderr if DB logging fails (will be captured by TUI if active)
 		fmt.Printf("[%s] %s: %s (failed to write to DB: %v)\n", jobID, level, message, err)
 	}
-	
+
 	// Also add to TUI log buffer if it exists (for live display)
 	// Format: [jobID] message
 	formattedMsg := fmt.Sprintf("[%s] %s", jobID, message)
@@ -830,23 +856,23 @@ func (o *Orchestrator) ReviewJob(jobIDOrLinearID, feedback string) error {
 	gitMgr := git.NewManager(job.RepoPath, o.cfg.GitHub.DefaultBaseBranch)
 	if _, err := os.Stat(job.WorktreePath); os.IsNotExist(err) {
 		o.log(job.ID, "info", "Worktree missing, recreating from existing branch")
-		
+
 		// Extract identifier from Linear issue ID for worktree path
 		issue, err := o.linear.GetIssue(job.LinearIssueID)
 		if err != nil {
 			return fmt.Errorf("failed to get Linear issue: %w", err)
 		}
-		
+
 		worktree, err := gitMgr.RecreateWorktree(issue.Identifier, job.BranchName)
 		if err != nil {
 			return fmt.Errorf("failed to recreate worktree: %w", err)
 		}
-		
+
 		job.WorktreePath = worktree.Path
 		if err := o.db.UpdateJob(job); err != nil {
 			return fmt.Errorf("failed to update job with worktree path: %w", err)
 		}
-		
+
 		o.log(job.ID, "info", fmt.Sprintf("Recreated worktree at %s", worktree.Path))
 	} else if job.WorktreePath == "" {
 		return fmt.Errorf("job has no worktree path and cannot recreate")
@@ -912,7 +938,7 @@ After making changes, confirm they are ready to push.`, feedback)
 	logFunc := func(msg string) {
 		o.log(job.ID, "info", msg)
 	}
-	
+
 	if err := o.opencode.WaitForSessionIdle(sessionID, o.cfg.OpenCode.Timeout, job.WorktreePath, logFunc); err != nil {
 		o.log(job.ID, "error", fmt.Sprintf("OpenCode session did not complete: %v", err))
 		return fmt.Errorf("OpenCode session timeout or error: %w", err)
@@ -971,30 +997,30 @@ After making changes, confirm they are ready to push.`, feedback)
 // Returns the final session ID (which may differ from job.OpenCodeSessionID if healing occurred).
 func (o *Orchestrator) waitForSessionWithHealing(job *db.Job, phase string, logFunc func(string)) (string, error) {
 	sessionID := job.OpenCodeSessionID
-	
+
 	// Determine wait timeout - use remaining time if resuming, else full budget
 	timeout := o.cfg.OpenCode.Timeout
 	var waitStartedAt *time.Time
-	
+
 	if phase == "coding" {
 		waitStartedAt = job.CodingWaitStartedAt
 	} else if phase == "reviewing" {
 		waitStartedAt = job.ReviewingWaitStartedAt
 	}
-	
+
 	// If wait was already in progress, calculate remaining time
 	if waitStartedAt != nil {
 		elapsed := time.Since(*waitStartedAt)
 		remaining := o.cfg.OpenCode.Timeout - elapsed
-		
+
 		if remaining <= 0 {
 			// Already exhausted - fail immediately
-			return sessionID, fmt.Errorf("wait timeout already exhausted: elapsed %v (started at %v)", 
+			return sessionID, fmt.Errorf("wait timeout already exhausted: elapsed %v (started at %v)",
 				elapsed, waitStartedAt.Format(time.RFC3339))
 		}
-		
+
 		timeout = remaining
-		o.log(job.ID, "info", fmt.Sprintf("Resuming %s wait: %v elapsed, %v remaining (budget: %v)", 
+		o.log(job.ID, "info", fmt.Sprintf("Resuming %s wait: %v elapsed, %v remaining (budget: %v)",
 			phase, elapsed.Round(time.Second), timeout.Round(time.Second), o.cfg.OpenCode.Timeout))
 	} else {
 		// First time waiting - persist start time
@@ -1010,11 +1036,11 @@ func (o *Orchestrator) waitForSessionWithHealing(job *db.Job, phase string, logF
 		}
 		o.log(job.ID, "info", fmt.Sprintf("Starting %s wait with %v timeout", phase, timeout))
 	}
-	
+
 	for {
 		// Try to wait for the session with remaining timeout
 		err := o.opencode.WaitForSessionIdle(sessionID, timeout, job.WorktreePath, logFunc)
-		
+
 		if err == nil {
 			// Success - session completed, clear wait start time
 			if phase == "coding" {
@@ -1027,46 +1053,46 @@ func (o *Orchestrator) waitForSessionWithHealing(job *db.Job, phase string, logF
 			}
 			return sessionID, nil
 		}
-		
+
 		// Check if this looks like a dead/missing session error
 		errMsg := err.Error()
 		isDeadSession := strings.Contains(errMsg, "never appeared in active map") ||
 			strings.Contains(errMsg, "session") && strings.Contains(errMsg, "not found") ||
 			strings.Contains(errMsg, "404")
-		
+
 		if !isDeadSession {
 			// Not a dead session error - could be timeout or other issue
 			// Return the error as-is (keep wait start time for potential future resume)
 			return sessionID, err
 		}
-		
+
 		// Dead session detected - attempt to heal
 		o.log(job.ID, "warn", fmt.Sprintf("Detected dead/missing OpenCode session %s", sessionID))
-		
+
 		// Check healing attempt limit
 		attemptKey := fmt.Sprintf("%s-%s", job.ID, phase)
 		attempts := o.healingAttempts[attemptKey]
-		
+
 		if attempts >= maxHealingAttempts {
 			o.log(job.ID, "error", fmt.Sprintf("Max healing attempts (%d) reached for phase %s", maxHealingAttempts, phase))
 			return sessionID, fmt.Errorf("session healing failed after %d attempts: %w", maxHealingAttempts, err)
 		}
-		
+
 		// Increment healing attempts
 		o.healingAttempts[attemptKey]++
 		o.log(job.ID, "info", fmt.Sprintf("Attempting session healing (attempt %d/%d)", o.healingAttempts[attemptKey], maxHealingAttempts))
-		
+
 		// Heal the session
 		newSessionID, healErr := o.healSession(job, phase)
 		if healErr != nil {
 			o.log(job.ID, "error", fmt.Sprintf("Session healing failed: %v", healErr))
 			return sessionID, fmt.Errorf("failed to heal session: %w", healErr)
 		}
-		
+
 		// Update to new session ID and retry wait
 		sessionID = newSessionID
 		o.log(job.ID, "info", fmt.Sprintf("Session healed successfully, new session ID: %s", sessionID))
-		
+
 		// Recalculate remaining timeout before retry
 		if waitStartedAt != nil {
 			elapsed := time.Since(*waitStartedAt)
@@ -1075,7 +1101,7 @@ func (o *Orchestrator) waitForSessionWithHealing(job *db.Job, phase string, logF
 				return sessionID, fmt.Errorf("wait timeout exhausted during healing: elapsed %v", elapsed)
 			}
 		}
-		
+
 		// Continue loop to wait on new session
 	}
 }
@@ -1089,16 +1115,16 @@ func (o *Orchestrator) healSession(job *db.Job, phase string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("failed to fetch Linear issue: %w", err)
 	}
-	
+
 	// Create new session
 	sessionName := fmt.Sprintf("%s: %s (healed)", issue.Identifier, issue.Title)
 	session, err := o.opencode.CreateSession(sessionName, job.WorktreePath)
 	if err != nil {
 		return "", fmt.Errorf("failed to create new session: %w", err)
 	}
-	
+
 	o.log(job.ID, "info", fmt.Sprintf("Created new OpenCode session: %s", session.ID))
-	
+
 	// Build and send appropriate prompt based on phase
 	var prompt string
 	if phase == "coding" {
@@ -1120,21 +1146,21 @@ If you find issues, fix them now. If everything looks good, confirm the changes 
 	} else {
 		return "", fmt.Errorf("unknown phase: %s", phase)
 	}
-	
+
 	// Send prompt to new session
 	if err := o.opencode.SendMessage(session.ID, prompt, job.WorktreePath); err != nil {
 		return "", fmt.Errorf("failed to send prompt to new session: %w", err)
 	}
-	
+
 	o.log(job.ID, "info", fmt.Sprintf("Re-sent %s prompt to new session", phase))
-	
+
 	// Update job with new session ID
 	job.OpenCodeSessionID = session.ID
 	if err := o.db.UpdateJob(job); err != nil {
 		o.log(job.ID, "warn", fmt.Sprintf("Failed to update job with new session ID: %v", err))
 		// Continue anyway - session is created and prompt is sent
 	}
-	
+
 	return session.ID, nil
 }
 

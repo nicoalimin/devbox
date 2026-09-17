@@ -3,6 +3,8 @@ package job
 import (
 	"fmt"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -10,6 +12,72 @@ import (
 	"github.com/nicoalimin/devbox/internal/config"
 	"github.com/nicoalimin/devbox/internal/db"
 )
+
+func TestFailJobPreservesDirtyWorktree(t *testing.T) {
+	repoPath := t.TempDir()
+	for _, args := range [][]string{
+		{"init"},
+		{"config", "user.name", "Test User"},
+		{"config", "user.email", "test@example.com"},
+	} {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = repoPath
+		if output, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v failed: %v\n%s", args, err, output)
+		}
+	}
+
+	readme := filepath.Join(repoPath, "README.md")
+	if err := os.WriteFile(readme, []byte("initial\n"), 0644); err != nil {
+		t.Fatalf("failed to create initial file: %v", err)
+	}
+	for _, args := range [][]string{{"add", "README.md"}, {"commit", "-m", "initial"}} {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = repoPath
+		if output, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v failed: %v\n%s", args, err, output)
+		}
+	}
+
+	dirtyFile := filepath.Join(repoPath, "agent-output.txt")
+	if err := os.WriteFile(dirtyFile, []byte("valuable uncommitted work\n"), 0644); err != nil {
+		t.Fatalf("failed to create dirty file: %v", err)
+	}
+
+	database, err := db.Open(filepath.Join(t.TempDir(), "jobs.db"))
+	if err != nil {
+		t.Fatalf("failed to open database: %v", err)
+	}
+	defer database.Close()
+
+	job := &db.Job{
+		ID:            "job-preserve-dirty",
+		LinearIssueID: "TEST-123",
+		State:         db.StatePushing,
+		RepoPath:      repoPath,
+		WorktreePath:  repoPath,
+		BranchName:    "devbox/test-123",
+		CreatedAt:     time.Now(),
+		UpdatedAt:     time.Now(),
+	}
+	if err := database.CreateJob(job); err != nil {
+		t.Fatalf("failed to create job: %v", err)
+	}
+
+	orch := NewOrchestrator(&config.Config{GitHub: config.GitHubConfig{DefaultBaseBranch: "main"}}, database)
+	orch.failJob(job, "delivery failed")
+
+	if _, err := os.Stat(dirtyFile); err != nil {
+		t.Fatalf("dirty worktree output was removed: %v", err)
+	}
+	updated, err := database.GetJob(job.ID)
+	if err != nil {
+		t.Fatalf("failed to reload job: %v", err)
+	}
+	if updated.State != db.StateFailed {
+		t.Fatalf("job state = %s, want failed", updated.State)
+	}
+}
 
 func TestSingleFlightEnforcement(t *testing.T) {
 	// Setup
@@ -186,13 +254,13 @@ func TestReplyToJob(t *testing.T) {
 
 	// Create a blocked job
 	job := &db.Job{
-		ID:               "job-1",
-		LinearIssueID:    "ENG-123",
-		State:            db.StateBlocked,
-		BlockerReason:    "Need clarification on button color",
+		ID:                "job-1",
+		LinearIssueID:     "ENG-123",
+		State:             db.StateBlocked,
+		BlockerReason:     "Need clarification on button color",
 		OpenCodeSessionID: "session-123",
-		CreatedAt:        time.Now(),
-		UpdatedAt:        time.Now(),
+		CreatedAt:         time.Now(),
+		UpdatedAt:         time.Now(),
 	}
 	if err := database.CreateJob(job); err != nil {
 		t.Fatalf("Failed to create job: %v", err)
@@ -425,7 +493,7 @@ func TestResumeInFlightJobs_HandlesInFlightJobs(t *testing.T) {
 
 	// Verify jobs were marked as active (they should be processing)
 	// Note: They will fail quickly due to missing session IDs, but should have been attempted
-	
+
 	// Check that jobs transitioned to failed state due to missing session ID
 	codingJobAfter, err := database.GetJob("job-coding")
 	if err != nil {
@@ -833,13 +901,13 @@ func TestCodingTimeoutFailsJob(t *testing.T) {
 		defer func() { done <- true }()
 		orch.markJobActive(job.ID)
 		defer orch.markJobInactive(job.ID)
-		
+
 		// This should fail and mark the job as failed
 		err := orch.resumeCoding(job)
 		if err == nil {
 			t.Error("Expected resumeCoding to return error for timed-out/missing session")
 		}
-		
+
 		// The error should propagate and cause failJob to be called by the caller
 		// In the real workflow, this happens in resumeJobFromState
 		if err != nil {
@@ -1187,4 +1255,3 @@ func TestWaitTimeoutPersistence_ClearOnSuccess(t *testing.T) {
 	//   }
 	// This test verifies the structure exists
 }
-
