@@ -686,9 +686,13 @@ func TestWaitForSessionIdleV2ImmediatelyActive(t *testing.T) {
 func TestWaitForSessionIdleV2UsesWaitEndpoint(t *testing.T) {
 	var activePolls int
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
+		if r.Method == http.MethodGet {
 			activePolls++
-			t.Errorf("expected POST, got %s", r.Method)
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(V2ActiveSessionsResponse{Data: map[string]SessionActive{
+				"ses_test": {ID: "ses_test", Status: "active"},
+			}})
+			return
 		}
 		if r.URL.Path != "/api/session/ses_test/wait" {
 			t.Errorf("expected v2 wait path, got %s", r.URL.Path)
@@ -709,16 +713,46 @@ func TestWaitForSessionIdleV2UsesWaitEndpoint(t *testing.T) {
 	if err != nil {
 		t.Fatalf("expected success, got %v", err)
 	}
-	if activePolls != 0 {
-		t.Fatalf("expected no active-session polling, got %d polls", activePolls)
+	if activePolls == 0 {
+		t.Fatal("expected the active-session guard before the wait request")
 	}
-	if len(logs) != 2 || !contains(logs[0], "v2 wait endpoint") || !contains(logs[1], "completed") {
+	if len(logs) != 4 || !contains(logs[0], "to start") || !contains(logs[1], "now active") || !contains(logs[2], "v2 wait endpoint") || !contains(logs[3], "completed") {
 		t.Fatalf("unexpected wait logs: %v", logs)
+	}
+}
+
+func TestWaitForSessionIdleV2DoesNotAcceptPreExecutionIdle(t *testing.T) {
+	var waitRequests int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			waitRequests++
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(V2ActiveSessionsResponse{Data: map[string]SessionActive{}})
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL, "", "", "v2")
+	err := client.WaitForSessionIdle("ses_test", 150*time.Millisecond, "", nil)
+	if err == nil || !contains(err.Error(), "never appeared in active map") {
+		t.Fatalf("expected an inactive prompt to fail instead of completing, got %v", err)
+	}
+	if waitRequests != 0 {
+		t.Fatalf("wait endpoint was called %d times before prompt execution started", waitRequests)
 	}
 }
 
 func TestWaitForSessionIdleV2WaitEndpointTimeout(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(V2ActiveSessionsResponse{Data: map[string]SessionActive{
+				"ses_test": {ID: "ses_test", Status: "active"},
+			}})
+			return
+		}
 		<-r.Context().Done()
 	}))
 	defer server.Close()
@@ -738,6 +772,13 @@ func TestWaitForSessionIdleV2WaitEndpointTimeout(t *testing.T) {
 
 func TestWaitForSessionIdleV2WaitEndpointError(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(V2ActiveSessionsResponse{Data: map[string]SessionActive{
+				"ses_missing": {ID: "ses_missing", Status: "active"},
+			}})
+			return
+		}
 		http.Error(w, `{"error":"session missing"}`, http.StatusNotFound)
 	}))
 	defer server.Close()
@@ -758,6 +799,13 @@ func TestWaitForSessionIdleV2RetriesTransientGatewayErrors(t *testing.T) {
 		t.Run(http.StatusText(statusCode), func(t *testing.T) {
 			requestCount := 0
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method == http.MethodGet {
+					w.Header().Set("Content-Type", "application/json")
+					json.NewEncoder(w).Encode(V2ActiveSessionsResponse{Data: map[string]SessionActive{
+						"ses_test": {ID: "ses_test", Status: "active"},
+					}})
+					return
+				}
 				requestCount++
 				if requestCount == 1 {
 					http.Error(w, `{"message":"temporary gateway failure","service":"proxy"}`, statusCode)
@@ -781,6 +829,13 @@ func TestWaitForSessionIdleV2RetriesTransientGatewayErrors(t *testing.T) {
 func TestWaitForSessionIdleV2RetriesTransportFailure(t *testing.T) {
 	requestCount := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(V2ActiveSessionsResponse{Data: map[string]SessionActive{
+				"ses_test": {ID: "ses_test", Status: "active"},
+			}})
+			return
+		}
 		requestCount++
 		if requestCount == 1 {
 			hijacker, ok := w.(http.Hijacker)
@@ -815,7 +870,10 @@ func TestWaitForSessionIdleV2FallbackPreservesTimeoutBudget(t *testing.T) {
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(V2ActiveSessionsResponse{Data: map[string]SessionActive{}})
+		active := map[string]SessionActive{
+			"ses_test": {ID: "ses_test", Status: "active"},
+		}
+		json.NewEncoder(w).Encode(V2ActiveSessionsResponse{Data: active})
 	}))
 	defer server.Close()
 

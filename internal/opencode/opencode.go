@@ -332,12 +332,24 @@ func (c *Client) isSessionBusyClassic(sessionID string) (bool, error) {
 // logFunc is called periodically with status updates (can be nil)
 func (c *Client) WaitForSessionIdle(sessionID string, timeout time.Duration, directory string, logFunc func(string)) error {
 	if c.version == "v2" {
-		waitStarted := time.Now()
+		deadline := time.Now().Add(timeout)
+		// A prompt is admitted before its execution is registered as active. Calling
+		// the wait endpoint in that gap can return 204 for the session's previous
+		// idle state, even though the newly admitted prompt has not run yet. Observe
+		// this execution become active before trusting the wait endpoint.
+		if err := c.waitForSessionActiveV2(sessionID, timeout, directory, logFunc); err != nil {
+			return err
+		}
+		timeout = time.Until(deadline)
+		if timeout <= 0 {
+			return fmt.Errorf("timeout waiting for session %s after it became active", sessionID)
+		}
+
 		supported, err := c.waitForSessionIdleV2(sessionID, timeout, logFunc)
 		if supported {
 			return err
 		}
-		timeout -= time.Since(waitStarted)
+		timeout = time.Until(deadline)
 		if timeout <= 0 {
 			return fmt.Errorf("timeout waiting for session %s after v2 wait endpoint fallback", sessionID)
 		}
@@ -346,7 +358,55 @@ func (c *Client) WaitForSessionIdle(sessionID string, timeout time.Duration, dir
 		}
 	}
 
-	return c.waitForSessionIdleByPolling(sessionID, timeout, directory, logFunc)
+	return c.waitForSessionIdleByPolling(sessionID, timeout, directory, logFunc, c.version == "v2")
+}
+
+// waitForSessionActiveV2 closes the admission-to-execution race in OpenCode's
+// v2 API. A successful prompt request means the prompt was admitted, not that
+// its asynchronous runner is already visible to /api/session/active.
+func (c *Client) waitForSessionActiveV2(sessionID string, timeout time.Duration, directory string, logFunc func(string)) error {
+	start := time.Now()
+	warmup := 30 * time.Second
+	if timeout < warmup {
+		warmup = timeout
+	}
+	deadline := start.Add(warmup)
+	pollInterval := 50 * time.Millisecond
+	lastLog := start
+
+	if logFunc != nil {
+		logFunc(fmt.Sprintf("Waiting for OpenCode session %s to start", sessionID))
+	}
+
+	for time.Now().Before(deadline) {
+		busy, err := c.IsSessionBusy(sessionID, directory)
+		if err == nil && busy {
+			if logFunc != nil {
+				logFunc(fmt.Sprintf("OpenCode session %s is now active", sessionID))
+			}
+			return nil
+		}
+
+		if logFunc != nil && time.Since(lastLog) >= 10*time.Second {
+			if err != nil {
+				logFunc(fmt.Sprintf("Warning: failed to check whether session started: %v", err))
+			} else {
+				logFunc(fmt.Sprintf("Still waiting for OpenCode session %s to start (elapsed: %v)", sessionID, time.Since(start).Round(time.Second)))
+			}
+			lastLog = time.Now()
+		}
+
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			break
+		}
+		if pollInterval > remaining {
+			pollInterval = remaining
+		}
+		time.Sleep(pollInterval)
+	}
+
+	return fmt.Errorf("session %s never appeared in active map within %v after prompt admission; refusing to treat the session as completed", sessionID, warmup)
 }
 
 // waitForSessionIdleV2 uses the authoritative wait operation added to the
@@ -479,7 +539,7 @@ func sleepWithContext(ctx context.Context, duration time.Duration) bool {
 
 // waitForSessionIdleByPolling retains compatibility with classic OpenCode and
 // OpenCode2 beta servers that do not implement the v2 wait operation.
-func (c *Client) waitForSessionIdleByPolling(sessionID string, timeout time.Duration, directory string, logFunc func(string)) error {
+func (c *Client) waitForSessionIdleByPolling(sessionID string, timeout time.Duration, directory string, logFunc func(string), sawActiveInitially bool) error {
 	start := time.Now()
 	deadline := start.Add(timeout)
 	pollInterval := 5 * time.Second
@@ -491,7 +551,7 @@ func (c *Client) waitForSessionIdleByPolling(sessionID string, timeout time.Dura
 	// Phase 1: Wait for session to become active (race condition protection)
 	// For v2: after sending prompt, OpenCode may take a moment to start processing
 	// Don't treat "not in active map" as idle until we've seen it become active at least once
-	sawActive := false
+	sawActive := sawActiveInitially
 	warmupDeadline := start.Add(30 * time.Second) // Give it 30s to start
 	warmupLogTimer := time.Now()                  // Separate timer for warmup phase logging
 
