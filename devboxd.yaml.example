@@ -18,7 +18,8 @@ linear:
 opencode:
   version: v2
   base_url: "http://127.0.0.1:3000"       # or set OPENCODE_BASE_URL env var
-  timeout: "30m"                          # Mark blocked after this timeout
+  timeout: "30m"                          # Coding session timeout
+  review_timeout: "15m"                   # Interrupt a stuck review, then validate/deliver safely
   
   # HTTP Basic Authentication for OpenCode 2.0.3+ (when OPENCODE_SERVER_PASSWORD is set)
   # username: "opencode"                  # or set DEVBOXD_OPENCODE_USERNAME / OPENCODE_SERVER_USERNAME env var
@@ -38,6 +39,10 @@ repos:
     repo:
       path: "/path/to/your/backend"
       base_branch: "main"
+      # Omit to auto-detect common Go and Node CI checks. Set [] to disable.
+      validation_commands:
+        - "go test ./..."
+        - "go vet ./..."
   
   - match:
       project: "Frontend Redesign"

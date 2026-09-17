@@ -6,6 +6,7 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -17,6 +18,7 @@ import (
 	"github.com/nicoalimin/devbox/internal/git"
 	"github.com/nicoalimin/devbox/internal/linear"
 	"github.com/nicoalimin/devbox/internal/opencode"
+	"github.com/nicoalimin/devbox/internal/validation"
 )
 
 // Orchestrator manages job lifecycle
@@ -34,6 +36,8 @@ type Orchestrator struct {
 
 const (
 	maxHealingAttempts = 2 // Max number of session recreate attempts per phase
+	maxReviewWait      = 15 * time.Minute
+	commitRecoveryWait = 10 * time.Minute
 )
 
 // NewOrchestrator creates a new job orchestrator
@@ -325,7 +329,7 @@ func (o *Orchestrator) reviewCode(job *db.Job) error {
 4. Confirm the implementation matches requirements
 5. **TUI changes (internal/tui/)**: Verify the dashboard fits entirely in one terminal screen with no overflow or clipped header/footer. Left column height (jobs + errors + integrations) must equal right column height (server logs + job logs).
 
-If you find issues, fix them now. If everything looks good, confirm the changes are ready.`
+If you find issues, fix them now. Run the relevant checks and commit all completed changes with a concise, contextual commit message. Do not merely confirm readiness: leave the worktree clean and committed.`
 
 	if err := o.opencode.SendMessage(job.OpenCodeSessionID, reviewPrompt, job.WorktreePath); err != nil {
 		return err
@@ -347,7 +351,7 @@ If you find issues, fix them now. If everything looks good, confirm the changes 
 
 	sessionID, err := o.waitForSessionWithHealing(job, "reviewing", logFunc)
 	if err != nil {
-		return fmt.Errorf("OpenCode review timed out or failed: %w", err)
+		return o.recoverFromReviewWaitFailure(job, err)
 	}
 
 	// Update job with final session ID (in case it was healed)
@@ -362,6 +366,20 @@ If you find issues, fix them now. If everything looks good, confirm the changes 
 	return nil
 }
 
+func (o *Orchestrator) recoverFromReviewWaitFailure(job *db.Job, waitErr error) error {
+	o.log(job.ID, "warn", fmt.Sprintf("OpenCode review did not finish cleanly; interrupting it before delivery recovery: %v", waitErr))
+	if interruptErr := o.opencode.InterruptSession(job.OpenCodeSessionID); interruptErr != nil {
+		return fmt.Errorf("OpenCode review failed (%v) and could not be interrupted safely: %w", waitErr, interruptErr)
+	}
+
+	job.ReviewingWaitStartedAt = nil
+	if err := o.db.UpdateJob(job); err != nil {
+		o.log(job.ID, "warn", fmt.Sprintf("Failed to clear review wait timestamp after interruption: %v", err))
+	}
+	o.log(job.ID, "warn", "OpenCode review was interrupted; continuing with local validation and delivery recovery")
+	return nil
+}
+
 // pushBranch pushes the branch to the remote
 func (o *Orchestrator) pushBranch(job *db.Job) error {
 	job.State = db.StatePushing
@@ -369,24 +387,56 @@ func (o *Orchestrator) pushBranch(job *db.Job) error {
 		return err
 	}
 
-	o.log(job.ID, "info", "Verifying commits before push")
+	o.log(job.ID, "info", "Preparing validated commits before push")
 
 	gitMgr := git.NewManager(job.RepoPath, o.cfg.GitHub.DefaultBaseBranch)
 
-	// OpenCode occasionally edits the worktree successfully but exits without
-	// committing. Devbox owns the delivery contract, so turn those edits into a
-	// commit before checking whether the branch can be pushed.
+	// Give OpenCode the first opportunity to inspect its diff, run checks, and
+	// create a contextual commit. A local generic commit is strictly last resort.
 	hasChanges, err := gitMgr.HasUncommittedChanges(job.WorktreePath)
 	if err != nil {
 		return fmt.Errorf("failed to inspect worktree before push: %w", err)
 	}
 	if hasChanges {
-		o.log(job.ID, "warn", "OpenCode left uncommitted changes; creating fallback commit")
+		o.log(job.ID, "warn", "OpenCode left uncommitted changes; asking it to validate and create a contextual commit")
+		prompt := `Devbox detected uncommitted work in this repository. Inspect git status and the complete diff, run the repository's relevant CI-equivalent checks locally, fix any failures caused by the changes, and commit all completed work. Use a concise, contextual commit message that describes the actual ticket implementation. Do not merely explain what should be committed; leave the worktree clean with the commit created.`
+		if sendErr := o.opencode.SendMessage(job.OpenCodeSessionID, prompt, job.WorktreePath); sendErr != nil {
+			o.log(job.ID, "warn", fmt.Sprintf("Could not ask OpenCode to commit; local fallback may be required: %v", sendErr))
+		} else {
+			wait := commitRecoveryWait
+			if o.cfg.OpenCode.Timeout > 0 && o.cfg.OpenCode.Timeout < wait {
+				wait = o.cfg.OpenCode.Timeout
+			}
+			waitErr := o.opencode.WaitForSessionIdle(job.OpenCodeSessionID, wait, job.WorktreePath, func(msg string) {
+				o.log(job.ID, "info", msg)
+			})
+			if waitErr != nil {
+				o.log(job.ID, "warn", fmt.Sprintf("OpenCode commit recovery did not finish: %v", waitErr))
+				if interruptErr := o.opencode.InterruptSession(job.OpenCodeSessionID); interruptErr != nil {
+					return fmt.Errorf("OpenCode commit recovery failed (%v) and could not be interrupted safely: %w", waitErr, interruptErr)
+				}
+			}
+		}
+	}
+
+	o.log(job.ID, "info", "Running local CI-equivalent validation before push")
+	if err := validation.Run(job.WorktreePath, o.validationCommands(job), func(msg string) {
+		o.log(job.ID, "info", msg)
+	}); err != nil {
+		return err
+	}
+
+	hasChanges, err = gitMgr.HasUncommittedChanges(job.WorktreePath)
+	if err != nil {
+		return fmt.Errorf("failed to inspect worktree after validation: %w", err)
+	}
+	if hasChanges {
+		o.log(job.ID, "warn", "OpenCode still left uncommitted changes; creating last-resort commit with the current Git identity")
 		message := fmt.Sprintf("[%s] Apply automated changes", job.LinearIssueID)
 		if err := gitMgr.CommitAll(job.WorktreePath, message); err != nil {
-			return fmt.Errorf("failed to create fallback commit: %w", err)
+			return fmt.Errorf("failed to create last-resort commit using current Git configuration: %w", err)
 		}
-		o.log(job.ID, "info", "Created fallback commit from OpenCode worktree changes")
+		o.log(job.ID, "info", "Created last-resort commit after OpenCode recovery and local validation")
 	}
 
 	// Check if there are commits ahead of base
@@ -406,6 +456,18 @@ func (o *Orchestrator) pushBranch(job *db.Job) error {
 	}
 
 	o.log(job.ID, "info", "Branch pushed successfully")
+	return nil
+}
+
+// validationCommands returns the per-repository override. A nil slice enables
+// automatic detection; an explicitly empty slice disables local validation.
+func (o *Orchestrator) validationCommands(job *db.Job) []string {
+	jobRepo := filepath.Clean(job.RepoPath)
+	for _, candidate := range o.cfg.Repos {
+		if filepath.Clean(candidate.Repo.Path) == jobRepo {
+			return candidate.Repo.ValidationCommands
+		}
+	}
 	return nil
 }
 
@@ -738,7 +800,7 @@ func (o *Orchestrator) resumeReviewing(job *db.Job) error {
 
 	sessionID, err := o.waitForSessionWithHealing(job, "reviewing", logFunc)
 	if err != nil {
-		return fmt.Errorf("OpenCode review timed out or failed: %w", err)
+		return o.recoverFromReviewWaitFailure(job, err)
 	}
 
 	// Update job with final session ID (in case it was healed)
@@ -999,7 +1061,17 @@ func (o *Orchestrator) waitForSessionWithHealing(job *db.Job, phase string, logF
 	sessionID := job.OpenCodeSessionID
 
 	// Determine wait timeout - use remaining time if resuming, else full budget
-	timeout := o.cfg.OpenCode.Timeout
+	waitBudget := o.cfg.OpenCode.Timeout
+	if phase == "reviewing" {
+		if o.cfg.OpenCode.ReviewTimeout > 0 {
+			waitBudget = o.cfg.OpenCode.ReviewTimeout
+		} else if waitBudget <= 0 || waitBudget > maxReviewWait {
+			// Older programmatic configs do not populate ReviewTimeout. Keep
+			// their shorter test budgets, otherwise use the safe default.
+			waitBudget = maxReviewWait
+		}
+	}
+	timeout := waitBudget
 	var waitStartedAt *time.Time
 
 	if phase == "coding" {
@@ -1011,7 +1083,7 @@ func (o *Orchestrator) waitForSessionWithHealing(job *db.Job, phase string, logF
 	// If wait was already in progress, calculate remaining time
 	if waitStartedAt != nil {
 		elapsed := time.Since(*waitStartedAt)
-		remaining := o.cfg.OpenCode.Timeout - elapsed
+		remaining := waitBudget - elapsed
 
 		if remaining <= 0 {
 			// Already exhausted - fail immediately
@@ -1021,7 +1093,7 @@ func (o *Orchestrator) waitForSessionWithHealing(job *db.Job, phase string, logF
 
 		timeout = remaining
 		o.log(job.ID, "info", fmt.Sprintf("Resuming %s wait: %v elapsed, %v remaining (budget: %v)",
-			phase, elapsed.Round(time.Second), timeout.Round(time.Second), o.cfg.OpenCode.Timeout))
+			phase, elapsed.Round(time.Second), timeout.Round(time.Second), waitBudget))
 	} else {
 		// First time waiting - persist start time
 		now := time.Now()
@@ -1096,7 +1168,7 @@ func (o *Orchestrator) waitForSessionWithHealing(job *db.Job, phase string, logF
 		// Recalculate remaining timeout before retry
 		if waitStartedAt != nil {
 			elapsed := time.Since(*waitStartedAt)
-			timeout = o.cfg.OpenCode.Timeout - elapsed
+			timeout = waitBudget - elapsed
 			if timeout <= 0 {
 				return sessionID, fmt.Errorf("wait timeout exhausted during healing: elapsed %v", elapsed)
 			}
@@ -1142,7 +1214,7 @@ func (o *Orchestrator) healSession(job *db.Job, phase string) (string, error) {
 4. Confirm the implementation matches requirements
 5. **TUI changes (internal/tui/)**: Verify the dashboard fits entirely in one terminal screen with no overflow or clipped header/footer. Left column height (jobs + errors + integrations) must equal right column height (server logs + job logs).
 
-If you find issues, fix them now. If everything looks good, confirm the changes are ready.`
+If you find issues, fix them now. Run the relevant checks and commit all completed changes with a concise, contextual commit message. Do not merely confirm readiness: leave the worktree clean and committed.`
 	} else {
 		return "", fmt.Errorf("unknown phase: %s", phase)
 	}

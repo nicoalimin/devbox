@@ -196,14 +196,9 @@ func (m *Manager) CommitAll(worktreePath, message string) error {
 		return fmt.Errorf("failed to stage worktree changes: %w\nOutput: %s", err, string(output))
 	}
 
-	// Use a command-scoped identity so headless hosts do not depend on global Git
-	// configuration. This does not modify the repository's local config.
-	cmd = exec.Command(
-		"git",
-		"-c", "user.name=Devbox",
-		"-c", "user.email=devbox@localhost",
-		"commit", "-m", message,
-	)
+	// Deliberately use the repository/user Git configuration. A fallback commit
+	// should have the same identity as a normal commit made in this checkout.
+	cmd = exec.Command("git", "commit", "-m", message)
 	cmd.Dir = worktreePath
 	if output, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("failed to commit worktree changes: %w\nOutput: %s", err, string(output))

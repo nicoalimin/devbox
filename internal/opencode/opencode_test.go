@@ -275,6 +275,35 @@ func TestSendMessageV2(t *testing.T) {
 	}
 }
 
+func TestInterruptSessionV2(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Errorf("method = %s, want POST", r.Method)
+		}
+		if r.URL.EscapedPath() != "/api/session/session%2F123/interrupt" {
+			t.Errorf("path = %s, want escaped interrupt path", r.URL.EscapedPath())
+		}
+		username, password, ok := r.BasicAuth()
+		if !ok || username != "test-user" || password != "test-pass" {
+			t.Errorf("basic auth = %q/%q/%v", username, password, ok)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL, "test-user", "test-pass", "v2")
+	if err := client.InterruptSession("session/123"); err != nil {
+		t.Fatalf("InterruptSession failed: %v", err)
+	}
+}
+
+func TestInterruptSessionRejectsClassic(t *testing.T) {
+	client := NewClient("http://unused", "", "", "classic")
+	if err := client.InterruptSession("session-123"); err == nil {
+		t.Fatal("expected classic interrupt to be rejected")
+	}
+}
+
 func TestCreateSessionWithBasicAuth(t *testing.T) {
 	username := "testuser"
 	password := "testpass"

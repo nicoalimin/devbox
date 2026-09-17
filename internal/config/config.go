@@ -41,11 +41,12 @@ type LinearConfig struct {
 
 // OpenCodeConfig defines OpenCode integration settings
 type OpenCodeConfig struct {
-	BaseURL  string        `yaml:"base_url"`
-	Version  string        `yaml:"version"`  // "v2" or "classic" (default: v2)
-	Username string        `yaml:"username"` // Optional
-	Password string        `yaml:"password"` // Optional
-	Timeout  time.Duration `yaml:"timeout"`  // Session timeout before marking blocked
+	BaseURL       string        `yaml:"base_url"`
+	Version       string        `yaml:"version"`        // "v2" or "classic" (default: v2)
+	Username      string        `yaml:"username"`       // Optional
+	Password      string        `yaml:"password"`       // Optional
+	Timeout       time.Duration `yaml:"timeout"`        // Coding session timeout
+	ReviewTimeout time.Duration `yaml:"review_timeout"` // Review timeout before safe delivery recovery
 }
 
 // GitHubConfig defines GitHub integration settings (uses gh CLI)
@@ -68,8 +69,9 @@ type RepoMatch struct {
 
 // RepoInfo defines repository details
 type RepoInfo struct {
-	Path       string `yaml:"path"`
-	BaseBranch string `yaml:"base_branch"`
+	Path               string   `yaml:"path"`
+	BaseBranch         string   `yaml:"base_branch"`
+	ValidationCommands []string `yaml:"validation_commands"`
 }
 
 // QueueConfig defines job queue settings
@@ -161,6 +163,9 @@ func LoadConfig(path string) (*Config, error) {
 	}
 	if cfg.OpenCode.Timeout == 0 {
 		cfg.OpenCode.Timeout = 30 * time.Minute
+	}
+	if cfg.OpenCode.ReviewTimeout == 0 {
+		cfg.OpenCode.ReviewTimeout = 15 * time.Minute
 	}
 	if cfg.GitHub.DefaultBaseBranch == "" {
 		cfg.GitHub.DefaultBaseBranch = "main"

@@ -668,6 +668,16 @@ func TestCommitAllCreatesFallbackCommit(t *testing.T) {
 	if got := strings.TrimSpace(string(output)); got != message {
 		t.Fatalf("fallback commit message = %q, want %q", got, message)
 	}
+
+	cmd = exec.Command("git", "log", "-1", "--pretty=%an <%ae>")
+	cmd.Dir = worktree.Path
+	output, err = cmd.Output()
+	if err != nil {
+		t.Fatalf("failed to read fallback commit author: %v", err)
+	}
+	if got := strings.TrimSpace(string(output)); got != "Test User <test@example.com>" {
+		t.Fatalf("fallback commit author = %q, want repository Git identity", got)
+	}
 }
 
 func TestExtractPRURLFromError(t *testing.T) {

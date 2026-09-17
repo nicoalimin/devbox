@@ -231,7 +231,8 @@ linear:
 
 opencode:
   base_url: "http://127.0.0.1:3000"
-  timeout: "30m"                          # Mark blocked after this timeout
+  timeout: "30m"                          # Coding session timeout
+  review_timeout: "15m"                   # Interrupt a stuck review, then validate/deliver safely
 
   # HTTP Basic Authentication (OpenCode 2.0.3+)
   # When OpenCode server is started with OPENCODE_SERVER_PASSWORD set,
@@ -249,6 +250,10 @@ repos:
     repo:
       path: "/home/dev/my-backend"
       base_branch: "main"
+      # Omit to auto-detect common Go and Node CI checks. Set [] to disable.
+      validation_commands:
+        - "go test ./..."
+        - "go vet ./..."
   
   - match:
       project: "Frontend Redesign"
@@ -270,6 +275,13 @@ reconciler:
   enabled: true   # Periodic GitHub check for stuck pr_open jobs (merged -> done, closed -> cancelled)
   interval: "2m"  # Poll interval (~1-5m recommended)
 ```
+
+Before pushing and opening a pull request, Devbox runs the configured
+`validation_commands`. When the field is omitted, it auto-detects common Go
+checks (`go test ./...`, `go vet ./...`) and Node package-manager checks
+(frozen install plus available `format:check`, `lint`, `typecheck`, `test`, and
+`build` scripts). Use `validation_commands: []` only when validation should be
+explicitly disabled for that repository.
 
 **Environment Variable Overrides:**
 - `DEVBOXD_AUTH_TOKEN` - Server authentication token

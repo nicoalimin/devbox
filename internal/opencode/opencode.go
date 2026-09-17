@@ -277,6 +277,21 @@ func (c *Client) SendMessage(sessionID, message, directory string) error {
 	return c.sendMessageClassic(sessionID, message, directory)
 }
 
+// InterruptSession stops the active execution for an OpenCode v2 session.
+// Callers use this before taking over a worktree so OpenCode cannot continue
+// editing concurrently with local validation or fallback delivery.
+func (c *Client) InterruptSession(sessionID string) error {
+	if c.version != "v2" {
+		return fmt.Errorf("session interruption is only supported for OpenCode v2")
+	}
+
+	path := fmt.Sprintf("/api/session/%s/interrupt", url.PathEscape(sessionID))
+	if err := c.post(path, map[string]interface{}{}, nil); err != nil {
+		return fmt.Errorf("failed to interrupt OpenCode session %s: %w", sessionID, err)
+	}
+	return nil
+}
+
 // IsSessionBusy checks if a specific session is busy (version-aware)
 // For v2: session is busy if present in /api/session/active map
 // For classic: session is busy if status shows busy field = true
@@ -806,7 +821,7 @@ func (c *Client) post(path string, body interface{}, result interface{}) error {
 	// Read response body for error reporting
 	respBody, _ := io.ReadAll(resp.Body)
 
-	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusNoContent {
 		return &HTTPError{
 			Method:       "POST",
 			URL:          fullURL,
@@ -817,7 +832,7 @@ func (c *Client) post(path string, body interface{}, result interface{}) error {
 		}
 	}
 
-	if result != nil {
+	if result != nil && len(respBody) > 0 {
 		if err := json.Unmarshal(respBody, result); err != nil {
 			return fmt.Errorf("failed to decode response: %w (body: %s)", err, string(respBody))
 		}

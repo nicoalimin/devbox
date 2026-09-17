@@ -3,14 +3,52 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
+	"time"
 )
+
+func TestLoadConfigValidationCommands(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	configContent := `
+server:
+  auth_token: test-token
+linear:
+  api_key: test-api-key
+opencode:
+  review_timeout: 7m
+repos:
+  - match:
+      team: TEST
+    repo:
+      path: /tmp/test
+      base_branch: main
+      validation_commands:
+        - go test ./...
+        - go vet ./...
+`
+	if err := os.WriteFile(configPath, []byte(configContent), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := LoadConfig(configPath)
+	if err != nil {
+		t.Fatalf("LoadConfig failed: %v", err)
+	}
+	want := []string{"go test ./...", "go vet ./..."}
+	if !reflect.DeepEqual(cfg.Repos[0].Repo.ValidationCommands, want) {
+		t.Fatalf("validation commands = %#v, want %#v", cfg.Repos[0].Repo.ValidationCommands, want)
+	}
+	if cfg.OpenCode.ReviewTimeout != 7*time.Minute {
+		t.Fatalf("review timeout = %v, want 7m", cfg.OpenCode.ReviewTimeout)
+	}
+}
 
 func TestOpenCodeAuthEnvVars(t *testing.T) {
 	// Create a minimal valid config file
 	tmpDir := t.TempDir()
 	configPath := filepath.Join(tmpDir, "test-config.yaml")
-	
+
 	configContent := `
 server:
   listen: "0.0.0.0:8080"
@@ -26,7 +64,7 @@ repos:
       path: "/tmp/test"
       base_branch: "main"
 `
-	
+
 	if err := os.WriteFile(configPath, []byte(configContent), 0644); err != nil {
 		t.Fatalf("Failed to write test config: %v", err)
 	}
@@ -66,8 +104,8 @@ repos:
 			envVars: map[string]string{
 				"DEVBOXD_OPENCODE_USERNAME": "devbox-user",
 				"DEVBOXD_OPENCODE_PASSWORD": "devbox-pass",
-				"OPENCODE_SERVER_USERNAME": "opencode",
-				"OPENCODE_SERVER_PASSWORD": "server-pass",
+				"OPENCODE_SERVER_USERNAME":  "opencode",
+				"OPENCODE_SERVER_PASSWORD":  "server-pass",
 			},
 			wantUsername: "devbox-user",
 			wantPassword: "devbox-pass",
@@ -76,7 +114,7 @@ repos:
 			name: "mixed: DEVBOXD username, OPENCODE_SERVER password",
 			envVars: map[string]string{
 				"DEVBOXD_OPENCODE_USERNAME": "devbox-user",
-				"OPENCODE_SERVER_PASSWORD": "server-pass",
+				"OPENCODE_SERVER_PASSWORD":  "server-pass",
 			},
 			wantUsername: "devbox-user",
 			wantPassword: "server-pass",
@@ -124,7 +162,7 @@ func TestOpenCodeAuthFromConfigFile(t *testing.T) {
 	// Test that credentials in config file are loaded correctly
 	tmpDir := t.TempDir()
 	configPath := filepath.Join(tmpDir, "test-config.yaml")
-	
+
 	configContent := `
 server:
   listen: "0.0.0.0:8080"
@@ -144,7 +182,7 @@ repos:
       path: "/tmp/test"
       base_branch: "main"
 `
-	
+
 	if err := os.WriteFile(configPath, []byte(configContent), 0644); err != nil {
 		t.Fatalf("Failed to write test config: %v", err)
 	}
@@ -173,7 +211,7 @@ func TestOpenCodeAuthEnvVarOverridesConfigFile(t *testing.T) {
 	// Test that env vars override config file values
 	tmpDir := t.TempDir()
 	configPath := filepath.Join(tmpDir, "test-config.yaml")
-	
+
 	configContent := `
 server:
   listen: "0.0.0.0:8080"
@@ -193,7 +231,7 @@ repos:
       path: "/tmp/test"
       base_branch: "main"
 `
-	
+
 	if err := os.WriteFile(configPath, []byte(configContent), 0644); err != nil {
 		t.Fatalf("Failed to write test config: %v", err)
 	}
