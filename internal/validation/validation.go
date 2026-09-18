@@ -7,7 +7,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -17,6 +19,7 @@ const commandTimeout = 20 * time.Minute
 type Command struct {
 	Name string
 	Args []string
+	Dir  string // Relative to the worktree; empty means its root.
 }
 
 // Run executes configured validation commands, or detects common CI checks
@@ -26,6 +29,10 @@ func Run(worktreePath string, configured []string, logFunc func(string)) error {
 	if err != nil {
 		return err
 	}
+	return runCommands(worktreePath, commands, logFunc)
+}
+
+func runCommands(worktreePath string, commands []Command, logFunc func(string)) error {
 	if len(commands) == 0 {
 		if logFunc != nil {
 			logFunc("No local validation commands detected")
@@ -35,14 +42,15 @@ func Run(worktreePath string, configured []string, logFunc func(string)) error {
 
 	for _, command := range commands {
 		display := strings.Join(append([]string{command.Name}, command.Args...), " ")
+		if command.Dir != "" {
+			display = "[" + command.Dir + "] " + display
+		}
 		if logFunc != nil {
 			logFunc(fmt.Sprintf("Running local validation: %s", display))
 		}
 
 		ctx, cancel := context.WithTimeout(context.Background(), commandTimeout)
-		cmd := exec.CommandContext(ctx, command.Name, command.Args...)
-		cmd.Dir = worktreePath
-		output, runErr := cmd.CombinedOutput()
+		output, runErr := runCommand(ctx, worktreePath, command)
 		cancel()
 
 		if ctx.Err() == context.DeadlineExceeded {
@@ -57,6 +65,24 @@ func Run(worktreePath string, configured []string, logFunc func(string)) error {
 	}
 
 	return nil
+}
+
+// Devbox runs on Linux/macOS. Terminate the whole command group on timeout,
+// including package-manager and shell children, before taking a Git snapshot.
+func runCommand(ctx context.Context, worktreePath string, command Command) ([]byte, error) {
+	cmd := exec.CommandContext(ctx, command.Name, command.Args...)
+	cmd.Dir = filepath.Join(worktreePath, command.Dir)
+	cmd.Env = append(os.Environ(), "CI=true")
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error {
+		err := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		if err == syscall.ESRCH {
+			return os.ErrProcessDone
+		}
+		return err
+	}
+	cmd.WaitDelay = 5 * time.Second
+	return cmd.CombinedOutput()
 }
 
 func commandsFor(worktreePath string, configured []string) ([]Command, error) {
@@ -79,16 +105,127 @@ func commandsFor(worktreePath string, configured []string) ([]Command, error) {
 		)
 	}
 
-	packageJSONPath := filepath.Join(worktreePath, "package.json")
-	if fileExists(packageJSONPath) {
-		nodeCommands, err := nodeCommands(worktreePath, packageJSONPath)
+	packages, err := packageDirs(worktreePath)
+	if err != nil {
+		return nil, err
+	}
+	for _, dir := range packages {
+		nodeCommands, err := nodeCommands(filepath.Join(worktreePath, dir), filepath.Join(worktreePath, dir, "package.json"))
 		if err != nil {
 			return nil, err
+		}
+		for i := range nodeCommands {
+			nodeCommands[i].Dir = dir
 		}
 		commands = append(commands, nodeCommands...)
 	}
 
 	return commands, nil
+}
+
+// packageDirs includes nested apps such as web/, while respecting Git's ignores
+// so dependencies, generated output, and other worktrees aren't traversed.
+func packageDirs(worktreePath string) ([]string, error) {
+	cmd := exec.Command("git", "ls-files", "-z", "--cached", "--others", "--exclude-standard", "--", "package.json", "**/package.json")
+	cmd.Dir = worktreePath
+	output, err := cmd.Output()
+	if err != nil {
+		// Non-Git directories are useful for validation in isolation.
+		if fileExists(filepath.Join(worktreePath, "package.json")) {
+			return []string{""}, nil
+		}
+		return nil, nil
+	}
+	seen := map[string]bool{}
+	for _, path := range strings.Split(string(output), "\x00") {
+		if path == "" || !fileExists(filepath.Join(worktreePath, path)) {
+			continue
+		}
+		if strings.HasPrefix(path, ".devbox-worktrees/") || strings.Contains("/"+path, "/node_modules/") {
+			continue
+		}
+		dir := filepath.Dir(path)
+		if dir == "." {
+			dir = ""
+		}
+		seen[dir] = true
+	}
+	var dirs []string
+	for dir := range seen {
+		dirs = append(dirs, dir)
+	}
+	sort.Strings(dirs)
+	return dirs, nil
+}
+
+// Format runs declared write-mode formatters independently of the model. Custom
+// commands are supported for repositories whose tooling cannot be autodetected.
+// An explicitly empty list disables automatic formatting.
+func Format(worktreePath string, configured []string, logFunc func(string)) error {
+	if configured != nil {
+		return Run(worktreePath, configured, logFunc)
+	}
+	dirs, err := packageDirs(worktreePath)
+	if err != nil {
+		return err
+	}
+	var commands []Command
+	for _, dir := range dirs {
+		path := filepath.Join(worktreePath, dir)
+		data, err := os.ReadFile(filepath.Join(path, "package.json"))
+		if err != nil {
+			return err
+		}
+		var manifest struct {
+			PackageManager string            `json:"packageManager"`
+			Scripts        map[string]string `json:"scripts"`
+		}
+		if err := json.Unmarshal(data, &manifest); err != nil {
+			return fmt.Errorf("invalid package.json in %s: %w", dir, err)
+		}
+		manager := detectPackageManager(path, manifest.PackageManager)
+		formatter := formatterCommand(manager, manifest.Scripts)
+		if formatter == nil {
+			continue
+		}
+		// Install before formatting in fresh worktrees. nodeCommands puts the
+		// repository's frozen install first, ahead of its checks.
+		if _, err := os.Stat(filepath.Join(path, "node_modules")); os.IsNotExist(err) {
+			checks, err := nodeCommands(path, filepath.Join(path, "package.json"))
+			if err != nil {
+				return err
+			}
+			if len(checks) > 0 {
+				checks[0].Dir = dir
+				commands = append(commands, checks[0])
+			}
+		}
+		formatter.Dir = dir
+		commands = append(commands, *formatter)
+	}
+	return runCommands(worktreePath, commands, logFunc)
+}
+
+func formatterCommand(manager string, scripts map[string]string) *Command {
+	for _, name := range []string{"format:write", "format:fix", "format"} {
+		if body := strings.TrimSpace(scripts[name]); body != "" && !strings.Contains(body, "--check") && !strings.Contains(body, "--list-different") {
+			return &Command{Name: manager, Args: []string{"run", name}}
+		}
+	}
+	// Only infer write mode for a simple declared Prettier check. Preserve its
+	// globs/config/ignore options, and never rewrite compound shell programs.
+	body := strings.TrimSpace(scripts["format:check"])
+	if strings.HasPrefix(body, "prettier ") && strings.Contains(body, "--check") && !strings.ContainsAny(body, ";&|\n`$") {
+		body = strings.Replace(body, "--check", "--write", 1)
+		prefix := manager + " exec "
+		if manager == "npm" {
+			prefix = "npm exec --no -- "
+		} else if manager == "yarn" || manager == "bun" {
+			prefix = manager + " run "
+		}
+		return &Command{Name: "/bin/sh", Args: []string{"-c", prefix + body}}
+	}
+	return nil
 }
 
 func nodeCommands(worktreePath, packageJSONPath string) ([]Command, error) {

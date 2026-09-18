@@ -8,6 +8,50 @@ import (
 	"testing"
 )
 
+func TestDeliveryRefusesWrongBranchAndDirtyCleanup(t *testing.T) {
+	repo := setupTestRepo(t)
+	defer os.RemoveAll(repo)
+	mgr := NewManager(repo, "main")
+	worktree, err := mgr.CreateWorktree("TEST-SAFE")
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(worktree.Path, "untracked.txt")
+	if err := os.WriteFile(path, []byte("preserve"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := mgr.RemoveWorktree(worktree.Path); err == nil {
+		t.Fatal("removed dirty worktree")
+	}
+	if _, err := mgr.RecreateWorktree("TEST-SAFE", worktree.BranchName); err == nil {
+		t.Fatal("replaced existing worktree")
+	}
+	if err := mgr.PushBranch(worktree.Path, "main"); err == nil {
+		t.Fatal("pushed to base branch")
+	}
+	if err := mgr.PushBranch(worktree.Path, "devbox/other"); err == nil {
+		t.Fatal("pushed to wrong branch")
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("lost output: %v", err)
+	}
+	if err := mgr.CommitAll(worktree.Path, "checkpoint"); err != nil {
+		t.Fatal(err)
+	}
+	if err := mgr.CommitAll(worktree.Path, "retry"); err != nil {
+		t.Fatalf("commit retry is not idempotent: %v", err)
+	}
+	if err := mgr.VerifyPublished(worktree.Path, worktree.BranchName); err == nil {
+		t.Fatal("unpublished commit passed verification")
+	}
+	if err := mgr.PushBranch(worktree.Path, worktree.BranchName); err != nil {
+		t.Fatal(err)
+	}
+	if err := mgr.VerifyPublished(worktree.Path, worktree.BranchName); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // setupTestRepo creates a temporary git repository for testing
 func setupTestRepo(t *testing.T) string {
 	t.Helper()
@@ -128,6 +172,11 @@ func TestCreateWorktree_Success(t *testing.T) {
 
 	if worktree.BranchName != "devbox/test-123" {
 		t.Errorf("expected branch name 'devbox/test-123', got '%s'", worktree.BranchName)
+	}
+	cmd := exec.Command("git", "rev-parse", "--verify", "@{upstream}")
+	cmd.Dir = worktree.Path
+	if err := cmd.Run(); err == nil {
+		t.Fatal("new job branch must not track origin/main before its first push")
 	}
 
 	expectedPath := filepath.Join(repoPath, ".devbox-worktrees", "TEST-123")

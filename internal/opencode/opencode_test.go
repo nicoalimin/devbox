@@ -10,6 +10,34 @@ import (
 	"time"
 )
 
+func TestStopSessionConfirmsIdleAfterInterrupt(t *testing.T) {
+	checks := 0
+	interrupted := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/session/test/interrupt" {
+			interrupted = true
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		if !interrupted {
+			t.Error("checked before interrupt")
+		}
+		checks++
+		if checks < 2 {
+			fmt.Fprint(w, `{"data":{"test":{}}}`)
+		} else {
+			fmt.Fprint(w, `{"data":{}}`)
+		}
+	}))
+	defer server.Close()
+	if err := NewClient(server.URL, "", "", "v2").StopSession("test", ""); err != nil {
+		t.Fatal(err)
+	}
+	if checks != 2 {
+		t.Fatalf("did not wait for interruption to settle: %d checks", checks)
+	}
+}
+
 func TestCreateSessionV2(t *testing.T) {
 	tests := []struct {
 		name          string

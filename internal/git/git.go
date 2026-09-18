@@ -1,11 +1,14 @@
 package git
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
+	"time"
 )
 
 // Manager handles git operations
@@ -61,7 +64,7 @@ func (m *Manager) CreateWorktree(identifier string) (*WorktreeInfo, error) {
 	// Use origin/<baseBranch> instead of local <baseBranch> to handle cases where
 	// the local base branch is stale or has diverged from remote
 	remoteBase := fmt.Sprintf("origin/%s", m.baseBranch)
-	cmd := exec.Command("git", "worktree", "add", "-b", branchName, worktreePath, remoteBase)
+	cmd := exec.Command("git", "worktree", "add", "--no-track", "-b", branchName, worktreePath, remoteBase)
 	cmd.Dir = m.repoPath
 	output, err := cmd.CombinedOutput()
 	if err != nil {
@@ -128,9 +131,9 @@ func (m *Manager) RecreateWorktree(identifier, branchName string) (*WorktreeInfo
 		worktreePath = filepath.Join(m.repoPath, ".devbox-worktrees", identifier+suffix)
 	}
 
-	// Remove worktree if it exists (in case of stale entries)
+	// Never replace an existing directory: it may contain unpublished work.
 	if _, err := os.Stat(worktreePath); err == nil {
-		_ = m.RemoveWorktree(worktreePath)
+		return nil, fmt.Errorf("refusing to replace existing worktree at %s", worktreePath)
 	}
 
 	// Ensure parent directory exists
@@ -154,7 +157,7 @@ func (m *Manager) RecreateWorktree(identifier, branchName string) (*WorktreeInfo
 
 // RemoveWorktree removes a git worktree
 func (m *Manager) RemoveWorktree(worktreePath string) error {
-	cmd := exec.Command("git", "worktree", "remove", worktreePath, "--force")
+	cmd := exec.Command("git", "worktree", "remove", worktreePath)
 	cmd.Dir = m.repoPath
 	output, err := cmd.CombinedOutput()
 	if err != nil {
@@ -165,11 +168,73 @@ func (m *Manager) RemoveWorktree(worktreePath string) error {
 
 // PushBranch pushes a branch to the remote
 func (m *Manager) PushBranch(worktreePath, branchName string) error {
-	cmd := exec.Command("git", "push", "-u", "origin", branchName)
-	cmd.Dir = worktreePath
-	output, err := cmd.CombinedOutput()
+	if err := m.AssertBranch(worktreePath, branchName); err != nil {
+		return err
+	}
+	output, err := runDeliveryGit(worktreePath, "push", "-u", "origin", "HEAD:refs/heads/"+branchName)
 	if err != nil {
 		return fmt.Errorf("failed to push branch: %w\nOutput: %s", err, string(output))
+	}
+	return m.VerifyPublished(worktreePath, branchName)
+}
+
+// Bound credential helpers, hooks and transport processes as well as Git
+// itself so host recovery cannot hang indefinitely after a model timeout.
+func runDeliveryGit(worktreePath string, args ...string) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "git", args...)
+	cmd.Dir = worktreePath
+	cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error {
+		err := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		if err == syscall.ESRCH {
+			return os.ErrProcessDone
+		}
+		return err
+	}
+	cmd.WaitDelay = 5 * time.Second
+	return cmd.CombinedOutput()
+}
+
+// AssertBranch prevents an agent's checkout of another branch (or detached HEAD)
+// from causing the host to commit or push to the wrong destination.
+func (m *Manager) AssertBranch(worktreePath, branchName string) error {
+	if branchName == "" || branchName == m.baseBranch {
+		return fmt.Errorf("refusing delivery to empty or base branch %q", branchName)
+	}
+	cmd := exec.Command("git", "symbolic-ref", "--quiet", "--short", "HEAD")
+	cmd.Dir = worktreePath
+	output, err := cmd.Output()
+	if err != nil || strings.TrimSpace(string(output)) != branchName {
+		return fmt.Errorf("worktree must be on assigned branch %q (found %q, error: %v)", branchName, strings.TrimSpace(string(output)), err)
+	}
+	return nil
+}
+
+// VerifyPublished checks the actual remote, not a potentially stale tracking ref.
+func (m *Manager) VerifyPublished(worktreePath, branchName string) error {
+	if err := m.AssertBranch(worktreePath, branchName); err != nil {
+		return err
+	}
+	dirty, err := m.HasUncommittedChanges(worktreePath)
+	if err != nil {
+		return err
+	}
+	if dirty {
+		return fmt.Errorf("worktree still contains uncommitted changes")
+	}
+	cmd := exec.Command("git", "rev-parse", "HEAD")
+	cmd.Dir = worktreePath
+	head, err := cmd.Output()
+	if err != nil {
+		return fmt.Errorf("failed to read HEAD: %w", err)
+	}
+	remote, err := runDeliveryGit(worktreePath, "ls-remote", "--exit-code", "origin", "refs/heads/"+branchName)
+	fields := strings.Fields(string(remote))
+	if err != nil || len(fields) != 2 || fields[0] != strings.TrimSpace(string(head)) {
+		return fmt.Errorf("remote branch %s does not match local HEAD: %s (error: %v)", branchName, remote, err)
 	}
 	return nil
 }
@@ -190,17 +255,18 @@ func (m *Manager) HasUncommittedChanges(worktreePath string) (bool, error) {
 // worktree. It is the delivery fallback when an agent edits files but does not
 // create the commit requested by the orchestrator.
 func (m *Manager) CommitAll(worktreePath, message string) error {
-	cmd := exec.Command("git", "add", "--all")
-	cmd.Dir = worktreePath
-	if output, err := cmd.CombinedOutput(); err != nil {
+	if output, err := runDeliveryGit(worktreePath, "add", "--all"); err != nil {
 		return fmt.Errorf("failed to stage worktree changes: %w\nOutput: %s", err, string(output))
+	}
+	if _, err := runDeliveryGit(worktreePath, "diff", "--cached", "--quiet"); err == nil {
+		return nil // Restart/retry after the commit already succeeded.
+	} else if exitErr, ok := err.(*exec.ExitError); !ok || exitErr.ExitCode() != 1 {
+		return fmt.Errorf("failed to inspect staged changes: %w", err)
 	}
 
 	// Deliberately use the repository/user Git configuration. A fallback commit
 	// should have the same identity as a normal commit made in this checkout.
-	cmd = exec.Command("git", "commit", "-m", message)
-	cmd.Dir = worktreePath
-	if output, err := cmd.CombinedOutput(); err != nil {
+	if output, err := runDeliveryGit(worktreePath, "commit", "-m", message); err != nil {
 		return fmt.Errorf("failed to commit worktree changes: %w\nOutput: %s", err, string(output))
 	}
 

@@ -2,6 +2,7 @@ package client
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -95,7 +96,7 @@ func (c *Client) Assign(linearIssueID string, operatorContext string) (*Job, err
 	if operatorContext != "" {
 		body["operatorContext"] = operatorContext
 	}
-	
+
 	var job Job
 	if err := c.post("/v1/jobs", body, &job, true); err != nil {
 		return nil, err
@@ -106,7 +107,7 @@ func (c *Client) Assign(linearIssueID string, operatorContext string) (*Job, err
 // ListJobs lists jobs
 func (c *Client) ListJobs(limit int) ([]*Job, error) {
 	path := fmt.Sprintf("/v1/jobs?limit=%d", limit)
-	
+
 	var resp struct {
 		Jobs []*Job `json:"jobs"`
 	}
@@ -141,19 +142,63 @@ func (c *Client) Reply(jobID, message string) error {
 	body := map[string]string{
 		"message": message,
 	}
-	
+
 	var resp map[string]interface{}
 	return c.post(fmt.Sprintf("/v1/jobs/%s/reply", jobID), body, &resp, true)
 }
 
 // Review sends review feedback to a job
 func (c *Client) Review(jobIDOrLinearID, feedback string) error {
+	_, err := c.StartReview(jobIDOrLinearID, feedback)
+	return err
+}
+
+type ReviewAcceptance struct {
+	JobID string `json:"jobId"`
+	State string `json:"state"`
+}
+
+// StartReview returns the canonical job ID to track an accepted review even
+// when the caller used a Linear issue ID. Acceptance is not completion.
+func (c *Client) StartReview(jobIDOrLinearID, feedback string) (*ReviewAcceptance, error) {
 	body := map[string]string{
 		"feedback": feedback,
 	}
-	
-	var resp map[string]interface{}
-	return c.post(fmt.Sprintf("/v1/jobs/%s/review", jobIDOrLinearID), body, &resp, true)
+	var resp ReviewAcceptance
+	if err := c.post(fmt.Sprintf("/v1/jobs/%s/review", jobIDOrLinearID), body, &resp, true); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
+// WaitForReview observes server-side delivery; cancelling this wait does not
+// cancel the job. Failed checkpoints remain errors, even if a branch exists.
+func (c *Client) WaitForReview(ctx context.Context, jobID string, interval time.Duration) (*Job, error) {
+	if jobID == "" {
+		return nil, fmt.Errorf("server did not return a job ID; upgrade devboxd to track review delivery")
+	}
+	if interval <= 0 {
+		interval = time.Second
+	}
+	for {
+		var job Job
+		if err := c.getContext(ctx, fmt.Sprintf("/v1/jobs/%s", jobID), &job, true); err != nil {
+			return nil, err
+		}
+		switch job.State {
+		case "pr_open", "done":
+			return &job, nil
+		case "failed", "cancelled", "blocked":
+			return &job, fmt.Errorf("review %s: %s (branch: %s, worktree: %s)", job.State, job.BlockerReason, job.BranchName, job.WorktreePath)
+		}
+		timer := time.NewTimer(interval)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil, fmt.Errorf("stopped waiting; job %s continues on server: %w", jobID, ctx.Err())
+		case <-timer.C:
+		}
+	}
 }
 
 // Cancel cancels a job
@@ -168,7 +213,7 @@ func (c *Client) GetLogs(jobID string, tail int) ([]*JobLog, error) {
 	if tail > 0 {
 		path += fmt.Sprintf("?tail=%d", tail)
 	}
-	
+
 	var resp struct {
 		Logs []*JobLog `json:"logs"`
 	}
@@ -180,7 +225,11 @@ func (c *Client) GetLogs(jobID string, tail int) ([]*JobLog, error) {
 
 // get performs a GET request
 func (c *Client) get(path string, result interface{}, auth bool) error {
-	req, err := http.NewRequest("GET", c.baseURL+path, nil)
+	return c.getContext(context.Background(), path, result, auth)
+}
+
+func (c *Client) getContext(ctx context.Context, path string, result interface{}, auth bool) error {
+	req, err := http.NewRequestWithContext(ctx, "GET", c.baseURL+path, nil)
 	if err != nil {
 		return fmt.Errorf("failed to create request: %w", err)
 	}

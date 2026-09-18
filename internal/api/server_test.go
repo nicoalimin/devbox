@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -15,6 +16,34 @@ import (
 	"github.com/nicoalimin/devbox/internal/db"
 	"github.com/nicoalimin/devbox/internal/job"
 )
+
+func TestReviewRejectsBusyServerBeforeAcceptance(t *testing.T) {
+	database, err := db.Open(filepath.Join(t.TempDir(), "jobs.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	jobToReview := &db.Job{ID: "review-job", LinearIssueID: "TEST-1", State: db.StatePROpen, PRURL: "https://example.com/pull/1", RepoPath: "/repo", BranchName: "devbox/test-1", CreatedAt: time.Now(), UpdatedAt: time.Now()}
+	if err := database.CreateJob(jobToReview); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.CreateJob(&db.Job{ID: "busy-job", LinearIssueID: "TEST-2", State: db.StateCoding, CreatedAt: time.Now(), UpdatedAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.Config{}
+	server := NewServer(cfg, database, job.NewOrchestrator(cfg, database))
+	router := chi.NewRouter()
+	router.Post("/v1/jobs/{id}/review", server.handleReviewJob)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, httptest.NewRequest("POST", "/v1/jobs/TEST-1/review", strings.NewReader(`{"feedback":"Fix this"}`)))
+	if w.Code != http.StatusConflict {
+		t.Fatalf("status %d: %s", w.Code, w.Body.String())
+	}
+	stored, _ := database.GetJob(jobToReview.ID)
+	if stored.State != db.StatePROpen || stored.ReviewFeedback != "" {
+		t.Fatalf("rejected request changed job: %+v", stored)
+	}
+}
 
 func TestHandleReviewJob_NotFound(t *testing.T) {
 	// Create temporary database

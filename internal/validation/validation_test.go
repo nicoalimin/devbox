@@ -1,11 +1,29 @@
 package validation
 
 import (
+	"context"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
+	"time"
 )
+
+func TestTimeoutStopsShellChildren(t *testing.T) {
+	dir := t.TempDir()
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	_, err := runCommand(ctx, dir, Command{Name: "/bin/sh", Args: []string{"-c", "sleep 0.2; echo orphan > orphan.txt"}})
+	if err == nil {
+		t.Fatal("expected command timeout")
+	}
+	time.Sleep(250 * time.Millisecond)
+	if _, err := os.Stat(filepath.Join(dir, "orphan.txt")); !os.IsNotExist(err) {
+		t.Fatalf("child kept writing after timeout: %v", err)
+	}
+}
 
 func TestCommandsForDetectsCommonGoAndPnpmCIGates(t *testing.T) {
 	dir := t.TempDir()
@@ -39,6 +57,48 @@ func TestCommandsForDetectsCommonGoAndPnpmCIGates(t *testing.T) {
 	}
 	if !reflect.DeepEqual(commands, want) {
 		t.Fatalf("commands = %#v, want %#v", commands, want)
+	}
+}
+
+func TestNestedPackageValidationAndFormatting(t *testing.T) {
+	dir := t.TempDir()
+	if output, err := exec.Command("git", "init", dir).CombinedOutput(); err != nil {
+		t.Fatalf("%v: %s", err, output)
+	}
+	if err := os.MkdirAll(filepath.Join(dir, "web"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	writeTestFile(t, filepath.Join(dir, "web", "package.json"), `{"packageManager":"pnpm@10","scripts":{"format:check":"prettier --check .","test":"vitest run"}}`)
+	commands, err := commandsFor(dir, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(commands) != 3 {
+		t.Fatalf("commands: %+v", commands)
+	}
+	for _, command := range commands {
+		if command.Dir != "web" || command.Name != "pnpm" {
+			t.Fatalf("wrong directory/manager: %+v", command)
+		}
+	}
+	formatter := formatterCommand("pnpm", map[string]string{"format:check": `prettier --check "src/**/*.ts" --ignore-path .prettierignore`})
+	if formatter == nil || !strings.Contains(strings.Join(formatter.Args, " "), `--write "src/**/*.ts" --ignore-path .prettierignore`) {
+		t.Fatalf("formatter: %+v", formatter)
+	}
+}
+
+func TestFormatterDetection(t *testing.T) {
+	for _, check := range []string{"eslint .", "prettier --check . && deploy", "prettier --check $(command)"} {
+		if cmd := formatterCommand("npm", map[string]string{"format:check": check}); cmd != nil {
+			t.Fatalf("unsafe inferred formatter for %s: %+v", check, cmd)
+		}
+	}
+	cmd := formatterCommand("pnpm", map[string]string{"format": "prettier --write .", "format:check": "prettier --check ."})
+	if cmd == nil || !reflect.DeepEqual(cmd.Args, []string{"run", "format"}) {
+		t.Fatalf("did not prefer declared formatter: %+v", cmd)
+	}
+	if err := Format(t.TempDir(), []string{}, nil); err != nil {
+		t.Fatal(err)
 	}
 }
 

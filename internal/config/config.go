@@ -72,6 +72,7 @@ type RepoInfo struct {
 	Path               string   `yaml:"path"`
 	BaseBranch         string   `yaml:"base_branch"`
 	ValidationCommands []string `yaml:"validation_commands"`
+	FormatCommands     []string `yaml:"format_commands"`
 }
 
 // QueueConfig defines job queue settings

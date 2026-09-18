@@ -39,6 +39,10 @@ repos:
     repo:
       path: "/path/to/your/backend"
       base_branch: "main"
+      # Omit to detect write-mode Node format scripts (including nested apps).
+      # Set [] to disable, or provide commands relative to the worktree root.
+      # format_commands:
+      #   - "cd web && pnpm exec prettier --write ."
       # Omit to auto-detect common Go and Node CI checks. Set [] to disable.
       validation_commands:
         - "go test ./..."
