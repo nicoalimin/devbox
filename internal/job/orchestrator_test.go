@@ -11,7 +11,43 @@ import (
 
 	"github.com/nicoalimin/devbox/internal/config"
 	"github.com/nicoalimin/devbox/internal/db"
+	"github.com/nicoalimin/devbox/internal/linear"
 )
+
+func TestBuildCodingPromptRequiresFormattingRepairAndCommit(t *testing.T) {
+	orch := &Orchestrator{}
+	prompt := orch.buildCodingPrompt(&linear.Issue{
+		Identifier: "TEST-123",
+		Title:      "Fix formatting",
+		Team:       linear.Team{Name: "Test", Key: "TEST"},
+		State:      linear.State{Name: "Todo"},
+	}, "")
+
+	for _, required := range []string{
+		"formatting, lint, typecheck, test, and build failures as work to fix",
+		"pnpm exec prettier --write .",
+		"every file reported anywhere in the repository",
+		"leave the worktree clean and committed",
+	} {
+		if !strings.Contains(prompt, required) {
+			t.Fatalf("coding prompt does not contain %q\n%s", required, prompt)
+		}
+	}
+}
+
+func TestBuildValidationRepairPromptIncludesExactFailureAndActions(t *testing.T) {
+	prompt := buildValidationRepairPrompt(fmt.Errorf("prettier failed: web/tsconfig.json"))
+	for _, required := range []string{
+		"prettier failed: web/tsconfig.json",
+		"pnpm exec prettier --write .",
+		"rerun the exact failing command",
+		"Commit the resulting fixes",
+	} {
+		if !strings.Contains(prompt, required) {
+			t.Fatalf("validation repair prompt does not contain %q\n%s", required, prompt)
+		}
+	}
+}
 
 func TestFailJobPreservesDirtyWorktree(t *testing.T) {
 	repoPath := t.TempDir()

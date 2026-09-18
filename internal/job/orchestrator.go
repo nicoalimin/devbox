@@ -40,6 +40,16 @@ const (
 	commitRecoveryWait = 10 * time.Minute
 )
 
+const agentQualityInstructions = `
+Quality and delivery requirements:
+- Treat formatting, lint, typecheck, test, and build failures as work to fix, not blockers to merely report.
+- Detect and use the repository's declared package manager and scripts.
+- If a Prettier or other formatting check fails, run its write-mode formatter (for example, pnpm exec prettier --write .), including every file reported anywhere in the repository—not only files you originally edited.
+- Rerun the exact failing command, then the repository's other relevant CI-equivalent checks. Continue fixing issues until they exit successfully.
+- Inspect git status and the complete diff, then commit all intended fixes with a concise, contextual message.
+- Do not stop after describing commands, errors, or suggested fixes. Execute them and leave the worktree clean and committed.
+`
+
 // NewOrchestrator creates a new job orchestrator
 func NewOrchestrator(cfg *config.Config, database *db.DB) *Orchestrator {
 	oc := opencode.NewClient(cfg.OpenCode.BaseURL, cfg.OpenCode.Username, cfg.OpenCode.Password, cfg.OpenCode.Version)
@@ -329,7 +339,7 @@ func (o *Orchestrator) reviewCode(job *db.Job) error {
 4. Confirm the implementation matches requirements
 5. **TUI changes (internal/tui/)**: Verify the dashboard fits entirely in one terminal screen with no overflow or clipped header/footer. Left column height (jobs + errors + integrations) must equal right column height (server logs + job logs).
 
-If you find issues, fix them now. Run the relevant checks and commit all completed changes with a concise, contextual commit message. Do not merely confirm readiness: leave the worktree clean and committed.`
+If you find issues, fix them now.` + agentQualityInstructions
 
 	if err := o.opencode.SendMessage(job.OpenCodeSessionID, reviewPrompt, job.WorktreePath); err != nil {
 		return err
@@ -399,7 +409,7 @@ func (o *Orchestrator) pushBranch(job *db.Job) error {
 	}
 	if hasChanges {
 		o.log(job.ID, "warn", "OpenCode left uncommitted changes; asking it to validate and create a contextual commit")
-		prompt := `Devbox detected uncommitted work in this repository. Inspect git status and the complete diff, run the repository's relevant CI-equivalent checks locally, fix any failures caused by the changes, and commit all completed work. Use a concise, contextual commit message that describes the actual ticket implementation. Do not merely explain what should be committed; leave the worktree clean with the commit created.`
+		prompt := `Devbox detected uncommitted work in this repository. Inspect git status and the complete diff, run the repository's relevant CI-equivalent checks locally, fix any failures caused by the changes, and commit all completed work. Use a concise, contextual commit message that describes the actual ticket implementation.` + agentQualityInstructions
 		if sendErr := o.opencode.SendMessage(job.OpenCodeSessionID, prompt, job.WorktreePath); sendErr != nil {
 			o.log(job.ID, "warn", fmt.Sprintf("Could not ask OpenCode to commit; local fallback may be required: %v", sendErr))
 		} else {
@@ -419,10 +429,7 @@ func (o *Orchestrator) pushBranch(job *db.Job) error {
 		}
 	}
 
-	o.log(job.ID, "info", "Running local CI-equivalent validation before push")
-	if err := validation.Run(job.WorktreePath, o.validationCommands(job), func(msg string) {
-		o.log(job.ID, "info", msg)
-	}); err != nil {
+	if err := o.validateWithOpenCodeRepair(job); err != nil {
 		return err
 	}
 
@@ -457,6 +464,59 @@ func (o *Orchestrator) pushBranch(job *db.Job) error {
 
 	o.log(job.ID, "info", "Branch pushed successfully")
 	return nil
+}
+
+// validateWithOpenCodeRepair runs the local quality gate and gives OpenCode one
+// bounded opportunity to repair the exact failure before delivery stops.
+func (o *Orchestrator) validateWithOpenCodeRepair(job *db.Job) error {
+	runValidation := func() error {
+		o.log(job.ID, "info", "Running local CI-equivalent validation before push")
+		return validation.Run(job.WorktreePath, o.validationCommands(job), func(msg string) {
+			o.log(job.ID, "info", msg)
+		})
+	}
+
+	validationErr := runValidation()
+	if validationErr == nil {
+		return nil
+	}
+
+	o.log(job.ID, "warn", fmt.Sprintf("Local validation failed; sending the exact failure to OpenCode for repair: %v", validationErr))
+	prompt := buildValidationRepairPrompt(validationErr)
+	if err := o.opencode.SendMessage(job.OpenCodeSessionID, prompt, job.WorktreePath); err != nil {
+		return fmt.Errorf("local validation failed (%v), and OpenCode could not be asked to repair it: %w", validationErr, err)
+	}
+
+	wait := commitRecoveryWait
+	if o.cfg.OpenCode.Timeout > 0 && o.cfg.OpenCode.Timeout < wait {
+		wait = o.cfg.OpenCode.Timeout
+	}
+	if err := o.opencode.WaitForSessionIdle(job.OpenCodeSessionID, wait, job.WorktreePath, func(msg string) {
+		o.log(job.ID, "info", msg)
+	}); err != nil {
+		o.log(job.ID, "warn", fmt.Sprintf("OpenCode validation repair did not finish: %v", err))
+		if interruptErr := o.opencode.InterruptSession(job.OpenCodeSessionID); interruptErr != nil {
+			return fmt.Errorf("OpenCode validation repair failed (%v) and could not be interrupted safely: %w", err, interruptErr)
+		}
+		return fmt.Errorf("local validation failed and OpenCode repair timed out: %w", validationErr)
+	}
+
+	o.log(job.ID, "info", "OpenCode validation repair completed; rerunning the full local validation gate")
+	if err := runValidation(); err != nil {
+		return fmt.Errorf("local validation still fails after OpenCode repair: %w", err)
+	}
+	return nil
+}
+
+func buildValidationRepairPrompt(validationErr error) string {
+	return fmt.Sprintf(`Devbox's local pre-push validation failed. Resolve the failure completely in the current worktree.
+
+Validation output:
+---
+%s
+---
+
+For formatting failures such as Prettier, run the formatter in write mode across every path reported (for example, pnpm exec prettier --write .), even when many files or files outside your original edit are listed. Then rerun the exact failing command and all relevant repository checks until they pass. Commit the resulting fixes with a concise message. Do not only report the failure or tell the operator what to run.`, validationErr)
 }
 
 // validationCommands returns the per-repository override. A nil slice enables
@@ -614,8 +674,9 @@ func (o *Orchestrator) buildCodingPrompt(issue *linear.Issue, operatorContext st
 	sb.WriteString("1. Review the .opencode instructions in this repository\n")
 	sb.WriteString("2. Search Notion for related PRDs, specs, or context using the issue title and team\n")
 	sb.WriteString("3. Implement the required changes\n")
-	sb.WriteString("4. Run tests and ensure code quality\n")
+	sb.WriteString("4. Run the repository's CI-equivalent checks and resolve every failure\n")
 	sb.WriteString("5. Commit your changes with clear messages\n")
+	sb.WriteString(agentQualityInstructions)
 
 	return sb.String()
 }
@@ -957,10 +1018,11 @@ func (o *Orchestrator) ReviewJob(jobIDOrLinearID, feedback string) error {
 Please address the feedback:
 1. Review and understand each comment
 2. Make the necessary changes to address the feedback
-3. Run tests to ensure everything still works
+3. Run all relevant local CI-equivalent checks
 4. Commit your changes with clear messages describing what you fixed
 
-After making changes, confirm they are ready to push.`, feedback)
+After making changes, confirm they are ready to push.
+%s`, feedback, agentQualityInstructions)
 
 	// Create or reuse OpenCode session
 	sessionID := job.OpenCodeSessionID
@@ -1214,7 +1276,7 @@ func (o *Orchestrator) healSession(job *db.Job, phase string) (string, error) {
 4. Confirm the implementation matches requirements
 5. **TUI changes (internal/tui/)**: Verify the dashboard fits entirely in one terminal screen with no overflow or clipped header/footer. Left column height (jobs + errors + integrations) must equal right column height (server logs + job logs).
 
-If you find issues, fix them now. Run the relevant checks and commit all completed changes with a concise, contextual commit message. Do not merely confirm readiness: leave the worktree clean and committed.`
+If you find issues, fix them now.` + agentQualityInstructions
 	} else {
 		return "", fmt.Errorf("unknown phase: %s", phase)
 	}
