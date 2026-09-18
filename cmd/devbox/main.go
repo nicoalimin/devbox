@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -11,9 +12,9 @@ import (
 )
 
 var (
-	serverURL   string
-	token       string
-	outputJSON  bool
+	serverURL  string
+	token      string
+	outputJSON bool
 )
 
 func main() {
@@ -130,7 +131,7 @@ You can provide additional context to the coding agent using:
   --note "first note" --note "second note" (can be used multiple times)
 
 All context sources are combined and passed to the OpenCode worker.`,
-		Args:  cobra.ExactArgs(1),
+		Args: cobra.ExactArgs(1),
 		Run: func(cmd *cobra.Command, args []string) {
 			// Build operator context from all sources
 			var contextParts []string
@@ -318,6 +319,8 @@ func replyCmd() *cobra.Command {
 func reviewCmd() *cobra.Command {
 	var comments string
 	var commentsFile string
+	var wait bool
+	var waitTimeout time.Duration
 
 	cmd := &cobra.Command{
 		Use:   "review <job_id|LINEAR_ISSUE_ID>",
@@ -330,7 +333,7 @@ You can provide feedback using:
   --comments-file path/to/file
 
 The job can be identified by job ID or Linear issue ID.`,
-		Args:  cobra.ExactArgs(1),
+		Args: cobra.ExactArgs(1),
 		Run: func(cmd *cobra.Command, args []string) {
 			feedback := comments
 			if commentsFile != "" {
@@ -349,20 +352,37 @@ The job can be identified by job ID or Linear issue ID.`,
 			}
 
 			c := client.NewClient(serverURL, token)
-			if err := c.Review(args[0], feedback); err != nil {
+			accepted, err := c.StartReview(args[0], feedback)
+			if err != nil {
 				exitError("Failed to send review feedback", err)
+			}
+			if wait {
+				ctx, cancel := context.WithTimeout(cmd.Context(), waitTimeout)
+				defer cancel()
+				job, err := c.WaitForReview(ctx, accepted.JobID, 2*time.Second)
+				if err != nil {
+					exitError("Review did not complete successfully", err)
+				}
+				if outputJSON {
+					printJSON(job)
+				} else {
+					fmt.Printf("✓ Review delivered to %s\n  PR: %s\n", job.BranchName, job.PRURL)
+				}
+				return
 			}
 
 			if outputJSON {
-				printJSON(map[string]string{"status": "success"})
+				printJSON(map[string]string{"status": "accepted", "jobId": accepted.JobID})
 			} else {
-				fmt.Printf("✓ Review feedback sent to job %s\n", args[0])
-				fmt.Printf("  OpenCode will address the feedback and update the PR\n")
+				fmt.Printf("Review accepted for job %s; delivery is still pending.\n", accepted.JobID)
+				fmt.Printf("  Track with: devbox job %s\n", accepted.JobID)
 			}
 		},
 	}
 	cmd.Flags().StringVar(&comments, "comments", "", "review feedback comments")
 	cmd.Flags().StringVar(&commentsFile, "comments-file", "", "path to file containing review feedback")
+	cmd.Flags().BoolVar(&wait, "wait", false, "wait for verified delivery and return an error if the review fails")
+	cmd.Flags().DurationVar(&waitTimeout, "wait-timeout", 2*time.Hour, "maximum client wait; the server continues after this expires")
 	return cmd
 }
 

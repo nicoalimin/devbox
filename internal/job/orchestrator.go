@@ -25,19 +25,27 @@ import (
 type Orchestrator struct {
 	cfg             *config.Config
 	db              *db.DB
-	linear          *linear.Client
+	linear          issueClient
 	opencode        *opencode.Client
-	activeJobs      map[string]bool                           // Track actively running jobs to prevent double-resume
-	healingAttempts map[string]int                            // Track session healing attempts per job (jobID -> count)
-	streamStopFuncs map[string]func()                         // Stop functions for active event streams (jobID -> stopFunc)
-	streamMu        sync.Mutex                                // Mutex to protect streamStopFuncs map
+	activeJobs      map[string]bool   // Track actively running jobs to prevent double-resume
+	healingAttempts map[string]int    // Track session healing attempts per job (jobID -> count)
+	streamStopFuncs map[string]func() // Stop functions for active event streams (jobID -> stopFunc)
+	streamMu        sync.Mutex        // Mutex to protect streamStopFuncs map
+	activeMu        sync.Mutex
+	admissionMu     sync.Mutex                                // Serialize job/review admission before persisting busy state.
 	prStatusFn      func(prURL string) (prStatus, int, error) // Override for getPRStatus (tests)
+}
+
+type issueClient interface {
+	GetIssue(string) (*linear.Issue, error)
+	AddComment(string, string) error
 }
 
 const (
 	maxHealingAttempts = 2 // Max number of session recreate attempts per phase
 	maxReviewWait      = 15 * time.Minute
 	commitRecoveryWait = 10 * time.Minute
+	maxRepairAttempts  = 3
 )
 
 const agentQualityInstructions = `
@@ -46,9 +54,15 @@ Quality and delivery requirements:
 - Detect and use the repository's declared package manager and scripts.
 - If a Prettier or other formatting check fails, run its write-mode formatter (for example, pnpm exec prettier --write .), including every file reported anywhere in the repository—not only files you originally edited.
 - Rerun the exact failing command, then the repository's other relevant CI-equivalent checks. Continue fixing issues until they exit successfully.
-- Inspect git status and the complete diff, then commit all intended fixes with a concise, contextual message.
-- Do not stop after describing commands, errors, or suggested fixes. Execute them and leave the worktree clean and committed.
+- Inspect git status and the complete diff, then use git add --all and commit every tracked and non-ignored untracked change in this dedicated job worktree with a concise, contextual message.
+- Push HEAD to the assigned branch on origin after every review pass. Never switch branches, force-push, reset, discard files, or bypass hooks. Verify the worktree is clean and the remote branch matches HEAD.
+- If checks remain broken, still commit and push a clearly labeled incomplete checkpoint and report the exact failure. A checkpoint is not a completed ticket.
+- Do not stop after describing commands, errors, or suggested fixes. Execute them and leave the worktree clean and committed, with all commits pushed.
 `
+
+func deliveryInstructions(job *db.Job) string {
+	return agentQualityInstructions + fmt.Sprintf("\nAssigned branch: %s. Push explicitly with git push -u origin HEAD:refs/heads/%s.\n", job.BranchName, job.BranchName)
+}
 
 // NewOrchestrator creates a new job orchestrator
 func NewOrchestrator(cfg *config.Config, database *db.DB) *Orchestrator {
@@ -73,21 +87,29 @@ func NewOrchestrator(cfg *config.Config, database *db.DB) *Orchestrator {
 
 // markJobActive marks a job as actively running
 func (o *Orchestrator) markJobActive(jobID string) {
+	o.activeMu.Lock()
+	defer o.activeMu.Unlock()
 	o.activeJobs[jobID] = true
 }
 
 // markJobInactive marks a job as no longer running
 func (o *Orchestrator) markJobInactive(jobID string) {
+	o.activeMu.Lock()
+	defer o.activeMu.Unlock()
 	delete(o.activeJobs, jobID)
 }
 
 // isJobActive checks if a job is currently running
 func (o *Orchestrator) isJobActive(jobID string) bool {
+	o.activeMu.Lock()
+	defer o.activeMu.Unlock()
 	return o.activeJobs[jobID]
 }
 
 // CreateJob creates a new job for a Linear issue with optional operator context
 func (o *Orchestrator) CreateJob(linearIssueID string, operatorContext string) (*db.Job, error) {
+	o.admissionMu.Lock()
+	defer o.admissionMu.Unlock()
 	// Check if server is busy
 	currentJob, err := o.db.GetCurrentJob()
 	if err != nil {
@@ -339,7 +361,7 @@ func (o *Orchestrator) reviewCode(job *db.Job) error {
 4. Confirm the implementation matches requirements
 5. **TUI changes (internal/tui/)**: Verify the dashboard fits entirely in one terminal screen with no overflow or clipped header/footer. Left column height (jobs + errors + integrations) must equal right column height (server logs + job logs).
 
-If you find issues, fix them now.` + agentQualityInstructions
+If you find issues, fix them now.` + deliveryInstructions(job)
 
 	if err := o.opencode.SendMessage(job.OpenCodeSessionID, reviewPrompt, job.WorktreePath); err != nil {
 		return err
@@ -378,7 +400,7 @@ If you find issues, fix them now.` + agentQualityInstructions
 
 func (o *Orchestrator) recoverFromReviewWaitFailure(job *db.Job, waitErr error) error {
 	o.log(job.ID, "warn", fmt.Sprintf("OpenCode review did not finish cleanly; interrupting it before delivery recovery: %v", waitErr))
-	if interruptErr := o.opencode.InterruptSession(job.OpenCodeSessionID); interruptErr != nil {
+	if interruptErr := o.opencode.StopSession(job.OpenCodeSessionID, job.WorktreePath); interruptErr != nil {
 		return fmt.Errorf("OpenCode review failed (%v) and could not be interrupted safely: %w", waitErr, interruptErr)
 	}
 
@@ -399,7 +421,10 @@ func (o *Orchestrator) pushBranch(job *db.Job) error {
 
 	o.log(job.ID, "info", "Preparing validated commits before push")
 
-	gitMgr := git.NewManager(job.RepoPath, o.cfg.GitHub.DefaultBaseBranch)
+	gitMgr := git.NewManager(job.RepoPath, o.baseBranch(job))
+	if err := gitMgr.AssertBranch(job.WorktreePath, job.BranchName); err != nil {
+		return err
+	}
 
 	// Give OpenCode the first opportunity to inspect its diff, run checks, and
 	// create a contextual commit. A local generic commit is strictly last resort.
@@ -407,11 +432,14 @@ func (o *Orchestrator) pushBranch(job *db.Job) error {
 	if err != nil {
 		return fmt.Errorf("failed to inspect worktree before push: %w", err)
 	}
-	if hasChanges {
+	if hasChanges && job.OpenCodeSessionID != "" {
 		o.log(job.ID, "warn", "OpenCode left uncommitted changes; asking it to validate and create a contextual commit")
-		prompt := `Devbox detected uncommitted work in this repository. Inspect git status and the complete diff, run the repository's relevant CI-equivalent checks locally, fix any failures caused by the changes, and commit all completed work. Use a concise, contextual commit message that describes the actual ticket implementation.` + agentQualityInstructions
+		prompt := `Devbox detected uncommitted work in this repository. Inspect git status and the complete diff, run the repository's relevant CI-equivalent checks locally, fix any failures caused by the changes, and commit all completed work. Use a concise, contextual commit message that describes the actual ticket implementation.` + deliveryInstructions(job)
 		if sendErr := o.opencode.SendMessage(job.OpenCodeSessionID, prompt, job.WorktreePath); sendErr != nil {
 			o.log(job.ID, "warn", fmt.Sprintf("Could not ask OpenCode to commit; local fallback may be required: %v", sendErr))
+			if err := o.opencode.StopSession(job.OpenCodeSessionID, job.WorktreePath); err != nil {
+				return fmt.Errorf("cannot take over after ambiguous prompt failure: %w", err)
+			}
 		} else {
 			wait := commitRecoveryWait
 			if o.cfg.OpenCode.Timeout > 0 && o.cfg.OpenCode.Timeout < wait {
@@ -422,7 +450,7 @@ func (o *Orchestrator) pushBranch(job *db.Job) error {
 			})
 			if waitErr != nil {
 				o.log(job.ID, "warn", fmt.Sprintf("OpenCode commit recovery did not finish: %v", waitErr))
-				if interruptErr := o.opencode.InterruptSession(job.OpenCodeSessionID); interruptErr != nil {
+				if interruptErr := o.opencode.StopSession(job.OpenCodeSessionID, job.WorktreePath); interruptErr != nil {
 					return fmt.Errorf("OpenCode commit recovery failed (%v) and could not be interrupted safely: %w", waitErr, interruptErr)
 				}
 			}
@@ -430,6 +458,9 @@ func (o *Orchestrator) pushBranch(job *db.Job) error {
 	}
 
 	if err := o.validateWithOpenCodeRepair(job); err != nil {
+		return err
+	}
+	if err := gitMgr.AssertBranch(job.WorktreePath, job.BranchName); err != nil {
 		return err
 	}
 
@@ -458,7 +489,7 @@ func (o *Orchestrator) pushBranch(job *db.Job) error {
 
 	o.log(job.ID, "info", "Commits verified, pushing branch to remote")
 
-	if err := gitMgr.PushBranch(job.WorktreePath, job.BranchName); err != nil {
+	if err := o.pushWithRetry(job, gitMgr); err != nil {
 		return err
 	}
 
@@ -466,46 +497,45 @@ func (o *Orchestrator) pushBranch(job *db.Job) error {
 	return nil
 }
 
-// validateWithOpenCodeRepair runs the local quality gate and gives OpenCode one
-// bounded opportunity to repair the exact failure before delivery stops.
+// validateWithOpenCodeRepair formats locally and retries the full gate after
+// each bounded repair, including interrupted repairs that may have succeeded.
 func (o *Orchestrator) validateWithOpenCodeRepair(job *db.Job) error {
 	runValidation := func() error {
 		o.log(job.ID, "info", "Running local CI-equivalent validation before push")
+		if err := validation.Format(job.WorktreePath, o.formatCommands(job), func(msg string) {
+			o.log(job.ID, "info", msg)
+		}); err != nil {
+			return err
+		}
 		return validation.Run(job.WorktreePath, o.validationCommands(job), func(msg string) {
 			o.log(job.ID, "info", msg)
 		})
 	}
 
-	validationErr := runValidation()
-	if validationErr == nil {
-		return nil
-	}
-
-	o.log(job.ID, "warn", fmt.Sprintf("Local validation failed; sending the exact failure to OpenCode for repair: %v", validationErr))
-	prompt := buildValidationRepairPrompt(validationErr)
-	if err := o.opencode.SendMessage(job.OpenCodeSessionID, prompt, job.WorktreePath); err != nil {
-		return fmt.Errorf("local validation failed (%v), and OpenCode could not be asked to repair it: %w", validationErr, err)
-	}
-
-	wait := commitRecoveryWait
-	if o.cfg.OpenCode.Timeout > 0 && o.cfg.OpenCode.Timeout < wait {
-		wait = o.cfg.OpenCode.Timeout
-	}
-	if err := o.opencode.WaitForSessionIdle(job.OpenCodeSessionID, wait, job.WorktreePath, func(msg string) {
-		o.log(job.ID, "info", msg)
-	}); err != nil {
-		o.log(job.ID, "warn", fmt.Sprintf("OpenCode validation repair did not finish: %v", err))
-		if interruptErr := o.opencode.InterruptSession(job.OpenCodeSessionID); interruptErr != nil {
-			return fmt.Errorf("OpenCode validation repair failed (%v) and could not be interrupted safely: %w", err, interruptErr)
+	for attempt := 0; ; attempt++ {
+		validationErr := runValidation()
+		if validationErr == nil {
+			return nil
 		}
-		return fmt.Errorf("local validation failed and OpenCode repair timed out: %w", validationErr)
+		if attempt == maxRepairAttempts || job.OpenCodeSessionID == "" {
+			return fmt.Errorf("local validation failed after %d repair attempts: %w", attempt, validationErr)
+		}
+		o.log(job.ID, "warn", fmt.Sprintf("Repair attempt %d/%d: %v", attempt+1, maxRepairAttempts, validationErr))
+		err := o.opencode.SendMessage(job.OpenCodeSessionID, buildValidationRepairPrompt(validationErr), job.WorktreePath)
+		if err == nil {
+			wait := commitRecoveryWait
+			if o.cfg.OpenCode.Timeout > 0 && o.cfg.OpenCode.Timeout < wait {
+				wait = o.cfg.OpenCode.Timeout
+			}
+			err = o.opencode.WaitForSessionIdle(job.OpenCodeSessionID, wait, job.WorktreePath, func(msg string) { o.log(job.ID, "info", msg) })
+		}
+		if err != nil {
+			o.log(job.ID, "warn", fmt.Sprintf("Repair did not finish cleanly; stopping session and rechecking actual files: %v", err))
+			if stopErr := o.opencode.StopSession(job.OpenCodeSessionID, job.WorktreePath); stopErr != nil {
+				return fmt.Errorf("repair failed (%v); cannot safely take over worktree: %w", err, stopErr)
+			}
+		}
 	}
-
-	o.log(job.ID, "info", "OpenCode validation repair completed; rerunning the full local validation gate")
-	if err := runValidation(); err != nil {
-		return fmt.Errorf("local validation still fails after OpenCode repair: %w", err)
-	}
-	return nil
 }
 
 func buildValidationRepairPrompt(validationErr error) string {
@@ -516,7 +546,39 @@ Validation output:
 %s
 ---
 
-For formatting failures such as Prettier, run the formatter in write mode across every path reported (for example, pnpm exec prettier --write .), even when many files or files outside your original edit are listed. Then rerun the exact failing command and all relevant repository checks until they pass. Commit the resulting fixes with a concise message. Do not only report the failure or tell the operator what to run.`, validationErr)
+For formatting failures such as Prettier, run the formatter in write mode across every path reported (for example, pnpm exec prettier --write .), even when many files or files outside your original edit are listed. Then rerun the exact failing command and all relevant repository checks until they pass. Commit the resulting fixes with a concise message. Do not only report the failure or tell the operator what to run.`, validationErr) + agentQualityInstructions
+}
+
+func (o *Orchestrator) baseBranch(job *db.Job) string {
+	for _, repo := range o.cfg.Repos {
+		if repo.Repo.Path == job.RepoPath && repo.Repo.BaseBranch != "" {
+			return repo.Repo.BaseBranch
+		}
+	}
+	return o.cfg.GitHub.DefaultBaseBranch
+}
+
+func (o *Orchestrator) formatCommands(job *db.Job) []string {
+	for _, repo := range o.cfg.Repos {
+		if repo.Repo.Path == job.RepoPath {
+			return repo.Repo.FormatCommands
+		}
+	}
+	return nil
+}
+
+func (o *Orchestrator) pushWithRetry(job *db.Job, manager *git.Manager) error {
+	var err error
+	for attempt := 1; attempt <= 3; attempt++ {
+		if err = manager.PushBranch(job.WorktreePath, job.BranchName); err == nil {
+			return nil
+		}
+		o.log(job.ID, "warn", fmt.Sprintf("Push attempt %d/3 failed: %v", attempt, err))
+		if attempt < 3 {
+			time.Sleep(time.Duration(attempt) * time.Second)
+		}
+	}
+	return err
 }
 
 // validationCommands returns the per-repository override. A nil slice enables
@@ -533,11 +595,6 @@ func (o *Orchestrator) validationCommands(job *db.Job) []string {
 
 // createPullRequest creates a PR using gh CLI
 func (o *Orchestrator) createPullRequest(job *db.Job) error {
-	job.State = db.StatePROpen
-	if err := o.db.UpdateJob(job); err != nil {
-		return err
-	}
-
 	o.log(job.ID, "info", "Creating pull request")
 
 	// Fetch issue for PR details
@@ -557,11 +614,7 @@ func (o *Orchestrator) createPullRequest(job *db.Job) error {
 *Automated PR created by devboxd*`, issue.URL, issue.Description)
 
 	// Determine base branch
-	repo := o.cfg.FindRepo(issue.Team.Key, "", nil)
-	baseBranch := o.cfg.GitHub.DefaultBaseBranch
-	if repo != nil && repo.BaseBranch != "" {
-		baseBranch = repo.BaseBranch
-	}
+	baseBranch := o.baseBranch(job)
 
 	prURL, err := git.CreatePR(job.WorktreePath, prTitle, prBody, baseBranch)
 	if err != nil {
@@ -587,6 +640,11 @@ func (o *Orchestrator) createPullRequest(job *db.Job) error {
 
 // completeJob marks a job as complete
 func (o *Orchestrator) completeJob(job *db.Job) {
+	manager := git.NewManager(job.RepoPath, o.baseBranch(job))
+	if err := manager.VerifyPublished(job.WorktreePath, job.BranchName); err != nil {
+		o.failJob(job, fmt.Sprintf("Delivery verification failed: %v", err))
+		return
+	}
 	now := time.Now()
 	job.State = db.StateDone
 	job.CompletedAt = &now
@@ -608,6 +666,15 @@ func (o *Orchestrator) completeJob(job *db.Job) {
 
 // failJob marks a job as failed
 func (o *Orchestrator) failJob(job *db.Job, reason string) {
+	// Preserve output on the remote even when quality checks or the model fail.
+	// This is explicitly an incomplete checkpoint, never successful delivery.
+	if job.WorktreePath != "" {
+		if err := o.checkpointFailedWork(job); err != nil {
+			reason += fmt.Sprintf("; recovery incomplete (worktree preserved at %s): %v", job.WorktreePath, err)
+		} else {
+			reason += "; incomplete work committed and pushed to " + job.BranchName
+		}
+	}
 	now := time.Now()
 	job.State = db.StateFailed
 	job.BlockerReason = reason
@@ -618,24 +685,27 @@ func (o *Orchestrator) failJob(job *db.Job, reason string) {
 	}
 
 	o.log(job.ID, "error", fmt.Sprintf("Job failed: %s", reason))
+}
 
-	// Never force-remove uncommitted agent output. If delivery failed before the
-	// fallback commit could be created, preserve the worktree for recovery.
-	if job.WorktreePath != "" {
-		gitMgr := git.NewManager(job.RepoPath, o.cfg.GitHub.DefaultBaseBranch)
-		hasChanges, err := gitMgr.HasUncommittedChanges(job.WorktreePath)
-		if err != nil {
-			o.log(job.ID, "warn", fmt.Sprintf("Preserving failed worktree because its state could not be inspected: %v", err))
-			return
-		}
-		if hasChanges {
-			o.log(job.ID, "warn", fmt.Sprintf("Preserving failed worktree with uncommitted changes at %s", job.WorktreePath))
-			return
-		}
-		if err := gitMgr.RemoveWorktree(job.WorktreePath); err != nil {
-			o.log(job.ID, "warn", fmt.Sprintf("Failed to remove worktree: %v", err))
-		}
+func (o *Orchestrator) checkpointFailedWork(job *db.Job) error {
+	if err := o.opencode.StopSession(job.OpenCodeSessionID, job.WorktreePath); err != nil {
+		return fmt.Errorf("cannot stop agent safely: %w", err)
 	}
+	manager := git.NewManager(job.RepoPath, o.baseBranch(job))
+	if err := manager.AssertBranch(job.WorktreePath, job.BranchName); err != nil {
+		return err
+	}
+	if err := manager.CommitAll(job.WorktreePath, fmt.Sprintf("[%s] Checkpoint incomplete automated work", job.LinearIssueID)); err != nil {
+		return err
+	}
+	if err := o.pushWithRetry(job, manager); err != nil {
+		return err
+	}
+	o.log(job.ID, "warn", "Incomplete work checkpoint committed and verified on remote; job remains failed")
+	if err := manager.RemoveWorktree(job.WorktreePath); err != nil {
+		o.log(job.ID, "warn", fmt.Sprintf("Checkpoint published; worktree cleanup deferred: %v", err))
+	}
+	return nil
 }
 
 // buildCodingPrompt builds the prompt for OpenCode with optional operator context
@@ -744,17 +814,18 @@ func (o *Orchestrator) resumeJobFromState(job *db.Job) {
 	defer o.markJobInactive(job.ID)
 
 	// Validate that we have the necessary information to resume
-	if job.OpenCodeSessionID == "" && (job.State == db.StateCoding || job.State == db.StateReviewing) {
+	if job.OpenCodeSessionID == "" && (job.State == db.StateCoding || (job.State == db.StateReviewing && job.ReviewFeedback == "")) {
 		o.failJob(job, fmt.Sprintf("Cannot resume %s: missing OpenCode session ID", job.State))
 		return
 	}
 
-	if job.WorktreePath == "" && job.State != db.StateFetching {
+	if job.WorktreePath == "" && job.State != db.StateFetching && job.State != db.StatePreparing {
 		o.failJob(job, fmt.Sprintf("Cannot resume %s: missing worktree path", job.State))
 		return
 	}
 
-	// Resume from the appropriate state
+	// Resume from the appropriate state. Coding must still send a review
+	// prompt, and preparation must start a new coding session.
 	switch job.State {
 	case db.StateFetching:
 		// Resume from the beginning
@@ -770,7 +841,14 @@ func (o *Orchestrator) resumeJobFromState(job *db.Job) {
 			o.failJob(job, fmt.Sprintf("Failed to prepare worktree: %v", err))
 			return
 		}
-		fallthrough
+		if err := o.executeCoding(job); err != nil {
+			o.failJob(job, fmt.Sprintf("Failed to execute coding: %v", err))
+			return
+		}
+		if err := o.reviewCode(job); err != nil {
+			o.failJob(job, fmt.Sprintf("Failed to review code: %v", err))
+			return
+		}
 
 	case db.StateCoding:
 		// Resume waiting for OpenCode coding session
@@ -778,35 +856,53 @@ func (o *Orchestrator) resumeJobFromState(job *db.Job) {
 			o.failJob(job, fmt.Sprintf("Failed to resume coding: %v", err))
 			return
 		}
-		fallthrough
+		if err := o.reviewCode(job); err != nil {
+			o.failJob(job, fmt.Sprintf("Failed to review code: %v", err))
+			return
+		}
 
 	case db.StateReviewing:
+		// An accepted review is saved before the HTTP response. If the server
+		// stopped before sending it, start it now using the persisted feedback.
+		if job.ReviewFeedback != "" && job.ReviewingWaitStartedAt == nil {
+			_ = o.runReview(job) // runReview persists its own failure.
+			return
+		}
 		// Resume waiting for OpenCode review session
 		if err := o.resumeReviewing(job); err != nil {
 			o.failJob(job, fmt.Sprintf("Failed to resume reviewing: %v", err))
 			return
 		}
-		fallthrough
 
 	case db.StatePushing:
-		// Resume pushing branch
-		if err := o.pushBranch(job); err != nil {
-			o.failJob(job, fmt.Sprintf("Failed to push branch: %v", err))
+		// A repair may still be running in OpenCode after devboxd restarts.
+		if err := o.opencode.StopSession(job.OpenCodeSessionID, job.WorktreePath); err != nil {
+			o.failJob(job, fmt.Sprintf("Cannot safely resume delivery: %v", err))
 			return
 		}
-
-		// Create PR
-		if err := o.createPullRequest(job); err != nil {
-			o.failJob(job, fmt.Sprintf("Failed to create PR: %v", err))
-			return
-		}
-
-		// Mark complete
-		o.completeJob(job)
 
 	default:
 		o.failJob(job, fmt.Sprintf("Cannot resume from unknown state: %s", job.State))
+		return
 	}
+	if err := o.pushBranch(job); err != nil {
+		o.failJob(job, fmt.Sprintf("Failed to push branch: %v", err))
+		return
+	}
+	if job.PRURL != "" {
+		job.State = db.StatePROpen
+		job.BlockerReason = ""
+		job.CompletedAt = nil
+		if err := o.db.UpdateJob(job); err != nil {
+			o.failJob(job, fmt.Sprintf("Failed to finish review: %v", err))
+		}
+		return
+	}
+	if err := o.createPullRequest(job); err != nil {
+		o.failJob(job, fmt.Sprintf("Failed to create PR: %v", err))
+		return
+	}
+	o.completeJob(job)
 }
 
 // resumeCoding resumes waiting for an existing OpenCode coding session
@@ -946,37 +1042,88 @@ func (o *Orchestrator) ReplyToJob(jobID, message string) error {
 
 // ReviewJob sends review feedback to an existing job and updates the PR
 func (o *Orchestrator) ReviewJob(jobIDOrLinearID, feedback string) error {
+	job, err := o.acceptReview(jobIDOrLinearID, feedback)
+	if err != nil {
+		return err
+	}
+	return o.runReview(job)
+}
+
+// StartReview persists acceptance synchronously so errors are returned before
+// HTTP 202, and a restart can resume even before the worker sends its prompt.
+func (o *Orchestrator) StartReview(jobIDOrLinearID, feedback string) (*db.Job, error) {
+	job, err := o.acceptReview(jobIDOrLinearID, feedback)
+	if err != nil {
+		return nil, err
+	}
+	accepted := *job // The response must not race with the worker's updates.
+	go func() { _ = o.runReview(job) }()
+	return &accepted, nil
+}
+
+func (o *Orchestrator) acceptReview(jobIDOrLinearID, feedback string) (*db.Job, error) {
+	o.admissionMu.Lock()
+	defer o.admissionMu.Unlock()
+	if strings.TrimSpace(feedback) == "" {
+		return nil, fmt.Errorf("feedback is required")
+	}
 	// Try to find job by ID first, then by Linear issue ID
 	job, err := o.db.GetJob(jobIDOrLinearID)
 	if err != nil {
-		return fmt.Errorf("failed to get job: %w", err)
+		return nil, fmt.Errorf("failed to get job: %w", err)
 	}
 	if job == nil {
 		// Try finding by Linear issue ID
 		job, err = o.db.GetJobByLinearIssueID(jobIDOrLinearID)
 		if err != nil {
-			return fmt.Errorf("failed to get job by Linear ID: %w", err)
+			return nil, fmt.Errorf("failed to get job by Linear ID: %w", err)
 		}
 		if job == nil {
-			return fmt.Errorf("job not found: %s", jobIDOrLinearID)
+			return nil, fmt.Errorf("job not found: %s", jobIDOrLinearID)
 		}
 	}
 
 	// Check that job has a PR
 	if job.PRURL == "" {
-		return fmt.Errorf("job does not have a pull request yet (state: %s)", job.State)
+		return nil, fmt.Errorf("job does not have a pull request yet (state: %s)", job.State)
 	}
 
 	// Check that we have necessary information
 	if job.BranchName == "" {
-		return fmt.Errorf("job has no branch name")
+		return nil, fmt.Errorf("job has no branch name")
 	}
 	if job.RepoPath == "" {
-		return fmt.Errorf("job has no repo path")
+		return nil, fmt.Errorf("job has no repo path")
 	}
+	current, err := o.db.GetCurrentJob()
+	if err != nil {
+		return nil, err
+	}
+	if current != nil || o.isJobActive(job.ID) {
+		return nil, fmt.Errorf("server busy; cannot start concurrent review")
+	}
+	job.ReviewFeedback = feedback
+	job.State = db.StateReviewing
+	job.BlockerReason = ""
+	job.CompletedAt = nil
+	job.ReviewingWaitStartedAt = nil
+	if err := o.db.UpdateJob(job); err != nil {
+		return nil, fmt.Errorf("failed to accept review: %w", err)
+	}
+	o.markJobActive(job.ID)
+	return job, nil
+}
+
+func (o *Orchestrator) runReview(job *db.Job) (resultErr error) {
+	defer o.markJobInactive(job.ID)
+	defer func() {
+		if resultErr != nil {
+			o.failJob(job, fmt.Sprintf("Review failed: %v", resultErr))
+		}
+	}()
 
 	// Check if worktree exists on disk; recreate if it was cleaned up
-	gitMgr := git.NewManager(job.RepoPath, o.cfg.GitHub.DefaultBaseBranch)
+	gitMgr := git.NewManager(job.RepoPath, o.baseBranch(job))
 	if _, err := os.Stat(job.WorktreePath); os.IsNotExist(err) {
 		o.log(job.ID, "info", "Worktree missing, recreating from existing branch")
 
@@ -1003,13 +1150,6 @@ func (o *Orchestrator) ReviewJob(jobIDOrLinearID, feedback string) error {
 
 	o.log(job.ID, "info", "Received review feedback")
 
-	// Store review feedback
-	job.ReviewFeedback = feedback
-	job.State = db.StateReviewing
-	if err := o.db.UpdateJob(job); err != nil {
-		return fmt.Errorf("failed to update job: %w", err)
-	}
-
 	// Build review prompt
 	reviewPrompt := fmt.Sprintf(`Review feedback on your pull request:
 
@@ -1019,10 +1159,11 @@ Please address the feedback:
 1. Review and understand each comment
 2. Make the necessary changes to address the feedback
 3. Run all relevant local CI-equivalent checks
-4. Commit your changes with clear messages describing what you fixed
+4. Commit all changes with clear messages describing what you fixed
+5. Push all commits to the assigned branch on origin and verify it matches HEAD
 
-After making changes, confirm they are ready to push.
-%s`, feedback, agentQualityInstructions)
+After making changes, report the checks and the pushed commit.
+%s`, job.ReviewFeedback, deliveryInstructions(job))
 
 	// Create or reuse OpenCode session
 	sessionID := job.OpenCodeSessionID
@@ -1045,6 +1186,11 @@ After making changes, confirm they are ready to push.
 	}
 
 	// Send review feedback to OpenCode
+	started := time.Now()
+	job.ReviewingWaitStartedAt = &started
+	if err := o.db.UpdateJob(job); err != nil {
+		return fmt.Errorf("failed to persist review start: %w", err)
+	}
 	if err := o.opencode.SendMessage(sessionID, reviewPrompt, job.WorktreePath); err != nil {
 		return fmt.Errorf("failed to send review feedback to OpenCode: %w", err)
 	}
@@ -1063,42 +1209,24 @@ After making changes, confirm they are ready to push.
 		o.log(job.ID, "info", msg)
 	}
 
-	if err := o.opencode.WaitForSessionIdle(sessionID, o.cfg.OpenCode.Timeout, job.WorktreePath, logFunc); err != nil {
-		o.log(job.ID, "error", fmt.Sprintf("OpenCode session did not complete: %v", err))
-		return fmt.Errorf("OpenCode session timeout or error: %w", err)
-	}
-
-	o.log(job.ID, "info", "OpenCode session completed, checking for new commits")
-
-	// Verify that new commits exist (reuse gitMgr from earlier)
-	hasCommits, err := gitMgr.HasCommitsAheadOfBase(job.WorktreePath)
-	if err != nil {
-		o.log(job.ID, "error", fmt.Sprintf("Failed to check for commits: %v", err))
-		return fmt.Errorf("failed to check for commits: %w", err)
-	}
-
-	if !hasCommits {
-		o.log(job.ID, "warn", "No new commits found after review - OpenCode may not have made changes")
-		// Don't fail, just update state back to pr_open
-		job.State = db.StatePROpen
-		if err := o.db.UpdateJob(job); err != nil {
-			return fmt.Errorf("failed to update job state: %w", err)
+	if _, err := o.waitForSessionWithHealing(job, "reviewing", logFunc); err != nil {
+		if err := o.recoverFromReviewWaitFailure(job, err); err != nil {
+			return err
 		}
-		return fmt.Errorf("no new commits found after review iteration")
 	}
 
-	o.log(job.ID, "info", "New commits detected, pushing to existing branch")
-
-	// Push to the same branch (updates the existing PR)
-	if err := gitMgr.PushBranch(job.WorktreePath, job.BranchName); err != nil {
-		o.log(job.ID, "error", fmt.Sprintf("Failed to push branch: %v", err))
-		return fmt.Errorf("failed to push branch: %w", err)
+	// All review iterations use the same host gate as initial delivery, even
+	// when the agent made no commit or timed out after editing files.
+	if err := o.pushBranch(job); err != nil {
+		return fmt.Errorf("failed to deliver review: %w", err)
 	}
 
 	o.log(job.ID, "info", fmt.Sprintf("Successfully pushed updates to branch %s (PR: %s)", job.BranchName, job.PRURL))
 
 	// Update job state back to pr_open (still has active PR)
 	job.State = db.StatePROpen
+	job.BlockerReason = ""
+	job.CompletedAt = nil
 	if err := o.db.UpdateJob(job); err != nil {
 		return fmt.Errorf("failed to update job state: %w", err)
 	}
@@ -1276,7 +1404,10 @@ func (o *Orchestrator) healSession(job *db.Job, phase string) (string, error) {
 4. Confirm the implementation matches requirements
 5. **TUI changes (internal/tui/)**: Verify the dashboard fits entirely in one terminal screen with no overflow or clipped header/footer. Left column height (jobs + errors + integrations) must equal right column height (server logs + job logs).
 
-If you find issues, fix them now.` + agentQualityInstructions
+If you find issues, fix them now.` + deliveryInstructions(job)
+		if job.ReviewFeedback != "" {
+			prompt += "\nAddress the persisted review feedback:\n" + job.ReviewFeedback
+		}
 	} else {
 		return "", fmt.Errorf("unknown phase: %s", phase)
 	}

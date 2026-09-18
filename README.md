@@ -283,6 +283,44 @@ checks (`go test ./...`, `go vet ./...`) and Node package-manager checks
 `build` scripts). Use `validation_commands: []` only when validation should be
 explicitly disabled for that repository.
 
+The same host delivery gate runs for every review iteration. Devbox runs
+write-mode formatting before checks, asks OpenCode to repair failures up to
+three times, and reruns the checks even when a repair times out (after stopping
+the session and confirming it is idle). It commits all tracked and non-ignored
+untracked changes, pushes the assigned branch without force, and verifies that
+the actual remote SHA matches local HEAD and the worktree is clean. Pushes are
+retried up to three times. The configured repository base branch is used.
+
+Formatting and Node checks are detected in nested Git-visible packages such as
+`web/` as well as the root. Formatting uses `format:write`, `format:fix`, or
+`format`; a simple `prettier --check ...` script can supply the write command
+when none is declared. Use `format_commands` for other tools or layouts (commands
+run from the worktree root), or `format_commands: []` to disable formatting.
+For example:
+
+```yaml
+format_commands:
+  - "cd web && pnpm install --frozen-lockfile && pnpm exec prettier --write ."
+validation_commands:
+  - "cd web && pnpm run format:check && pnpm run lint && pnpm run test"
+```
+
+If coding or review still fails, Devbox attempts to stop OpenCode, commit an
+**incomplete checkpoint**, and push it before marking the job failed. A failed
+check never becomes a successful ticket merely because its branch was pushed.
+Cleanup occurs only after checkpoint publication is verified; if interruption,
+commit hooks, credentials, or remote rejection prevent recovery, the worktree is
+preserved and `blocker_reason` records the failure and recovery path. Cleanup
+never force-removes a dirty worktree.
+
+Review requests are saved before HTTP `202 Accepted` is returned. Duplicate or
+concurrent reviews are rejected, background errors are persisted, and accepted
+reviews resume after restart. The response includes the canonical `jobId`.
+`devbox review TEST-123 --comments "Address feedback" --wait` waits for verified
+delivery and exits with an error on failure. Without `--wait`, the CLI reports
+`accepted`, not completion. `--wait-timeout` limits the client's wait only; the
+server continues processing.
+
 **Environment Variable Overrides:**
 - `DEVBOXD_AUTH_TOKEN` - Server authentication token
 - `DEVBOXD_DB_PATH` - Database file path

@@ -292,6 +292,31 @@ func (c *Client) InterruptSession(sessionID string) error {
 	return nil
 }
 
+// StopSession verifies that interruption has settled before the host mutates
+// the worktree. Interrupt acknowledgement alone is not proof of quiescence.
+func (c *Client) StopSession(sessionID, directory string) error {
+	if sessionID == "" {
+		return nil
+	}
+	if err := c.InterruptSession(sessionID); err != nil {
+		return err
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		busy, err := c.IsSessionBusy(sessionID, directory)
+		if err != nil {
+			return fmt.Errorf("cannot confirm interrupted session is idle: %w", err)
+		}
+		if !busy {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("session %s is still active after interruption", sessionID)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
 // IsSessionBusy checks if a specific session is busy (version-aware)
 // For v2: session is busy if present in /api/session/active map
 // For classic: session is busy if status shows busy field = true
