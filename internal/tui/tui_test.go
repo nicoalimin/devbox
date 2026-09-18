@@ -3,7 +3,81 @@ package tui
 import (
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/charmbracelet/bubbles/viewport"
+	"github.com/nicoalimin/devbox/internal/db"
 )
+
+func TestDataRefreshPreservesScrolledLogPositions(t *testing.T) {
+	m := Model{
+		ready:              true,
+		serverLogsViewport: viewport.New(80, 3),
+		jobLogsViewport:    viewport.New(80, 3),
+		jobsViewport:       viewport.New(20, 3),
+		errorsViewport:     viewport.New(20, 3),
+	}
+	m.serverLogsViewport.SetContent(strings.Repeat("old server line\n", 10))
+	m.jobLogsViewport.SetContent(strings.Repeat("old job line\n", 10))
+	m.serverLogsViewport.GotoBottom()
+	m.jobLogsViewport.GotoBottom()
+	m.serverLogsViewport.LineUp(2)
+	m.jobLogsViewport.LineUp(3)
+	serverOffset := m.serverLogsViewport.YOffset
+	jobOffset := m.jobLogsViewport.YOffset
+
+	updatedModel, _ := m.Update(dataRefreshMsg{
+		serverLogs: testLogs(12, "server"),
+		jobLogs:    testLogs(12, "job"),
+	})
+	updated := updatedModel.(Model)
+
+	if updated.serverLogsViewport.YOffset != serverOffset {
+		t.Fatalf("server log offset = %d, want preserved offset %d", updated.serverLogsViewport.YOffset, serverOffset)
+	}
+	if updated.jobLogsViewport.YOffset != jobOffset {
+		t.Fatalf("job log offset = %d, want preserved offset %d", updated.jobLogsViewport.YOffset, jobOffset)
+	}
+}
+
+func TestDataRefreshFollowsLogsWhenAlreadyAtBottom(t *testing.T) {
+	m := Model{
+		ready:              true,
+		serverLogsViewport: viewport.New(80, 3),
+		jobLogsViewport:    viewport.New(80, 3),
+		jobsViewport:       viewport.New(20, 3),
+		errorsViewport:     viewport.New(20, 3),
+	}
+	m.serverLogsViewport.SetContent(strings.Repeat("old server line\n", 10))
+	m.jobLogsViewport.SetContent(strings.Repeat("old job line\n", 10))
+	m.serverLogsViewport.GotoBottom()
+	m.jobLogsViewport.GotoBottom()
+
+	updatedModel, _ := m.Update(dataRefreshMsg{
+		serverLogs: testLogs(12, "server"),
+		jobLogs:    testLogs(12, "job"),
+	})
+	updated := updatedModel.(Model)
+
+	if !updated.serverLogsViewport.AtBottom() {
+		t.Fatal("server logs stopped following while already at bottom")
+	}
+	if !updated.jobLogsViewport.AtBottom() {
+		t.Fatal("job logs stopped following while already at bottom")
+	}
+}
+
+func testLogs(count int, prefix string) []*db.JobLog {
+	logs := make([]*db.JobLog, count)
+	for i := range logs {
+		logs[i] = &db.JobLog{
+			Timestamp: time.Unix(int64(i), 0),
+			Level:     "info",
+			Message:   prefix,
+		}
+	}
+	return logs
+}
 
 func TestCalculateRenderedHeight(t *testing.T) {
 	tests := []struct {
@@ -162,11 +236,11 @@ func TestGetFooterHeight(t *testing.T) {
 // correctly accounts for header and footer wrapping at different terminal widths.
 func TestAvailableContentHeight(t *testing.T) {
 	tests := []struct {
-		name                        string
-		terminalHeight              int
-		terminalWidth               int
-		expectedAvailableContent    int
-		description                 string
+		name                     string
+		terminalHeight           int
+		terminalWidth            int
+		expectedAvailableContent int
+		description              string
 	}{
 		{
 			name:                     "80x24 terminal (standard)",
@@ -197,11 +271,11 @@ func TestAvailableContentHeight(t *testing.T) {
 				width:  tt.terminalWidth,
 				height: tt.terminalHeight,
 			}
-			
+
 			headerHeight := m.getHeaderHeight()
 			footerHeight := m.getFooterHeight()
 			availableContent := tt.terminalHeight - headerHeight - footerHeight - 2
-			
+
 			if availableContent != tt.expectedAvailableContent {
 				t.Errorf("%s: availableContentHeight = %v, want %v (header=%d, footer=%d, total=%d)",
 					tt.description, availableContent, tt.expectedAvailableContent,

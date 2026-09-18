@@ -129,7 +129,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.jobLogsViewport.LineUp(1)
 			}
 			return m, tea.Batch(cmds...)
-		
 
 		case "g":
 			// Go to top in focused pane
@@ -166,7 +165,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.jobLogsViewport.GotoBottom()
 			}
 			return m, tea.Batch(cmds...)
-		
 
 		case "enter":
 			// Switch focus to job logs pane
@@ -189,12 +187,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// to 2+ lines, and the header may also wrap if showing a long job name.
 		headerHeight := m.getHeaderHeight()
 		footerHeight := m.getFooterHeight()
-		
+
 		// Calculate viewport heights to fit layout exactly:
 		// Layout: Header (headerHeight) + newline (1) + Main Content + newline (1) + Footer (footerHeight) = height
 		// So: Main Content must be exactly (height - headerHeight - footerHeight - 2)
 		availableContentHeight := msg.Height - headerHeight - footerHeight - 2
-		
+
 		// Sidebar (stacked vertically):
 		//   - Jobs section: title (1) + viewport content + borders (2) = viewport + 3
 		//   - Errors section: title (1) + viewport content + borders (2) = viewport + 3
@@ -213,14 +211,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		//   Split with 2:1 ratio (Job Logs taller): jobLogs = 2/3, serverLogs = 1/3
 
 		sidebarWidth := 30
-		
+
 		// Jobs and errors split the available height, accounting for integrations bar (~5 lines)
 		// Each section needs: title (1) + viewport + borders (2) = viewport + 3
 		// Total: jobsViewport + errorsViewport + 6 + integrations (5) = availableContentHeight
 		sidebarJobsErrors := availableContentHeight - 5 // 5 for integrations bar
 		jobsHeight := (sidebarJobsErrors - 6) / 2       // -6 for titles (2) and borders (4) across both sections
 		errorsHeight := (sidebarJobsErrors - 6) / 2
-		
+
 		// Split logs pane into two sections (job logs above, server logs beneath)
 		// Each section renders as: title (1) + subtitle (1) + viewport + borders (2) = viewport + 4
 		// Total: (jobLogsViewport + 4) + (serverLogsViewport + 4) = availableContentHeight
@@ -282,23 +280,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		// Update viewport contents
 		if m.ready {
-			m.serverLogsViewport.SetContent(m.renderServerLogsContent())
-			m.jobLogsViewport.SetContent(m.renderJobLogsContent())
+			setViewportContent(m.serverLogsViewport.AtBottom(), &m.serverLogsViewport, m.renderServerLogsContent())
+			setViewportContent(m.jobLogsViewport.AtBottom(), &m.jobLogsViewport, m.renderJobLogsContent())
 			m.jobsViewport.SetContent(m.renderJobsContent())
 			m.errorsViewport.SetContent(m.renderErrorsContent())
-			
-			// Auto-scroll both logs to bottom to see latest activity
-			m.serverLogsViewport.GotoBottom()
-			m.jobLogsViewport.GotoBottom()
 		}
 		return m, nil
-	
+
 	case jobLogsRefreshMsg:
 		m.jobLogs = msg.jobLogs
 		if m.ready {
-			m.jobLogsViewport.SetContent(m.renderJobLogsContent())
-			// Auto-scroll to see latest job logs
-			m.jobLogsViewport.GotoBottom()
+			setViewportContent(m.jobLogsViewport.AtBottom(), &m.jobLogsViewport, m.renderJobLogsContent())
 		}
 		return m, nil
 	}
@@ -319,6 +311,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 
 	return m, tea.Batch(cmds...)
+}
+
+// setViewportContent updates dynamic content without stealing the reader's
+// scroll position. A viewport follows new output only while it was already at
+// the bottom; once the user scrolls up, refreshes preserve that offset.
+func setViewportContent(wasAtBottom bool, target *viewport.Model, content string) {
+	target.SetContent(content)
+	if wasAtBottom {
+		target.GotoBottom()
+	}
 }
 
 // View renders the full-screen TUI
@@ -427,7 +429,7 @@ func (m Model) renderSidebar() string {
 
 	jobsContent := m.renderJobsContent()
 	m.jobsViewport.SetContent(jobsContent)
-	
+
 	jobs := lipgloss.JoinVertical(
 		lipgloss.Left,
 		jobsTitle,
@@ -504,7 +506,7 @@ func (m Model) renderJobsContent() string {
 		}
 
 		state := stateStyle.Render(string(job.State))
-		
+
 		// Truncate job ID for display
 		displayID := job.LinearIssueID
 		if len(displayID) > 12 {
@@ -530,14 +532,14 @@ func (m Model) renderErrorsContent() string {
 		if i >= 5 { // Show max 5 blockers
 			break
 		}
-		
+
 		s.WriteString(errorStyle.Render("• ") + job.LinearIssueID + "\n")
 		if job.BlockerReason != "" {
 			reason := job.BlockerReason
 			if len(reason) > 22 {
 				reason = reason[:22] + "…"
 			}
-			s.WriteString(dimStyle.Render("  " + reason) + "\n")
+			s.WriteString(dimStyle.Render("  "+reason) + "\n")
 		}
 	}
 
@@ -576,7 +578,7 @@ func (m Model) renderIntegrationsBar() string {
 // renderLogsPane renders the main logs pane with both job logs and server logs
 func (m Model) renderLogsPane() string {
 	logsWidth := m.width - 32
-	
+
 	// Job Logs Section (TOP) - height includes title (1) + subtitle (1) + viewport + borders (2) = viewport + 4
 	jobLogsStyle := lipgloss.NewStyle().
 		Width(logsWidth).
@@ -760,14 +762,14 @@ func (m Model) refreshData() tea.Cmd {
 		// Get job logs for the selected job or current job
 		var jobLogs []*db.JobLog
 		var targetJob *db.Job
-		
+
 		// Priority: selected job > current job
 		if len(recentJobs) > 0 && m.selectedJobIdx < len(recentJobs) {
 			targetJob = recentJobs[m.selectedJobIdx]
 		} else if currentJob != nil {
 			targetJob = currentJob
 		}
-		
+
 		if targetJob != nil {
 			jobLogs, _ = m.database.GetLogs(targetJob.ID, 200)
 		}
@@ -786,13 +788,13 @@ func (m Model) refreshData() tea.Cmd {
 func (m Model) refreshJobLogs() tea.Cmd {
 	return func() tea.Msg {
 		var jobLogs []*db.JobLog
-		
+
 		// Get logs for the selected job
 		if len(m.recentJobs) > 0 && m.selectedJobIdx < len(m.recentJobs) {
 			targetJob := m.recentJobs[m.selectedJobIdx]
 			jobLogs, _ = m.database.GetLogs(targetJob.ID, 200)
 		}
-		
+
 		return jobLogsRefreshMsg{
 			jobLogs: jobLogs,
 		}
@@ -838,24 +840,24 @@ func calculateRenderedHeight(text string, width int, horizontalPadding int) int 
 	if width <= 0 {
 		return 1
 	}
-	
+
 	// Account for padding on both sides
 	effectiveWidth := width - (2 * horizontalPadding)
 	if effectiveWidth <= 0 {
 		effectiveWidth = 1
 	}
-	
+
 	// Calculate how many lines the text will occupy
 	textLen := len(text)
 	if textLen == 0 {
 		return 1
 	}
-	
+
 	lines := (textLen + effectiveWidth - 1) / effectiveWidth // Ceiling division
 	if lines < 1 {
 		lines = 1
 	}
-	
+
 	return lines
 }
 
@@ -865,12 +867,12 @@ func (m Model) getHeaderHeight() int {
 	if m.width <= 0 {
 		return 2 // Minimum with top padding
 	}
-	
+
 	// Worst-case header text (with a running job):
 	// "devboxd v1.0.0 │ BUSY │ Job: LINEAR-123456789012 (running) │ 999h99m"
 	// This is approximately 75 characters in the worst case
 	worstCaseHeaderLen := 75
-	
+
 	// Header has horizontal padding of 1 on each side, plus 1 line of top padding
 	textHeight := calculateRenderedHeight(strings.Repeat("X", worstCaseHeaderLen), m.width, 1)
 	return textHeight + 1 // Add 1 for top padding line
@@ -882,12 +884,12 @@ func (m Model) getFooterHeight() int {
 	if m.width <= 0 {
 		return 1
 	}
-	
+
 	// Worst-case footer text (with "Integrations" as the focused pane):
 	// "Focus: Integrations │ Tab: switch │ ↑↓/jk: nav │ g/G: jump │ r: refresh │ q: quit"
 	// This is approximately 85 characters
 	worstCaseFooterLen := 85
-	
+
 	// Footer has padding of 1 on each side
 	return calculateRenderedHeight(strings.Repeat("X", worstCaseFooterLen), m.width, 1)
 }
