@@ -55,15 +55,10 @@ Quality and delivery requirements:
 - Detect and use the repository's declared package manager and scripts.
 - If a Prettier or other formatting check fails, run its write-mode formatter (for example, pnpm exec prettier --write .), including every file reported anywhere in the repository—not only files you originally edited.
 - Rerun the exact failing command, then the repository's other relevant CI-equivalent checks. Continue fixing issues until they exit successfully.
-- Inspect git status and the complete diff, then use git add --all and commit every tracked and non-ignored untracked change in this dedicated job worktree with a concise, contextual message.
-- Push HEAD to the assigned branch on origin after every review pass. Never switch branches, force-push, reset, discard files, or bypass hooks. Verify the worktree is clean and the remote branch matches HEAD.
-- If checks remain broken, still commit and push a clearly labeled incomplete checkpoint and report the exact failure. A checkpoint is not a completed ticket.
-- Do not stop after describing commands, errors, or suggested fixes. Execute them and leave the worktree clean and committed, with all commits pushed.
+- Do not switch branches, force-push, reset, discard files, or bypass hooks.
+- Do not stop after describing commands, errors, or suggested fixes. Execute the implementation and leave all completed changes in the assigned worktree.
+- Devbox owns final formatting, validation, commit, and push from its host delivery gate; do not wait for or depend on a model-side commit or push.
 `
-
-func deliveryInstructions(job *db.Job) string {
-	return agentQualityInstructions + fmt.Sprintf("\nAssigned branch: %s. Push explicitly with git push -u origin HEAD:refs/heads/%s.\n", job.BranchName, job.BranchName)
-}
 
 // NewOrchestrator creates a new job orchestrator
 func NewOrchestrator(cfg *config.Config, database *db.DB) *Orchestrator {
@@ -365,7 +360,7 @@ func (o *Orchestrator) reviewCode(job *db.Job) error {
 4. Confirm the implementation matches requirements
 5. **TUI changes (internal/tui/)**: Verify the dashboard fits entirely in one terminal screen with no overflow or clipped header/footer. Left column height (jobs + errors + integrations) must equal right column height (server logs + job logs).
 
-If you find issues, fix them now.` + deliveryInstructions(job)
+If you find issues, fix them now.` + agentQualityInstructions
 
 	if err := o.opencode.SendMessage(job.OpenCodeSessionID, reviewPrompt, job.WorktreePath); err != nil {
 		return err
@@ -430,37 +425,6 @@ func (o *Orchestrator) pushBranch(job *db.Job) error {
 		return err
 	}
 
-	// Give OpenCode the first opportunity to inspect its diff, run checks, and
-	// create a contextual commit. A local generic commit is strictly last resort.
-	hasChanges, err := gitMgr.HasUncommittedChanges(job.WorktreePath)
-	if err != nil {
-		return fmt.Errorf("failed to inspect worktree before push: %w", err)
-	}
-	if hasChanges && job.OpenCodeSessionID != "" {
-		o.log(job.ID, "warn", "OpenCode left uncommitted changes; asking it to validate and create a contextual commit")
-		prompt := `Devbox detected uncommitted work in this repository. Inspect git status and the complete diff, run the repository's relevant CI-equivalent checks locally, fix any failures caused by the changes, and commit all completed work. Use a concise, contextual commit message that describes the actual ticket implementation.` + deliveryInstructions(job)
-		if sendErr := o.opencode.SendMessage(job.OpenCodeSessionID, prompt, job.WorktreePath); sendErr != nil {
-			o.log(job.ID, "warn", fmt.Sprintf("Could not ask OpenCode to commit; local fallback may be required: %v", sendErr))
-			if err := o.opencode.StopSession(job.OpenCodeSessionID, job.WorktreePath); err != nil {
-				return fmt.Errorf("cannot take over after ambiguous prompt failure: %w", err)
-			}
-		} else {
-			wait := commitRecoveryWait
-			if o.cfg.OpenCode.Timeout > 0 && o.cfg.OpenCode.Timeout < wait {
-				wait = o.cfg.OpenCode.Timeout
-			}
-			waitErr := o.opencode.WaitForSessionIdle(job.OpenCodeSessionID, wait, job.WorktreePath, func(msg string) {
-				o.log(job.ID, "info", msg)
-			})
-			if waitErr != nil {
-				o.log(job.ID, "warn", fmt.Sprintf("OpenCode commit recovery did not finish: %v", waitErr))
-				if interruptErr := o.opencode.StopSession(job.OpenCodeSessionID, job.WorktreePath); interruptErr != nil {
-					return fmt.Errorf("OpenCode commit recovery failed (%v) and could not be interrupted safely: %w", waitErr, interruptErr)
-				}
-			}
-		}
-	}
-
 	if err := o.validateWithOpenCodeRepair(job); err != nil {
 		return err
 	}
@@ -468,17 +432,17 @@ func (o *Orchestrator) pushBranch(job *db.Job) error {
 		return err
 	}
 
-	hasChanges, err = gitMgr.HasUncommittedChanges(job.WorktreePath)
+	hasChanges, err := gitMgr.HasUncommittedChanges(job.WorktreePath)
 	if err != nil {
 		return fmt.Errorf("failed to inspect worktree after validation: %w", err)
 	}
 	if hasChanges {
-		o.log(job.ID, "warn", "OpenCode still left uncommitted changes; creating last-resort commit with the current Git identity")
-		message := fmt.Sprintf("[%s] Apply automated changes", job.LinearIssueID)
+		o.log(job.ID, "info", "Committing host-formatted and validated worktree changes")
+		message := fmt.Sprintf("[%s] Apply validated changes", job.LinearIssueID)
 		if err := gitMgr.CommitAll(job.WorktreePath, message); err != nil {
-			return fmt.Errorf("failed to create last-resort commit using current Git configuration: %w", err)
+			return fmt.Errorf("failed to commit validated worktree changes using current Git configuration: %w", err)
 		}
-		o.log(job.ID, "info", "Created last-resort commit after OpenCode recovery and local validation")
+		o.log(job.ID, "info", "Host delivery gate created commit")
 	}
 
 	// Check if there are commits ahead of base
@@ -550,7 +514,7 @@ Validation output:
 %s
 ---
 
-For formatting failures such as Prettier, run the formatter in write mode across every path reported (for example, pnpm exec prettier --write .), even when many files or files outside your original edit are listed. Then rerun the exact failing command and all relevant repository checks until they pass. Commit the resulting fixes with a concise message. Do not only report the failure or tell the operator what to run.`, validationErr) + agentQualityInstructions
+For formatting failures such as Prettier, run the formatter in write mode across every path reported (for example, pnpm exec prettier --write .), even when many files or files outside your original edit are listed. Then rerun the exact failing command and all relevant repository checks until they pass. Leave the resulting fixes in the worktree; Devbox will format, validate, commit, and push them from the host. Do not only report the failure or tell the operator what to run.`, validationErr) + agentQualityInstructions
 }
 
 func (o *Orchestrator) baseBranch(job *db.Job) string {
@@ -749,7 +713,7 @@ func (o *Orchestrator) buildCodingPrompt(issue *linear.Issue, operatorContext st
 	sb.WriteString("2. Search Notion for related PRDs, specs, or context using the issue title and team\n")
 	sb.WriteString("3. Implement the required changes\n")
 	sb.WriteString("4. Run the repository's CI-equivalent checks and resolve every failure\n")
-	sb.WriteString("5. Commit your changes with clear messages\n")
+	sb.WriteString("5. Leave all completed changes in the assigned worktree for the host delivery gate\n")
 	sb.WriteString(agentQualityInstructions)
 
 	return sb.String()
@@ -1171,11 +1135,10 @@ Please address the feedback:
 1. Review and understand each comment
 2. Make the necessary changes to address the feedback
 3. Run all relevant local CI-equivalent checks
-4. Commit all changes with clear messages describing what you fixed
-5. Push all commits to the assigned branch on origin and verify it matches HEAD
+4. Leave all completed changes in the assigned worktree for the host delivery gate
 
-After making changes, report the checks and the pushed commit.
-%s`, job.ReviewFeedback, deliveryInstructions(job))
+After making changes, report the checks you ran.
+%s`, job.ReviewFeedback, agentQualityInstructions)
 
 	// Create or reuse OpenCode session
 	sessionID := job.OpenCodeSessionID
@@ -1416,7 +1379,7 @@ func (o *Orchestrator) healSession(job *db.Job, phase string) (string, error) {
 4. Confirm the implementation matches requirements
 5. **TUI changes (internal/tui/)**: Verify the dashboard fits entirely in one terminal screen with no overflow or clipped header/footer. Left column height (jobs + errors + integrations) must equal right column height (server logs + job logs).
 
-If you find issues, fix them now.` + deliveryInstructions(job)
+If you find issues, fix them now.` + agentQualityInstructions
 		if job.ReviewFeedback != "" {
 			prompt += "\nAddress the persisted review feedback:\n" + job.ReviewFeedback
 		}

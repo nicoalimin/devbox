@@ -252,8 +252,7 @@ func (m *Manager) HasUncommittedChanges(worktreePath string) (bool, error) {
 }
 
 // CommitAll commits every staged, unstaged, and untracked change in a
-// worktree. It is the delivery fallback when an agent edits files but does not
-// create the commit requested by the orchestrator.
+// worktree. The host delivery gate uses it after formatting and validation.
 func (m *Manager) CommitAll(worktreePath, message string) error {
 	if output, err := runDeliveryGit(worktreePath, "add", "--all"); err != nil {
 		return fmt.Errorf("failed to stage worktree changes: %w\nOutput: %s", err, string(output))
@@ -264,8 +263,8 @@ func (m *Manager) CommitAll(worktreePath, message string) error {
 		return fmt.Errorf("failed to inspect staged changes: %w", err)
 	}
 
-	// Deliberately use the repository/user Git configuration. A fallback commit
-	// should have the same identity as a normal commit made in this checkout.
+	// Deliberately use the repository/user Git configuration so the delivery
+	// commit has the same identity as a normal commit made in this checkout.
 	if output, err := runDeliveryGit(worktreePath, "commit", "-m", message); err != nil {
 		return fmt.Errorf("failed to commit worktree changes: %w\nOutput: %s", err, string(output))
 	}

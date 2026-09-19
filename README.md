@@ -283,13 +283,15 @@ checks (`go test ./...`, `go vet ./...`) and Node package-manager checks
 `build` scripts). Use `validation_commands: []` only when validation should be
 explicitly disabled for that repository.
 
-The same host delivery gate runs for every review iteration. Devbox runs
-write-mode formatting before checks, asks OpenCode to repair failures up to
-three times, and reruns the checks even when a repair times out (after stopping
-the session and confirming it is idle). It commits all tracked and non-ignored
-untracked changes, pushes the assigned branch without force, and verifies that
-the actual remote SHA matches local HEAD and the worktree is clean. Pushes are
-retried up to three times. The configured repository base branch is used.
+The same host delivery gate runs for every review iteration. Devbox itself runs
+write-mode formatting before checks and commits all tracked and non-ignored
+untracked changes after the checks pass; delivery does not depend on OpenCode
+formatting or committing its work. Devbox asks OpenCode to repair other failures
+up to three times and reruns the complete gate even when a repair times out
+(after stopping the session and confirming it is idle). It pushes the assigned
+branch without force and verifies that the actual remote SHA matches local HEAD
+and the worktree is clean. Pushes are retried up to three times. The configured
+repository base branch is used.
 
 Formatting and Node checks are detected in nested Git-visible packages such as
 `web/` as well as the root. Formatting uses `format:write`, `format:fix`, or
@@ -593,7 +595,7 @@ Instructions:
 2. Search Notion for related PRDs, specs, or context
 3. Implement the required changes
 4. Run tests and ensure code quality
-5. Commit your changes with clear messages
+5. Leave completed changes in the worktree for the host delivery gate
 ```
 
 ### Existing .opencode Instructions

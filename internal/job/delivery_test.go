@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -227,6 +228,34 @@ func TestHostFormattingRunsBeforeValidation(t *testing.T) {
 	}
 	if got := deliveryGit(t, remote, "show", "refs/heads/"+job.BranchName+":output.txt"); got != "formatted" {
 		t.Fatal(got)
+	}
+}
+
+func TestHostDeliveryFormatsAndCommitsWithoutOpenCode(t *testing.T) {
+	orch, job, remote := deliveryFixture(t)
+	orch.cfg.Repos[0].Repo.FormatCommands = []string{"printf 'formatted\\n' > output.txt"}
+	orch.cfg.Repos[0].Repo.ValidationCommands = []string{"test \"$(cat output.txt)\" = formatted"}
+
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer server.Close()
+	orch.opencode = opencode.NewClient(server.URL, "", "", "v2")
+	job.OpenCodeSessionID = "session-that-must-not-be-used"
+
+	if err := orch.pushBranch(job); err != nil {
+		t.Fatal(err)
+	}
+	if got := requests.Load(); got != 0 {
+		t.Fatalf("host delivery contacted OpenCode %d times", got)
+	}
+	if got := deliveryGit(t, remote, "show", "refs/heads/"+job.BranchName+":output.txt"); got != "formatted" {
+		t.Fatal(got)
+	}
+	if subject := deliveryGit(t, job.WorktreePath, "show", "-s", "--format=%s", "HEAD"); subject != "[TEST-1] Apply validated changes" {
+		t.Fatalf("commit subject = %q", subject)
 	}
 }
 
