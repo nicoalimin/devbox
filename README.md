@@ -283,15 +283,16 @@ checks (`go test ./...`, `go vet ./...`) and Node package-manager checks
 `build` scripts). Use `validation_commands: []` only when validation should be
 explicitly disabled for that repository.
 
-The same host delivery gate runs for every review iteration. Devbox itself runs
-write-mode formatting before checks and commits all tracked and non-ignored
-untracked changes after the checks pass; delivery does not depend on OpenCode
-formatting or committing its work. Devbox asks OpenCode to repair other failures
-up to three times and reruns the complete gate even when a repair times out
-(after stopping the session and confirming it is idle). It pushes the assigned
-branch without force and verifies that the actual remote SHA matches local HEAD
-and the worktree is clean. Pushes are retried up to three times. The configured
-repository base branch is used.
+The same host delivery gate runs for the first push and every review iteration.
+Devbox itself runs write-mode formatting and, when the worktree is dirty,
+commits all tracked and non-ignored untracked changes as `chore: format` before
+running the hard checks. This deterministic step does not depend on OpenCode
+remembering to format or commit. OpenCode may repair other validation failures
+up to three times; after each repair Devbox repeats its own format, commit, and
+check sequence, including when a repair times out after the session is stopped.
+Devbox then pushes the assigned branch without force and verifies that the
+actual remote SHA matches local HEAD and the worktree is clean. Pushes are
+retried up to three times. The configured repository base branch is used.
 
 Formatting and Node checks are detected in nested Git-visible packages such as
 `web/` as well as the root. Formatting uses `format:write`, `format:fix`, or

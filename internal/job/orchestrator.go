@@ -425,7 +425,7 @@ func (o *Orchestrator) pushBranch(job *db.Job) error {
 		return err
 	}
 
-	if err := o.validateWithOpenCodeRepair(job); err != nil {
+	if err := o.validateWithOpenCodeRepair(job, gitMgr); err != nil {
 		return err
 	}
 	if err := gitMgr.AssertBranch(job.WorktreePath, job.BranchName); err != nil {
@@ -437,12 +437,12 @@ func (o *Orchestrator) pushBranch(job *db.Job) error {
 		return fmt.Errorf("failed to inspect worktree after validation: %w", err)
 	}
 	if hasChanges {
-		o.log(job.ID, "info", "Committing host-formatted and validated worktree changes")
-		message := fmt.Sprintf("[%s] Apply validated changes", job.LinearIssueID)
+		o.log(job.ID, "warn", "Validation commands left uncommitted changes; committing them with the current Git identity")
+		message := fmt.Sprintf("[%s] Commit validation output", job.LinearIssueID)
 		if err := gitMgr.CommitAll(job.WorktreePath, message); err != nil {
-			return fmt.Errorf("failed to commit validated worktree changes using current Git configuration: %w", err)
+			return fmt.Errorf("failed to commit validation output using current Git configuration: %w", err)
 		}
-		o.log(job.ID, "info", "Host delivery gate created commit")
+		o.log(job.ID, "info", "Committed changes produced by local validation")
 	}
 
 	// Check if there are commits ahead of base
@@ -467,14 +467,33 @@ func (o *Orchestrator) pushBranch(job *db.Job) error {
 
 // validateWithOpenCodeRepair formats locally and retries the full gate after
 // each bounded repair, including interrupted repairs that may have succeeded.
-func (o *Orchestrator) validateWithOpenCodeRepair(job *db.Job) error {
+func (o *Orchestrator) validateWithOpenCodeRepair(job *db.Job, gitMgr *git.Manager) error {
 	runValidation := func() error {
-		o.log(job.ID, "info", "Running local CI-equivalent validation before push")
+		// A repair agent can run arbitrary Git commands. Reassert the assigned
+		// branch before every host-owned format/commit pass.
+		if err := gitMgr.AssertBranch(job.WorktreePath, job.BranchName); err != nil {
+			return err
+		}
+		o.log(job.ID, "info", "Running deterministic host formatting before validation")
 		if err := validation.Format(job.WorktreePath, o.formatCommands(job), func(msg string) {
 			o.log(job.ID, "info", msg)
 		}); err != nil {
-			return err
+			return fmt.Errorf("host formatting failed: %w", err)
 		}
+
+		hasChanges, err := gitMgr.HasUncommittedChanges(job.WorktreePath)
+		if err != nil {
+			return fmt.Errorf("failed to inspect formatted worktree: %w", err)
+		}
+		if hasChanges {
+			o.log(job.ID, "info", "Host formatting or agent output changed the worktree; creating chore: format commit")
+			if err := gitMgr.CommitAll(job.WorktreePath, "chore: format"); err != nil {
+				return fmt.Errorf("failed to commit host-formatted worktree: %w", err)
+			}
+			o.log(job.ID, "info", "Created chore: format commit")
+		}
+
+		o.log(job.ID, "info", "Running local CI-equivalent validation before push")
 		return validation.Run(job.WorktreePath, o.validationCommands(job), func(msg string) {
 			o.log(job.ID, "info", msg)
 		})
