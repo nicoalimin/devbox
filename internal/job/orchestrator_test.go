@@ -14,7 +14,7 @@ import (
 	"github.com/nicoalimin/devbox/internal/linear"
 )
 
-func TestBuildCodingPromptRequiresFormattingRepairAndCommit(t *testing.T) {
+func TestBuildCodingPromptDefersDeliveryToHost(t *testing.T) {
 	orch := &Orchestrator{}
 	prompt := orch.buildCodingPrompt(&linear.Issue{
 		Identifier: "TEST-123",
@@ -27,7 +27,7 @@ func TestBuildCodingPromptRequiresFormattingRepairAndCommit(t *testing.T) {
 		"formatting, lint, typecheck, test, and build failures as work to fix",
 		"pnpm exec prettier --write .",
 		"every file reported anywhere in the repository",
-		"leave the worktree clean and committed",
+		"host delivery gate",
 	} {
 		if !strings.Contains(prompt, required) {
 			t.Fatalf("coding prompt does not contain %q\n%s", required, prompt)
@@ -41,7 +41,7 @@ func TestBuildValidationRepairPromptIncludesExactFailureAndActions(t *testing.T)
 		"prettier failed: web/tsconfig.json",
 		"pnpm exec prettier --write .",
 		"rerun the exact failing command",
-		"Commit the resulting fixes",
+		"Leave the resulting fixes in the worktree",
 	} {
 		if !strings.Contains(prompt, required) {
 			t.Fatalf("validation repair prompt does not contain %q\n%s", required, prompt)
