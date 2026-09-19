@@ -41,6 +41,7 @@ Thumbs.db
 
 # Worktrees
 /worktrees/
+.devbox-worktrees/
 
 # n8n
 node_modules/
