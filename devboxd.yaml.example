@@ -2,6 +2,15 @@ server:
   listen: "0.0.0.0:8080"
   # auth_token: "your-secret-token-here"  # or set DEVBOXD_AUTH_TOKEN env var
 
+# Opt-in authenticated self-upgrade from this checkout's trusted remote.
+upgrade:
+  enabled: false
+  source_path: "/path/to/devbox"
+  remote: "origin"
+  branch: "main"
+  build_timeout: "20m"
+  drain_timeout: "1h"
+
 database:
   # path: ""  # Path to SQLite database file
               # Default: .devbox/jobs.db (relative to current working directory)

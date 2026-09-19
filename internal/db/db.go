@@ -22,8 +22,8 @@ var migrationsFS embed.FS
 type JobState string
 
 const (
-	StateQueued   JobState = "queued"
-	StateFetching JobState = "fetching"
+	StateQueued    JobState = "queued"
+	StateFetching  JobState = "fetching"
 	StatePreparing JobState = "preparing"
 	StateCoding    JobState = "coding"
 	StateReviewing JobState = "reviewing"
@@ -48,23 +48,23 @@ func (s JobState) IsBusy() bool {
 
 // Job represents a coding job
 type Job struct {
-	ID                      string     `json:"id"`
-	LinearIssueID           string     `json:"linear_issue_id"`
-	LinearURL               string     `json:"linear_url"`
-	State                   JobState   `json:"state"`
-	RepoPath                string     `json:"repo_path"`
-	BranchName              string     `json:"branch_name"`
-	WorktreePath            string     `json:"worktree_path"`
-	PRURL                   string     `json:"pr_url"`
-	BlockerReason           string     `json:"blocker_reason"`
-	OpenCodeSessionID       string     `json:"opencode_session_id"`
-	OperatorContext         string     `json:"operator_context"`
-	ReviewFeedback          string     `json:"review_feedback"`
-	CodingWaitStartedAt     *time.Time `json:"coding_wait_started_at"`
-	ReviewingWaitStartedAt  *time.Time `json:"reviewing_wait_started_at"`
-	CreatedAt               time.Time  `json:"created_at"`
-	UpdatedAt               time.Time  `json:"updated_at"`
-	CompletedAt             *time.Time `json:"completed_at"`
+	ID                     string     `json:"id"`
+	LinearIssueID          string     `json:"linear_issue_id"`
+	LinearURL              string     `json:"linear_url"`
+	State                  JobState   `json:"state"`
+	RepoPath               string     `json:"repo_path"`
+	BranchName             string     `json:"branch_name"`
+	WorktreePath           string     `json:"worktree_path"`
+	PRURL                  string     `json:"pr_url"`
+	BlockerReason          string     `json:"blocker_reason"`
+	OpenCodeSessionID      string     `json:"opencode_session_id"`
+	OperatorContext        string     `json:"operator_context"`
+	ReviewFeedback         string     `json:"review_feedback"`
+	CodingWaitStartedAt    *time.Time `json:"coding_wait_started_at"`
+	ReviewingWaitStartedAt *time.Time `json:"reviewing_wait_started_at"`
+	CreatedAt              time.Time  `json:"created_at"`
+	UpdatedAt              time.Time  `json:"updated_at"`
+	CompletedAt            *time.Time `json:"completed_at"`
 }
 
 // JobLog represents a log entry for a job
@@ -161,6 +161,19 @@ func createDirIfNotExist(dir string) error {
 // Close closes the database connection
 func (db *DB) Close() error {
 	return db.conn.Close()
+}
+
+// Backup includes committed WAL contents in a standalone SQLite snapshot.
+func (db *DB) Backup(path string) error {
+	if _, err := os.Stat(path); err == nil {
+		return fmt.Errorf("backup already exists: %s", path)
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+	if _, err := db.conn.Exec("VACUUM INTO ?", path); err != nil {
+		return fmt.Errorf("backup database: %w", err)
+	}
+	return os.Chmod(path, 0600)
 }
 
 // CreateJob creates a new job

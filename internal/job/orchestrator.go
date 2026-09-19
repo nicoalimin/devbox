@@ -32,7 +32,8 @@ type Orchestrator struct {
 	streamStopFuncs map[string]func() // Stop functions for active event streams (jobID -> stopFunc)
 	streamMu        sync.Mutex        // Mutex to protect streamStopFuncs map
 	activeMu        sync.Mutex
-	admissionMu     sync.Mutex                                // Serialize job/review admission before persisting busy state.
+	admissionMu     sync.Mutex // Serialize job/review admission before persisting busy state.
+	maintenance     bool
 	prStatusFn      func(prURL string) (prStatus, int, error) // Override for getPRStatus (tests)
 }
 
@@ -110,6 +111,9 @@ func (o *Orchestrator) isJobActive(jobID string) bool {
 func (o *Orchestrator) CreateJob(linearIssueID string, operatorContext string) (*db.Job, error) {
 	o.admissionMu.Lock()
 	defer o.admissionMu.Unlock()
+	if o.maintenance {
+		return nil, fmt.Errorf("server is draining for upgrade; retry after restart")
+	}
 	// Check if server is busy
 	currentJob, err := o.db.GetCurrentJob()
 	if err != nil {
@@ -1008,6 +1012,11 @@ func (o *Orchestrator) CancelJob(jobID string) error {
 
 // ReplyToJob sends a reply to a blocked job
 func (o *Orchestrator) ReplyToJob(jobID, message string) error {
+	o.admissionMu.Lock()
+	defer o.admissionMu.Unlock()
+	if o.maintenance {
+		return fmt.Errorf("server is draining for upgrade; retry after restart")
+	}
 	job, err := o.db.GetJob(jobID)
 	if err != nil {
 		return err
@@ -1064,6 +1073,9 @@ func (o *Orchestrator) StartReview(jobIDOrLinearID, feedback string) (*db.Job, e
 func (o *Orchestrator) acceptReview(jobIDOrLinearID, feedback string) (*db.Job, error) {
 	o.admissionMu.Lock()
 	defer o.admissionMu.Unlock()
+	if o.maintenance {
+		return nil, fmt.Errorf("server is draining for upgrade; retry after restart")
+	}
 	if strings.TrimSpace(feedback) == "" {
 		return nil, fmt.Errorf("feedback is required")
 	}

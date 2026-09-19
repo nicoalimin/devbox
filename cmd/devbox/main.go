@@ -4,10 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/nicoalimin/devbox/internal/buildinfo"
 	"os"
 	"time"
 
-	"github.com/nicoalimin/devbox/pkg/client"
 	"github.com/spf13/cobra"
 )
 
@@ -60,6 +60,10 @@ func main() {
 		reviewCmd(),
 		cancelCmd(),
 		logsCmd(),
+		upgradeCmd(),
+		&cobra.Command{Use: "version", Short: "Print client version and revision", Run: func(cmd *cobra.Command, args []string) {
+			fmt.Printf("devbox %s (%s)\n", buildinfo.Version, buildinfo.Revision)
+		}},
 	)
 
 	if err := rootCmd.Execute(); err != nil {
@@ -73,7 +77,7 @@ func healthCmd() *cobra.Command {
 		Use:   "health",
 		Short: "Check if server is reachable",
 		Run: func(cmd *cobra.Command, args []string) {
-			c := client.NewClient(serverURL, token)
+			c := newAPIClient()
 			resp, err := c.Health()
 			if err != nil {
 				exitError("Health check failed", err)
@@ -93,7 +97,7 @@ func statusCmd() *cobra.Command {
 		Use:   "status",
 		Short: "Get overall status + current job summary",
 		Run: func(cmd *cobra.Command, args []string) {
-			c := client.NewClient(serverURL, token)
+			c := newAPIClient()
 			resp, err := c.Status()
 			if err != nil {
 				exitError("Failed to get status", err)
@@ -103,6 +107,10 @@ func statusCmd() *cobra.Command {
 				printJSON(resp)
 			} else {
 				fmt.Printf("Version: %s\n", resp.Version)
+				fmt.Printf("Revision: %s (instance %s)\n", resp.Revision, resp.InstanceID)
+				if resp.Draining {
+					fmt.Println("Server is draining jobs for upgrade")
+				}
 				if resp.Busy {
 					fmt.Printf("Status: BUSY\n")
 					fmt.Printf("Current Job: %s (state: %s)\n", resp.CurrentJobID, resp.CurrentJobState)
@@ -160,7 +168,7 @@ All context sources are combined and passed to the OpenCode worker.`,
 				}
 			}
 
-			c := client.NewClient(serverURL, token)
+			c := newAPIClient()
 			job, err := c.Assign(args[0], operatorContext)
 			if err != nil {
 				exitError("Failed to assign job", err)
@@ -192,7 +200,7 @@ func jobsCmd() *cobra.Command {
 		Use:   "jobs",
 		Short: "List recent jobs",
 		Run: func(cmd *cobra.Command, args []string) {
-			c := client.NewClient(serverURL, token)
+			c := newAPIClient()
 			jobs, err := c.ListJobs(limit)
 			if err != nil {
 				exitError("Failed to list jobs", err)
@@ -228,7 +236,7 @@ func jobCmd() *cobra.Command {
 		Short: "Get detailed job status",
 		Args:  cobra.ExactArgs(1),
 		Run: func(cmd *cobra.Command, args []string) {
-			c := client.NewClient(serverURL, token)
+			c := newAPIClient()
 			job, err := c.GetJob(args[0])
 			if err != nil {
 				exitError("Failed to get job", err)
@@ -270,7 +278,7 @@ func blockersCmd() *cobra.Command {
 		Use:   "blockers",
 		Short: "List jobs in blocked state",
 		Run: func(cmd *cobra.Command, args []string) {
-			c := client.NewClient(serverURL, token)
+			c := newAPIClient()
 			jobs, err := c.GetBlockers()
 			if err != nil {
 				exitError("Failed to get blockers", err)
@@ -302,7 +310,7 @@ func replyCmd() *cobra.Command {
 		Short: "Send clarification to resume blocked job",
 		Args:  cobra.ExactArgs(2),
 		Run: func(cmd *cobra.Command, args []string) {
-			c := client.NewClient(serverURL, token)
+			c := newAPIClient()
 			if err := c.Reply(args[0], args[1]); err != nil {
 				exitError("Failed to reply to job", err)
 			}
@@ -351,7 +359,7 @@ The job can be identified by job ID or Linear issue ID.`,
 				exitError("Review feedback required", fmt.Errorf("use --comments or --comments-file to provide feedback"))
 			}
 
-			c := client.NewClient(serverURL, token)
+			c := newAPIClient()
 			accepted, err := c.StartReview(args[0], feedback)
 			if err != nil {
 				exitError("Failed to send review feedback", err)
@@ -392,7 +400,7 @@ func cancelCmd() *cobra.Command {
 		Short: "Cancel a job",
 		Args:  cobra.ExactArgs(1),
 		Run: func(cmd *cobra.Command, args []string) {
-			c := client.NewClient(serverURL, token)
+			c := newAPIClient()
 			if err := c.Cancel(args[0]); err != nil {
 				exitError("Failed to cancel job", err)
 			}
@@ -413,7 +421,7 @@ func logsCmd() *cobra.Command {
 		Short: "View job logs",
 		Args:  cobra.ExactArgs(1),
 		Run: func(cmd *cobra.Command, args []string) {
-			c := client.NewClient(serverURL, token)
+			c := newAPIClient()
 			logs, err := c.GetLogs(args[0], tail)
 			if err != nil {
 				exitError("Failed to get logs", err)
