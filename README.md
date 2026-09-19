@@ -906,6 +906,93 @@ A: Not yet. PR creation uses `gh` CLI. You'd need to modify `internal/git/git.go
 **Q: How do I update Linear status automatically?**  
 A: The server can call Linear's GraphQL API to update issue state. Future enhancement to make this configurable.
 
+## Self-upgrade (macOS and Linux)
+
+After a reviewed harness PR is merged to `nicoalimin/devbox` main, an operator
+or automation can run `devbox upgrade`. The authenticated RPC builds the
+configured remote branch and restarts the server; it does not merge PRs itself.
+
+Enable it in the host's `devboxd.yaml`:
+
+```yaml
+upgrade:
+  enabled: true
+  source_path: /Users/nicoalimin/code/devbox
+  remote: origin
+  branch: main
+  build_timeout: 20m
+  drain_timeout: 1h
+```
+
+The service account needs Git access to that trusted remote, Go (and the C
+toolchain required by SQLite), and write access to the installed binary
+directory and database directory. The configured checkout may contain other
+branches or dirty files: upgrades fetch into an isolated temporary checkout and
+never pull/reset the host checkout. Both `devboxd` and the sibling `devbox`
+executable are installed atomically. Run from a compiled, installed binary,
+not `go run`. No sudo or privilege escalation is performed by the upgrader.
+
+The first deployment of this feature needs the normal bootstrap once:
+
+```sh
+go build -o bin/devboxd ./cmd/devboxd
+go build -o bin/devbox ./cmd/devbox
+# Stop the old daemon only when its jobs have finished, then start:
+./bin/devboxd --config devboxd.yaml
+```
+
+Subsequent upgrades use the running server:
+
+```sh
+devbox upgrade                       # Wait through restart and verify health
+devbox upgrade --wait=false          # Accept asynchronously
+devbox upgrade --status              # Inspect durable progress/failure
+devbox version                      # Client revision
+devbox status                       # Server revision, instance, and drain state
+```
+
+`POST /v1/upgrade` returns HTTP 202 and an upgrade ID; `GET /v1/upgrade` returns
+its persisted state. Both require the usual bearer token. Targets come only
+from the host configuration, not request input. Progress is `building` →
+`draining` → `installing` → `restarting` → `complete` (or `up_to_date`/`failed`).
+Duplicate upgrades are rejected. While draining, new assignments, reviews,
+and replies are rejected; existing workers finish normally. If the drain
+deadline expires, installation is abandoned and admission resumes.
+
+Before replacing binaries, Devbox saves rollback copies and a consistent
+SQLite snapshot, including committed WAL data. It closes HTTP, restores the
+TUI terminal, closes SQLite, and uses `exec` to preserve the daemon PID, working
+directory, arguments, environment, and foreground terminal. The new process
+runs normal database migrations and must pass a local HTTP health check before
+the upgrade is marked complete and job admission resumes. Installation/exec
+failures restore the binaries. Startup failures restore the binaries and
+database snapshot; failed database/sidecar files are retained for diagnosis.
+
+State, built binaries, and rollback copies live under `upgrades/` beside the
+jobs database (normally `.devbox/upgrades/`). Source checkouts are removed after
+building; rollback artifacts are retained. Abrupt process/host death still
+requires the normal service supervisor or operator to start the daemon again;
+startup recovers persisted upgrade state. An upgrade cannot make an unavailable
+Git remote, full disk, or broken toolchain succeed: failures remain visible and
+never count as completion. Keep ordinary database backups as well.
+
+`/health`, `/v1/status`, and response headers expose the server revision and
+instance ID. Polling CLI commands announce an instance change. `devbox upgrade`
+verifies both the target SHA and a new healthy instance and prints the client
+restart action. The sibling client on the server host is updated automatically;
+restart long-running clients. Clients on other machines should build/install
+the same revision, then reconnect. `--timeout` limits only the client wait;
+it does not cancel the server's upgrade.
+
+The opt-in integration test builds and restarts a real daemon against a local
+temporary Git remote, checks the client binary revision, and verifies a stored
+job survives. It also injects a failing migration and verifies automatic binary
+and database rollback. Run it from a commit containing the implementation:
+
+```sh
+DEVBOX_UPGRADE_INTEGRATION=1 go test ./cmd/devboxd -run TestSelfUpgradeProcess -v
+```
+
 ## Contributing
 
 Contributions welcome! Please:

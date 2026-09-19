@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"time"
@@ -907,8 +908,22 @@ var (
 
 // Run starts the TUI
 func Run(cfg *config.Config, database *db.DB) error {
+	return RunContext(context.Background(), cfg, database)
+}
+
+// RunContext restores the terminal before a graceful daemon restart.
+func RunContext(ctx context.Context, cfg *config.Config, database *db.DB) error {
 	m := NewModel(cfg, database)
 	p := tea.NewProgram(m, tea.WithAltScreen())
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		select {
+		case <-ctx.Done():
+			p.Quit()
+		case <-done:
+		}
+	}()
 	_, err := p.Run()
 	return err
 }

@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -10,18 +11,24 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
+	"github.com/google/uuid"
+	"github.com/nicoalimin/devbox/internal/buildinfo"
 	"github.com/nicoalimin/devbox/internal/config"
 	"github.com/nicoalimin/devbox/internal/db"
 	"github.com/nicoalimin/devbox/internal/job"
+	"github.com/nicoalimin/devbox/internal/upgrade"
 )
 
-const Version = "0.1.0"
+const Version = buildinfo.Version
 
 // Server represents the HTTP API server
 type Server struct {
 	cfg          *config.Config
 	db           *db.DB
 	orchestrator *job.Orchestrator
+	upgrader     *upgrade.Manager
+	instanceID   string
+	httpServer   *http.Server
 }
 
 // NewServer creates a new API server
@@ -30,8 +37,14 @@ func NewServer(cfg *config.Config, database *db.DB, orch *job.Orchestrator) *Ser
 		cfg:          cfg,
 		db:           database,
 		orchestrator: orch,
+		instanceID:   uuid.NewString(),
+		httpServer:   &http.Server{ReadHeaderTimeout: 10 * time.Second},
 	}
 }
+
+func (s *Server) InstanceID() string                   { return s.instanceID }
+func (s *Server) SetUpgrader(manager *upgrade.Manager) { s.upgrader = manager }
+func (s *Server) Shutdown(ctx context.Context) error   { return s.httpServer.Shutdown(ctx) }
 
 // Start starts the HTTP server
 func (s *Server) Start() error {
@@ -52,7 +65,23 @@ func (s *Server) StartWithLogger(customLogger func(string, ...interface{})) erro
 // the listener separately lets callers surface bind failures before starting a
 // full-screen UI or other long-running foreground work.
 func (s *Server) ServeWithLogger(listener net.Listener, customLogger func(string, ...interface{})) error {
+	s.httpServer.Handler = s.Router(customLogger)
+	err := s.httpServer.Serve(listener)
+	if err == http.ErrServerClosed {
+		return nil
+	}
+	return err
+}
+
+func (s *Server) Router(customLogger func(string, ...interface{})) http.Handler {
 	r := chi.NewRouter()
+	r.Use(func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("X-Devbox-Revision", buildinfo.Revision)
+			w.Header().Set("X-Devbox-Instance", s.instanceID)
+			next.ServeHTTP(w, r)
+		})
+	})
 
 	// Middleware
 	if customLogger != nil {
@@ -90,6 +119,8 @@ func (s *Server) ServeWithLogger(listener net.Listener, customLogger func(string
 		r.Use(s.authMiddleware)
 
 		r.Get("/v1/status", s.handleStatus)
+		r.Get("/v1/upgrade", s.handleUpgradeStatus)
+		r.Post("/v1/upgrade", s.handleUpgrade)
 		r.Post("/v1/jobs", s.handleCreateJob)
 		r.Get("/v1/jobs", s.handleListJobs)
 		r.Get("/v1/jobs/{id}", s.handleGetJob)
@@ -105,7 +136,7 @@ func (s *Server) ServeWithLogger(listener net.Listener, customLogger func(string
 	} else {
 		customLogger("Starting devboxd server on %s", s.cfg.Server.Listen)
 	}
-	return http.Serve(listener, r)
+	return r
 }
 
 // authMiddleware validates the bearer token
@@ -130,8 +161,10 @@ func (s *Server) authMiddleware(next http.Handler) http.Handler {
 // handleHealth handles health check requests
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	s.writeJSON(w, http.StatusOK, map[string]interface{}{
-		"healthy": true,
-		"version": Version,
+		"healthy":    true,
+		"version":    Version,
+		"revision":   buildinfo.Revision,
+		"instanceId": s.instanceID,
 	})
 }
 
@@ -144,8 +177,11 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	}
 
 	response := map[string]interface{}{
-		"version": Version,
-		"busy":    currentJob != nil,
+		"version":    Version,
+		"busy":       currentJob != nil,
+		"revision":   buildinfo.Revision,
+		"instanceId": s.instanceID,
+		"draining":   s.orchestrator.IsDraining(),
 	}
 
 	if currentJob != nil {
@@ -154,6 +190,32 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.writeJSON(w, http.StatusOK, response)
+}
+
+func (s *Server) handleUpgrade(w http.ResponseWriter, r *http.Request) {
+	if s.upgrader == nil || !s.upgrader.Enabled() {
+		s.writeError(w, http.StatusServiceUnavailable, "self-upgrade is not configured")
+		return
+	}
+	state, err := s.upgrader.Start()
+	if err != nil {
+		s.writeError(w, http.StatusConflict, err.Error())
+		return
+	}
+	s.writeJSON(w, http.StatusAccepted, state)
+}
+
+func (s *Server) handleUpgradeStatus(w http.ResponseWriter, r *http.Request) {
+	if s.upgrader == nil {
+		s.writeJSON(w, http.StatusOK, upgrade.State{Phase: "disabled"})
+		return
+	}
+	state, err := s.upgrader.Status()
+	if err != nil {
+		s.writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	s.writeJSON(w, http.StatusOK, state)
 }
 
 // CreateJobRequest represents a request to create a job

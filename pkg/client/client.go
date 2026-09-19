@@ -7,14 +7,50 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sync"
 	"time"
 )
 
 // Client represents the devbox API client
 type Client struct {
-	baseURL    string
-	token      string
-	httpClient *http.Client
+	baseURL         string
+	token           string
+	httpClient      *http.Client
+	serverMu        sync.Mutex
+	serverInstance  string
+	onServerRestart func(string, string)
+}
+
+type ResponseError struct {
+	StatusCode int
+	Body       string
+}
+
+func (e *ResponseError) Error() string {
+	return fmt.Sprintf("API error (status %d): %s", e.StatusCode, e.Body)
+}
+
+// SetServerRestartHandler lets polling clients prompt a restart when the
+// daemon's instance changes. The first response establishes the baseline.
+func (c *Client) SetServerRestartHandler(handler func(revision, instance string)) {
+	c.serverMu.Lock()
+	defer c.serverMu.Unlock()
+	c.onServerRestart = handler
+}
+
+func (c *Client) observeServer(headers http.Header) {
+	instance := headers.Get("X-Devbox-Instance")
+	if instance == "" {
+		return
+	}
+	c.serverMu.Lock()
+	changed := c.serverInstance != "" && c.serverInstance != instance
+	c.serverInstance = instance
+	handler := c.onServerRestart
+	c.serverMu.Unlock()
+	if changed && handler != nil {
+		handler(headers.Get("X-Devbox-Revision"), instance)
+	}
 }
 
 // NewClient creates a new API client
@@ -30,8 +66,10 @@ func NewClient(baseURL, token string) *Client {
 
 // HealthResponse represents the health check response
 type HealthResponse struct {
-	Healthy bool   `json:"healthy"`
-	Version string `json:"version"`
+	Healthy    bool   `json:"healthy"`
+	Version    string `json:"version"`
+	Revision   string `json:"revision"`
+	InstanceID string `json:"instanceId"`
 }
 
 // StatusResponse represents the status response
@@ -40,6 +78,9 @@ type StatusResponse struct {
 	Busy            bool   `json:"busy"`
 	CurrentJobID    string `json:"currentJobId,omitempty"`
 	CurrentJobState string `json:"currentJobState,omitempty"`
+	Revision        string `json:"revision"`
+	InstanceID      string `json:"instanceId"`
+	Draining        bool   `json:"draining"`
 }
 
 // Job represents a job
@@ -243,10 +284,11 @@ func (c *Client) getContext(ctx context.Context, path string, result interface{}
 		return fmt.Errorf("request failed: %w", err)
 	}
 	defer resp.Body.Close()
+	c.observeServer(resp.Header)
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("API error (status %d): %s", resp.StatusCode, string(body))
+		return &ResponseError{StatusCode: resp.StatusCode, Body: string(body)}
 	}
 
 	if err := json.NewDecoder(resp.Body).Decode(result); err != nil {
@@ -282,10 +324,11 @@ func (c *Client) post(path string, body interface{}, result interface{}, auth bo
 		return fmt.Errorf("request failed: %w", err)
 	}
 	defer resp.Body.Close()
+	c.observeServer(resp.Header)
 
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusAccepted {
 		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("API error (status %d): %s", resp.StatusCode, string(body))
+		return &ResponseError{StatusCode: resp.StatusCode, Body: string(body)}
 	}
 
 	if result != nil {

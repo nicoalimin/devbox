@@ -19,6 +19,17 @@ type Config struct {
 	Repos      []RepoConfig     `yaml:"repos"`
 	Queue      QueueConfig      `yaml:"queue"`
 	Reconciler ReconcilerConfig `yaml:"reconciler"`
+	Upgrade    UpgradeConfig    `yaml:"upgrade"`
+}
+
+// UpgradeConfig opts this host into builds from its trusted Devbox remote.
+type UpgradeConfig struct {
+	Enabled      bool          `yaml:"enabled"`
+	SourcePath   string        `yaml:"source_path"`
+	Remote       string        `yaml:"remote"`
+	Branch       string        `yaml:"branch"`
+	BuildTimeout time.Duration `yaml:"build_timeout"`
+	DrainTimeout time.Duration `yaml:"drain_timeout"`
 }
 
 // ServerConfig defines HTTP server settings
@@ -120,6 +131,10 @@ func LoadConfig(path string) (*Config, error) {
 	// missing keys within it) keeps defaults; explicit keys still override.
 	cfg.Reconciler.Enabled = true
 	cfg.Reconciler.Interval = DefaultReconcilerInterval
+	cfg.Upgrade.Remote = "origin"
+	cfg.Upgrade.Branch = "main"
+	cfg.Upgrade.BuildTimeout = 20 * time.Minute
+	cfg.Upgrade.DrainTimeout = time.Hour
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
 		return nil, fmt.Errorf("failed to parse config file: %w", err)
 	}
@@ -176,6 +191,14 @@ func LoadConfig(path string) (*Config, error) {
 	}
 
 	// Validation
+	if cfg.Upgrade.Enabled {
+		if cfg.Upgrade.SourcePath == "" || cfg.Upgrade.Remote == "" || cfg.Upgrade.Branch == "" {
+			return nil, fmt.Errorf("upgrade requires source_path, remote, and branch")
+		}
+		if cfg.Upgrade.BuildTimeout <= 0 || cfg.Upgrade.DrainTimeout <= 0 {
+			return nil, fmt.Errorf("upgrade build_timeout and drain_timeout must be positive")
+		}
+	}
 	if cfg.Server.AuthToken == "" {
 		return nil, fmt.Errorf("server.auth_token is required (or set DEVBOXD_AUTH_TOKEN)")
 	}
