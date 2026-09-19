@@ -49,7 +49,9 @@ repos:
       path: "/path/to/your/backend"
       base_branch: "main"
       # Omit to detect write-mode Node format scripts (including nested apps).
-      # Set [] to disable, or provide commands relative to the worktree root.
+      # Before validation, the host runs these and commits a dirty worktree as
+      # "chore: format" without relying on OpenCode. Set [] to disable, or
+      # provide commands relative to the worktree root.
       # format_commands:
       #   - "cd web && pnpm exec prettier --write ."
       # Omit to auto-detect common Go and Node CI checks. Set [] to disable.

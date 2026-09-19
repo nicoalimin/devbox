@@ -152,7 +152,8 @@ func TestRepairTimeoutRechecksActualFiles(t *testing.T) {
 			t.Error(err)
 		}
 	})
-	if err := orch.validateWithOpenCodeRepair(job); err != nil {
+	manager := gitmanager.NewManager(job.RepoPath, orch.baseBranch(job))
+	if err := orch.validateWithOpenCodeRepair(job, manager); err != nil {
 		t.Fatalf("repair succeeded before timeout but was rejected: %v", err)
 	}
 }
@@ -229,6 +230,51 @@ func TestHostFormattingRunsBeforeValidation(t *testing.T) {
 	if got := deliveryGit(t, remote, "show", "refs/heads/"+job.BranchName+":output.txt"); got != "formatted" {
 		t.Fatal(got)
 	}
+	if got := deliveryGit(t, remote, "log", "-1", "--format=%s", job.BranchName); got != "chore: format" {
+		t.Fatalf("format commit subject = %q", got)
+	}
+}
+
+func TestHostFormattingDoesNotCreateEmptyCommit(t *testing.T) {
+	orch, job, _ := deliveryFixture(t)
+	orch.cfg.Repos[0].Repo.FormatCommands = []string{"true"}
+	orch.cfg.Repos[0].Repo.ValidationCommands = []string{}
+	if err := os.WriteFile(filepath.Join(job.WorktreePath, "feature.txt"), []byte("done\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	deliveryGit(t, job.WorktreePath, "add", "feature.txt")
+	deliveryGit(t, job.WorktreePath, "commit", "-m", "feature: complete work")
+	head := deliveryGit(t, job.WorktreePath, "rev-parse", "HEAD")
+	if err := orch.pushBranch(job); err != nil {
+		t.Fatal(err)
+	}
+	if got := deliveryGit(t, job.WorktreePath, "rev-parse", "HEAD"); got != head {
+		t.Fatalf("clean formatter created commit: got %s, want %s", got, head)
+	}
+}
+
+func TestHostFormattingCommitDoesNotBypassValidation(t *testing.T) {
+	orch, job, _ := deliveryFixture(t)
+	orch.cfg.Repos[0].Repo.FormatCommands = []string{"printf 'formatted\\n' > output.txt"}
+	orch.cfg.Repos[0].Repo.ValidationCommands = []string{"exit 7"}
+	if err := orch.pushBranch(job); err == nil || !strings.Contains(err.Error(), "local validation failed") {
+		t.Fatalf("expected validation failure after formatting, got %v", err)
+	}
+	if got := deliveryGit(t, job.WorktreePath, "log", "-1", "--format=%s"); got != "chore: format" {
+		t.Fatalf("format changes were not committed before failed check: %q", got)
+	}
+}
+
+func TestHostFormattingReportsCommitFailure(t *testing.T) {
+	orch, job, _ := deliveryFixture(t)
+	orch.cfg.Repos[0].Repo.FormatCommands = []string{"printf 'formatted\\n' > output.txt"}
+	if err := os.WriteFile(filepath.Join(job.RepoPath, ".git", "hooks", "pre-commit"), []byte("#!/bin/sh\nexit 1\n"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	err := orch.pushBranch(job)
+	if err == nil || !strings.Contains(err.Error(), "failed to commit host-formatted worktree") {
+		t.Fatalf("expected clear host commit error, got %v", err)
+	}
 }
 
 func TestHostDeliveryFormatsAndCommitsWithoutOpenCode(t *testing.T) {
@@ -254,7 +300,7 @@ func TestHostDeliveryFormatsAndCommitsWithoutOpenCode(t *testing.T) {
 	if got := deliveryGit(t, remote, "show", "refs/heads/"+job.BranchName+":output.txt"); got != "formatted" {
 		t.Fatal(got)
 	}
-	if subject := deliveryGit(t, job.WorktreePath, "show", "-s", "--format=%s", "HEAD"); subject != "[TEST-1] Apply validated changes" {
+	if subject := deliveryGit(t, job.WorktreePath, "show", "-s", "--format=%s", "HEAD"); subject != "chore: format" {
 		t.Fatalf("commit subject = %q", subject)
 	}
 }

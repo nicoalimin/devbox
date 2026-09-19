@@ -166,6 +166,15 @@ repos:
     repo:
       path: "/home/dev/my-backend"
       base_branch: "main"
+      # Omit to auto-detect write-mode Node format scripts. The host runs these
+      # before validation and commits a dirty worktree as "chore: format".
+      # Set [] to disable host formatting for this repository.
+      # format_commands:
+      #   - "cd web && pnpm exec prettier --write ."
+      # Omit to auto-detect common Go and Node validation commands.
+      # Set [] to disable validation for this repository.
+      # validation_commands:
+      #   - "go test ./..."
   
   - match:
       project: "Frontend Redesign"
@@ -187,6 +196,16 @@ reconciler:
   enabled: true   # Periodic GitHub check for stuck pr_open jobs (merged -> done, closed -> cancelled)
   interval: "2m"  # Poll interval (~1-5m recommended)
 ```
+
+The first-push and review-feedback paths share the same host-owned delivery
+gate. Before any push, Devbox runs configured or auto-detected write-mode
+formatters and commits all remaining tracked and non-ignored untracked changes
+as `chore: format` when the worktree is dirty. It then runs the configured or
+auto-detected validation checks. OpenCode is not responsible for this format
+and commit step, so a model timeout cannot leave formatter output only in the
+local worktree. A failed formatter, commit, or post-format check remains a job
+failure; failure recovery publishes an explicitly incomplete checkpoint when
+it can do so safely.
 
 ## Single-Flight Enforcement
 
