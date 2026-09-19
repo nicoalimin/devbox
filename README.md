@@ -986,7 +986,8 @@ it does not cancel the server's upgrade.
 
 The opt-in integration test builds and restarts a real daemon against a local
 temporary Git remote, checks the client binary revision, and verifies a stored
-job survives. Run it from a commit containing the implementation:
+job survives. It also injects a failing migration and verifies automatic binary
+and database rollback. Run it from a commit containing the implementation:
 
 ```sh
 DEVBOX_UPGRADE_INTEGRATION=1 go test ./cmd/devboxd -run TestSelfUpgradeProcess -v

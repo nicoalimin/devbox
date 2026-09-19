@@ -359,7 +359,7 @@ func (m *Manager) RestartFailed(cause error) error {
 	err = m.restoreDatabase(&s, m.rollback(&s, cause))
 	s.Phase, s.Error = "failed", err.Error()
 	if saveErr := m.save(&s); saveErr != nil {
-		return fmt.Errorf("%v; saving failure: %w", err, saveErr)
+		return fmt.Errorf("%w: %v; saving failure: %v", ErrRollbackFailed, err, saveErr)
 	}
 	if s.RollbackFailed {
 		return fmt.Errorf("%w: %v", ErrRollbackFailed, err)

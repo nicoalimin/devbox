@@ -241,3 +241,22 @@ func TestFailedStartupRestoresDatabaseSnapshot(t *testing.T) {
 		t.Fatal("failed WAL left beside restored database")
 	}
 }
+
+func TestMissingRollbackCopyDoesNotPermitRestart(t *testing.T) {
+	m, _, _ := fixture(t)
+	if _, err := m.Start(); err != nil {
+		t.Fatal(err)
+	}
+	s := awaitPhase(t, m, "restarting")
+	m.Close()
+	if err := os.Remove(s.Files[0].Backup); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.RestartFailed(errors.New("exec failed")); !errors.Is(err, ErrRollbackFailed) {
+		t.Fatalf("missing backup ignored: %v", err)
+	}
+	state, _ := m.Status()
+	if !state.RollbackFailed {
+		t.Fatal("rollback failure not persisted")
+	}
+}
