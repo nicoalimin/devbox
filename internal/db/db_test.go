@@ -666,7 +666,7 @@ func TestMigrationEmptyDatabase(t *testing.T) {
 	now := time.Now()
 	codingWaitStarted := now.Add(-5 * time.Minute)
 	reviewingWaitStarted := now.Add(-2 * time.Minute)
-	
+
 	job := &Job{
 		ID:                     "migration-test-1",
 		LinearIssueID:          "ENG-MIGRATE-1",
@@ -781,7 +781,7 @@ func TestMigrationIdempotent(t *testing.T) {
 func TestDirectoryCreation(t *testing.T) {
 	testDir := "test_subdir/nested/path"
 	dbPath := filepath.Join(testDir, "jobs.db")
-	
+
 	// Clean up before and after
 	defer os.RemoveAll("test_subdir")
 	os.RemoveAll("test_subdir")

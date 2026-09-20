@@ -1,83 +1,62 @@
+# devboxd configuration
+
 server:
   listen: "0.0.0.0:8080"
-  # auth_token: "your-secret-token-here"  # or set DEVBOXD_AUTH_TOKEN env var
-
-# Opt-in authenticated self-upgrade from this checkout's trusted remote.
-upgrade:
-  enabled: false
-  source_path: "/path/to/devbox"
-  remote: "origin"
-  branch: "main"
-  build_timeout: "20m"
-  drain_timeout: "1h"
+  auth_token: "set-me-in-env"
 
 database:
-  # path: ""  # Path to SQLite database file
-              # Default: .devbox/jobs.db (relative to current working directory)
-              # Can also set DEVBOXD_DB_PATH env var or use --db CLI flag
-              # 
-              # Breaking change from v0.1.0: old default was ~/.local/share/devbox/jobs.db
-              # To use old location, explicitly set: path: "~/.local/share/devbox/jobs.db"
+  path: ".devbox/jobs.db" # SQLite database file path
 
 linear:
-  # api_key: "lin_api_your_key_here"     # or set LINEAR_API_KEY env var
-  assignee_id: ""                         # Optional: only process issues assigned to this user
-  workspace_id: ""                        # Optional: workspace ID
+  api_key: "set-me-in-env"     # Required
+  assignee_id: ""              # Optional filter (for assigning to a specific person)
+  workspace_id: ""             # Optional (for filtering by workspace)
 
 opencode:
-  version: v2
-  base_url: "http://127.0.0.1:3000"       # or set OPENCODE_BASE_URL env var
-  timeout: "30m"                          # Coding session timeout
-  review_timeout: "15m"                   # Interrupt a stuck review, then validate/deliver safely
-  
-  # HTTP Basic Authentication for OpenCode 2.0.3+ (when OPENCODE_SERVER_PASSWORD is set)
-  # username: "opencode"                  # or set DEVBOXD_OPENCODE_USERNAME / OPENCODE_SERVER_USERNAME env var
-  # password: "your-password-here"        # or set DEVBOXD_OPENCODE_PASSWORD / OPENCODE_SERVER_PASSWORD env var
-  #
-  # When OpenCode server is started with OPENCODE_SERVER_PASSWORD set, all API requests
-  # require HTTP Basic Auth. The username defaults to "opencode" unless OPENCODE_SERVER_USERNAME
-  # is set. Configure matching credentials here or via environment variables.
+  base_url: "http://127.0.0.1:3000"
+  version: "v2"                # or "classic"
+  timeout: "30m"               # Default timeout for coding sessions
+  review_timeout: "15m"        # Timeout for reviews before safe recovery
 
 github:
   default_base_branch: "main"
 
-# Map Linear issue attributes to repository paths
 repos:
   - match:
-      team: "ENG"
+      team: "dev"
     repo:
-      path: "/path/to/your/backend"
+      path: "/home/dev/my-backend"
       base_branch: "main"
-      # Omit to detect write-mode Node format scripts (including nested apps).
-      # Before validation, the host runs these and commits a dirty worktree as
-      # "chore: format" without relying on OpenCode. Set [] to disable, or
-      # provide commands relative to the worktree root.
+      # Omit to auto-detect write-mode Node format scripts. The host runs these
+      # before validation and commits a dirty worktree as "chore: format".
+      # Set [] to disable host formatting for this repository.
       # format_commands:
       #   - "cd web && pnpm exec prettier --write ."
-      # Omit to auto-detect common Go and Node CI checks. Set [] to disable.
-      validation_commands:
-        - "go test ./..."
-        - "go vet ./..."
-  
+      # Omit to auto-detect common Go and Node validation commands.
+      # Set [] to disable validation for this repository.
+      # validation_commands:
+      #   - "go test ./..."
   - match:
       project: "Frontend Redesign"
     repo:
-      path: "/path/to/your/frontend"
-      base_branch: "develop"
-  
-  - match:
-      label: "infrastructure"
-    repo:
-      path: "/path/to/your/infra"
+      path: "/home/dev/my-frontend"
       base_branch: "main"
+      validation_commands: []
+      format_commands: []
 
 queue:
-  enabled: false  # Default: reject when busy
-  max_depth: 1    # Only if enabled
+  enabled: false   # Default: false (reject when busy)
+  max_depth: 100   # Max queued jobs
 
-# Periodic GitHub reconciler for stuck pr_open jobs (UTA-68).
-# Polls GitHub for jobs waiting on external PR state and advances them to a
-# terminal state (merged -> done, closed unmerged -> cancelled).
 reconciler:
-  enabled: true   # Default: true (set false to disable polling)
-  interval: "2m"  # Default: 2m (~1-5m recommended; rate-limit friendly)
+  enabled: true    # Default: poll GitHub periodically
+  interval: "2m"   # Poll interval (~1-5m recommended)
+
+# The first-push and review-feedback paths share the same host-owned delivery
+# gate. Before any push, Devbox runs configured or auto-detected write-mode
+# formatters and commits all remaining tracked and non-ignored untracked changes
+# as `chore: format`. It then runs the configured or auto-detected validation 
+# checks. OpenCode is not responsible for this format and commit step, so a model 
+# timeout cannot leave formatter output only in the local worktree. A failed 
+# formatter, commit, or post-format check remains a job failure; failure recovery 
+# publishes an explicitly incomplete checkpoint when it can do so safely.

@@ -114,20 +114,20 @@ func (c *Client) GetIssue(idOrIdentifier string) (*Issue, error) {
 	var result struct {
 		Data struct {
 			Issue struct {
-				ID          string    `json:"id"`
-				Identifier  string    `json:"identifier"`
-				Title       string    `json:"title"`
-				Description string    `json:"description"`
-				URL         string    `json:"url"`
-				Priority    int       `json:"priority"`
-				State       State     `json:"state"`
-				Team        Team      `json:"team"`
-				Project     *Project  `json:"project"`
+				ID          string   `json:"id"`
+				Identifier  string   `json:"identifier"`
+				Title       string   `json:"title"`
+				Description string   `json:"description"`
+				URL         string   `json:"url"`
+				Priority    int      `json:"priority"`
+				State       State    `json:"state"`
+				Team        Team     `json:"team"`
+				Project     *Project `json:"project"`
 				Labels      struct {
 					Nodes []Label `json:"nodes"`
 				} `json:"labels"`
-				CreatedAt   time.Time `json:"createdAt"`
-				UpdatedAt   time.Time `json:"updatedAt"`
+				CreatedAt time.Time `json:"createdAt"`
+				UpdatedAt time.Time `json:"updatedAt"`
 			} `json:"issue"`
 		} `json:"data"`
 	}
