@@ -2,6 +2,7 @@ package validation
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -127,5 +128,95 @@ func writeTestFile(t *testing.T, path, content string) {
 	t.Helper()
 	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
 		t.Fatalf("failed to write %s: %v", path, err)
+	}
+}
+
+func TestShouldSoftSkipMobileInstallHelpers(t *testing.T) {
+	cmd := Command{Name: "pnpm", Args: []string{"install", "--frozen-lockfile"}, Dir: "mobile"}
+	out := []byte("npm ERR! code EUNSUPPORTEDPROTOCOL\nnpm ERR! Unsupported URL Type \"workspace:\": workspace:*\n")
+	if !shouldSoftSkipMobileInstall(cmd, out, true) {
+		t.Fatal("expected soft-skip when primary passed + mobile install protocol error")
+	}
+	if shouldSoftSkipMobileInstall(cmd, out, false) {
+		t.Fatal("must hard-fail when no primary package succeeded yet")
+	}
+	lint := Command{Name: "pnpm", Args: []string{"run", "lint"}, Dir: "mobile"}
+	if shouldSoftSkipMobileInstall(lint, out, true) {
+		t.Fatal("non-install mobile failures must stay hard-fail")
+	}
+	other := []byte("npm ERR! code E404\nnpm ERR! 404 Not Found\n")
+	if shouldSoftSkipMobileInstall(cmd, other, true) {
+		t.Fatal("non-protocol mobile install failures must stay hard-fail")
+	}
+	webInstall := Command{Name: "pnpm", Args: []string{"install", "--frozen-lockfile"}, Dir: "web"}
+	if shouldSoftSkipMobileInstall(webInstall, out, true) {
+		t.Fatal("web install must never soft-skip")
+	}
+}
+
+func TestRunCommandsSoftSkipsMobileProtocolAfterWeb(t *testing.T) {
+	orig := runCommandFn
+	defer func() { runCommandFn = orig }()
+
+	var logs []string
+	logFunc := func(s string) { logs = append(logs, s) }
+
+	runCommandFn = func(ctx context.Context, worktreePath string, command Command) ([]byte, error) {
+		if command.Dir == "web" {
+			return []byte("ok"), nil
+		}
+		if command.Dir == "mobile" && isInstallCommand(command) {
+			return []byte("npm ERR! code EUNSUPPORTEDPROTOCOL\nUnsupported URL Type \"workspace:\": workspace:*\n"), fmt.Errorf("exit status 1")
+		}
+		return nil, fmt.Errorf("unexpected command: %+v", command)
+	}
+
+	err := runCommands(t.TempDir(), []Command{
+		{Name: "pnpm", Args: []string{"install", "--frozen-lockfile"}, Dir: "web"},
+		{Name: "pnpm", Args: []string{"run", "typecheck"}, Dir: "web"},
+		{Name: "pnpm", Args: []string{"install", "--frozen-lockfile"}, Dir: "mobile"},
+	}, logFunc)
+	if err != nil {
+		t.Fatalf("expected soft-skip success, got %v", err)
+	}
+	joined := strings.Join(logs, "\n")
+	if !strings.Contains(joined, "Local validation soft-skipped: [mobile] pnpm install --frozen-lockfile (EUNSUPPORTEDPROTOCOL; web gates already green)") {
+		t.Fatalf("missing soft-skip log: %s", joined)
+	}
+}
+
+func TestRunCommandsHardFailsMobileProtocolWithoutPrimary(t *testing.T) {
+	orig := runCommandFn
+	defer func() { runCommandFn = orig }()
+
+	runCommandFn = func(ctx context.Context, worktreePath string, command Command) ([]byte, error) {
+		return []byte("npm ERR! code EUNSUPPORTEDPROTOCOL\nworkspace:*\n"), fmt.Errorf("exit status 1")
+	}
+
+	err := runCommands(t.TempDir(), []Command{
+		{Name: "pnpm", Args: []string{"install", "--frozen-lockfile"}, Dir: "mobile"},
+	}, nil)
+	if err == nil || !strings.Contains(err.Error(), "local validation failed") {
+		t.Fatalf("expected hard-fail, got %v", err)
+	}
+}
+
+func TestRunCommandsHardFailsNonProtocolMobile(t *testing.T) {
+	orig := runCommandFn
+	defer func() { runCommandFn = orig }()
+
+	runCommandFn = func(ctx context.Context, worktreePath string, command Command) ([]byte, error) {
+		if command.Dir == "web" {
+			return []byte("ok"), nil
+		}
+		return []byte("eslint found 3 errors\n"), fmt.Errorf("exit status 1")
+	}
+
+	err := runCommands(t.TempDir(), []Command{
+		{Name: "pnpm", Args: []string{"run", "lint"}, Dir: "web"},
+		{Name: "pnpm", Args: []string{"run", "lint"}, Dir: "mobile"},
+	}, nil)
+	if err == nil || !strings.Contains(err.Error(), "local validation failed") {
+		t.Fatalf("expected hard-fail for mobile lint, got %v", err)
 	}
 }

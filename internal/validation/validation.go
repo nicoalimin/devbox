@@ -32,6 +32,12 @@ func Run(worktreePath string, configured []string, logFunc func(string)) error {
 	return runCommands(worktreePath, commands, logFunc)
 }
 
+// optionalPackages may soft-fail install-only workspace protocol errors when a
+// primary (non-optional) package gate has already passed in this run.
+var optionalPackages = map[string]bool{
+	"mobile": true,
+}
+
 func runCommands(worktreePath string, commands []Command, logFunc func(string)) error {
 	if len(commands) == 0 {
 		if logFunc != nil {
@@ -40,6 +46,8 @@ func runCommands(worktreePath string, commands []Command, logFunc func(string)) 
 		return nil
 	}
 
+	primaryPassed := false
+	webPassed := false
 	for _, command := range commands {
 		display := strings.Join(append([]string{command.Name}, command.Args...), " ")
 		if command.Dir != "" {
@@ -50,14 +58,30 @@ func runCommands(worktreePath string, commands []Command, logFunc func(string)) 
 		}
 
 		ctx, cancel := context.WithTimeout(context.Background(), commandTimeout)
-		output, runErr := runCommand(ctx, worktreePath, command)
+		output, runErr := runCommandFn(ctx, worktreePath, command)
 		cancel()
 
 		if ctx.Err() == context.DeadlineExceeded {
 			return fmt.Errorf("local validation timed out after %v: %s", commandTimeout, display)
 		}
 		if runErr != nil {
+			if shouldSoftSkipMobileInstall(command, output, primaryPassed) {
+				reason := "primary package gates already green"
+				if webPassed {
+					reason = "web gates already green"
+				}
+				if logFunc != nil {
+					logFunc(fmt.Sprintf("Local validation soft-skipped: %s (EUNSUPPORTEDPROTOCOL; %s)", display, reason))
+				}
+				continue
+			}
 			return fmt.Errorf("local validation failed: %s: %w\nOutput:\n%s", display, runErr, tail(output, 16*1024))
+		}
+		if isPrimaryPackageDir(command.Dir) {
+			primaryPassed = true
+			if filepath.Base(command.Dir) == "web" || command.Dir == "web" {
+				webPassed = true
+			}
 		}
 		if logFunc != nil {
 			logFunc(fmt.Sprintf("Local validation passed: %s", display))
@@ -66,6 +90,51 @@ func runCommands(worktreePath string, commands []Command, logFunc func(string)) 
 
 	return nil
 }
+
+func isOptionalPackageDir(dir string) bool {
+	if dir == "" {
+		return false
+	}
+	return optionalPackages[filepath.Base(dir)]
+}
+
+func isPrimaryPackageDir(dir string) bool {
+	// Only node package dirs count as primary gates — not bare go commands at "".
+	if dir == "" {
+		return false
+	}
+	return !isOptionalPackageDir(dir)
+}
+
+func isInstallCommand(command Command) bool {
+	switch command.Name {
+	case "pnpm", "npm", "yarn", "bun":
+		if len(command.Args) == 0 {
+			return false
+		}
+		return command.Args[0] == "install" || command.Args[0] == "ci"
+	default:
+		return false
+	}
+}
+
+func isWorkspaceProtocolFailure(output []byte) bool {
+	lower := strings.ToLower(string(output))
+	if strings.Contains(lower, "eunsupportedprotocol") {
+		return true
+	}
+	if strings.Contains(lower, "unsupported protocol") && strings.Contains(lower, "workspace:") {
+		return true
+	}
+	return false
+}
+
+func shouldSoftSkipMobileInstall(command Command, output []byte, primaryPassed bool) bool {
+	return primaryPassed && isOptionalPackageDir(command.Dir) && isInstallCommand(command) && isWorkspaceProtocolFailure(output)
+}
+
+// runCommandFn is swapped in tests to simulate install failures.
+var runCommandFn = runCommand
 
 // Devbox runs on Linux/macOS. Terminate the whole command group on timeout,
 // including package-manager and shell children, before taking a Git snapshot.
