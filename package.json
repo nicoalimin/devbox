@@ -18,7 +18,6 @@
   "dependencies": {
     "n8n-nodes-base": "^1.0.0",
     "n8n-nodes-notion": "^1.0.0",
-    "n8n-nodes-webhook": "^1.0.0",
-    "n8n-nodes-http-request": "^1.0.0"
+    "n8n-nodes-webhook": "^1.0.0"
   }
 }
