@@ -1349,13 +1349,17 @@ func (o *Orchestrator) waitForSessionWithHealing(job *db.Job, phase string, logF
 		sessionID = newSessionID
 		o.log(job.ID, "info", fmt.Sprintf("Session healed successfully, new session ID: %s", sessionID))
 
-		// Recalculate remaining timeout before retry
+		// Recalculate remaining timeout before retry using the same logic as during initial wait
 		if waitStartedAt != nil {
 			elapsed := time.Since(*waitStartedAt)
 			timeout = waitBudget - elapsed
 			if timeout <= 0 {
-				return sessionID, fmt.Errorf("wait timeout exhausted during healing: elapsed %v", elapsed)
+				// Ensure we don't return a negative timeout when the session healing took too long
+				return sessionID, fmt.Errorf("wait timeout exhausted during healing: elapsed %v (budget: %v)", elapsed, waitBudget)
 			}
+		} else {
+			// If we're starting fresh after healing, set timeout to the original budget
+			timeout = waitBudget
 		}
 
 		// Continue loop to wait on new session
