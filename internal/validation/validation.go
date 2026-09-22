@@ -95,7 +95,14 @@ func isOptionalPackageDir(dir string) bool {
 	if dir == "" {
 		return false
 	}
-	return optionalPackages[filepath.Base(dir)]
+	
+	// Check if it's an explicitly listed optional package
+	if optionalPackages[filepath.Base(dir)] {
+		return true
+	}
+	
+	// Check if it's under packages/ directory (e.g., packages/application)
+	return strings.HasPrefix(dir, "packages/")
 }
 
 func isPrimaryPackageDir(dir string) bool {

@@ -154,6 +154,30 @@ func TestShouldSoftSkipMobileInstallHelpers(t *testing.T) {
 	}
 }
 
+func TestShouldSoftSkipPackagesInstallHelpers(t *testing.T) {
+	cmd := Command{Name: "npm", Args: []string{"install", "--no-package-lock"}, Dir: "packages/application"}
+	out := []byte("npm ERR! code EUNSUPPORTEDPROTOCOL\nnpm ERR! Unsupported URL Type \"workspace:\": workspace:*\n")
+	if !shouldSoftSkipMobileInstall(cmd, out, true) {
+		t.Fatal("expected soft-skip when primary passed + packages install protocol error")
+	}
+	if shouldSoftSkipMobileInstall(cmd, out, false) {
+		t.Fatal("must hard-fail when no primary package succeeded yet")
+	}
+	lint := Command{Name: "npm", Args: []string{"run", "lint"}, Dir: "packages/application"}
+	if shouldSoftSkipMobileInstall(lint, out, true) {
+		t.Fatal("non-install packages failures must stay hard-fail")
+	}
+	other := []byte("npm ERR! code E404\nnpm ERR! 404 Not Found\n")
+	if shouldSoftSkipMobileInstall(cmd, other, true) {
+		t.Fatal("non-protocol packages install failures must stay hard-fail")
+	}
+	// Test that non-packages directory doesn't soft-skip
+	appInstall := Command{Name: "npm", Args: []string{"install", "--no-package-lock"}, Dir: "app"}
+	if shouldSoftSkipMobileInstall(appInstall, out, true) {
+		t.Fatal("non-packages install must not soft-skip")
+	}
+}
+
 func TestRunCommandsSoftSkipsMobileProtocolAfterWeb(t *testing.T) {
 	orig := runCommandFn
 	defer func() { runCommandFn = orig }()
@@ -182,6 +206,69 @@ func TestRunCommandsSoftSkipsMobileProtocolAfterWeb(t *testing.T) {
 	joined := strings.Join(logs, "\n")
 	if !strings.Contains(joined, "Local validation soft-skipped: [mobile] pnpm install --frozen-lockfile (EUNSUPPORTEDPROTOCOL; web gates already green)") {
 		t.Fatalf("missing soft-skip log: %s", joined)
+	}
+}
+
+func TestRunCommandsSoftSkipsPackagesProtocolAfterPrimary(t *testing.T) {
+	orig := runCommandFn
+	defer func() { runCommandFn = orig }()
+
+	var logs []string
+	logFunc := func(s string) { logs = append(logs, s) }
+
+	runCommandFn = func(ctx context.Context, worktreePath string, command Command) ([]byte, error) {
+		if command.Dir == "web" {
+			return []byte("ok"), nil
+		}
+		if command.Dir == "packages/application" && isInstallCommand(command) {
+			return []byte("npm ERR! code EUNSUPPORTEDPROTOCOL\nUnsupported URL Type \"workspace:\": workspace:*\n"), fmt.Errorf("exit status 1")
+		}
+		return nil, fmt.Errorf("unexpected command: %+v", command)
+	}
+
+	err := runCommands(t.TempDir(), []Command{
+		{Name: "pnpm", Args: []string{"install", "--frozen-lockfile"}, Dir: "web"},
+		{Name: "pnpm", Args: []string{"run", "typecheck"}, Dir: "web"},
+		{Name: "npm", Args: []string{"install", "--no-package-lock"}, Dir: "packages/application"},
+	}, logFunc)
+	if err != nil {
+		t.Fatalf("expected soft-skip success, got %v", err)
+	}
+	joined := strings.Join(logs, "\n")
+	if !strings.Contains(joined, "Local validation soft-skipped: [packages/application] npm install --no-package-lock (EUNSUPPORTEDPROTOCOL; web gates already green)") {
+		t.Fatalf("missing soft-skip log: %s", joined)
+	}
+}
+
+func TestRunCommandsHardFailsPackagesProtocolWithoutPrimary(t *testing.T) {
+	orig := runCommandFn
+	defer func() { runCommandFn = orig }()
+
+	runCommandFn = func(ctx context.Context, worktreePath string, command Command) ([]byte, error) {
+		return []byte("npm ERR! code EUNSUPPORTEDPROTOCOL\nworkspace:*\n"), fmt.Errorf("exit status 1")
+	}
+
+	err := runCommands(t.TempDir(), []Command{
+		{Name: "npm", Args: []string{"install", "--no-package-lock"}, Dir: "packages/application"},
+	}, nil)
+	if err == nil || !strings.Contains(err.Error(), "local validation failed") {
+		t.Fatalf("expected hard-fail, got %v", err)
+	}
+}
+
+func TestRunCommandsHardFailsNonPackagesProtocol(t *testing.T) {
+	orig := runCommandFn
+	defer func() { runCommandFn = orig }()
+
+	runCommandFn = func(ctx context.Context, worktreePath string, command Command) ([]byte, error) {
+		return []byte("npm ERR! code EUNSUPPORTEDPROTOCOL\nworkspace:*\n"), fmt.Errorf("exit status 1")
+	}
+
+	err := runCommands(t.TempDir(), []Command{
+		{Name: "npm", Args: []string{"install", "--no-package-lock"}, Dir: "some-other-dir"},
+	}, nil)
+	if err == nil || !strings.Contains(err.Error(), "local validation failed") {
+		t.Fatalf("expected hard-fail, got %v", err)
 	}
 }
 
