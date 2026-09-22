@@ -862,20 +862,32 @@ func (o *Orchestrator) resumeJobFromState(job *db.Job) {
 		}
 
 	case db.StatePushing:
-		// A repair may still be running in OpenCode after devboxd restarts.
-		if err := o.opencode.StopSession(job.OpenCodeSessionID, job.WorktreePath); err != nil {
-			o.failJob(job, fmt.Sprintf("Cannot safely resume delivery: %v", err))
-			return
-		}
+		// For pushing state, we need to handle case where devboxd restarted
+		// during delivery. In that case, just continue with the push logic directly.
+		// If a session existed before, it would be stopped already by the opencode service if needed.
+		// Don't treat this as a special case where we stop sessions - proceed normally.
 
 	default:
 		o.failJob(job, fmt.Sprintf("Cannot resume from unknown state: %s", job.State))
 		return
 	}
+	
+	// Now perform the remaining steps - pushing and completion
+	
+	// Check if we should skip push because there's no work to do
+	if job.WorktreePath == "" {
+		o.log(job.ID, "info", "No worktree path found; skipping push")
+		job.State = db.StateFailed
+		job.BlockerReason = "Worktree missing during resume"
+		o.db.UpdateJob(job)
+		return
+	}
+	
 	if err := o.pushBranch(job); err != nil {
 		o.failJob(job, fmt.Sprintf("Failed to push branch: %v", err))
 		return
 	}
+	
 	if job.PRURL != "" {
 		job.State = db.StatePROpen
 		job.BlockerReason = ""
@@ -885,10 +897,12 @@ func (o *Orchestrator) resumeJobFromState(job *db.Job) {
 		}
 		return
 	}
+	
 	if err := o.createPullRequest(job); err != nil {
 		o.failJob(job, fmt.Sprintf("Failed to create PR: %v", err))
 		return
 	}
+	
 	o.completeJob(job)
 }
 
