@@ -95,14 +95,21 @@ func isOptionalPackageDir(dir string) bool {
 	if dir == "" {
 		return false
 	}
-	
-	// Check if it's an explicitly listed optional package
+
+	// Explicit optional roots (e.g. mobile).
 	if optionalPackages[filepath.Base(dir)] {
 		return true
 	}
-	
-	// Check if it's under packages/ directory (e.g., packages/application)
-	return strings.HasPrefix(dir, "packages/")
+
+	// Secondary npm installs outside primary pnpm apps may soft-fail
+	// install-only workspace:* protocol errors when primary gates already passed.
+	if strings.HasPrefix(dir, "packages/") {
+		return true
+	}
+	if strings.HasPrefix(dir, "tests/") {
+		return true
+	}
+	return false
 }
 
 func isPrimaryPackageDir(dir string) bool {
