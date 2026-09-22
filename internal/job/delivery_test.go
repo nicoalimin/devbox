@@ -369,3 +369,230 @@ func TestRejectedCommitPreservesOutputAndReportsRecoveryFailure(t *testing.T) {
 		t.Fatalf("lost staged output: %s", got)
 	}
 }
+
+func TestCancelJobStopsOpenCodeBeforeWorktreeCleanup(t *testing.T) {
+	orch, job, _ := deliveryFixture(t)
+	job.State = db.StateCoding
+	job.PRURL = ""
+	job.CompletedAt = nil
+	if err := orch.db.UpdateJob(job); err != nil {
+		t.Fatal(err)
+	}
+
+	var mu sync.Mutex
+	var events []string
+	active := true
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/interrupt"):
+			events = append(events, "interrupt")
+			active = false
+			w.WriteHeader(http.StatusNoContent)
+		case r.URL.Path == "/api/session/active":
+			events = append(events, "active")
+			if active {
+				fmt.Fprint(w, `{"data":{"session":{}}}`)
+			} else {
+				fmt.Fprint(w, `{"data":{}}`)
+			}
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(server.Close)
+	orch.opencode = opencode.NewClient(server.URL, "", "", "v2")
+	job.OpenCodeSessionID = "session"
+	if err := orch.db.UpdateJob(job); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := orch.CancelJob(job.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	mu.Lock()
+	got := append([]string(nil), events...)
+	mu.Unlock()
+	if len(got) == 0 || got[0] != "interrupt" {
+		t.Fatalf("expected StopSession interrupt before cleanup, events=%v", got)
+	}
+
+	stored, err := orch.db.GetJob(job.ID)
+	if err != nil || stored.State != db.StateCancelled {
+		t.Fatalf("job: %+v err=%v", stored, err)
+	}
+	if _, err := os.Stat(job.WorktreePath); !os.IsNotExist(err) {
+		t.Fatalf("worktree should be removed after cancel: %v", err)
+	}
+}
+
+func TestCancelDuringCodingWaitRemainsCancelled(t *testing.T) {
+	orch, job, remote := deliveryFixture(t)
+	job.State = db.StateCoding
+	job.PRURL = ""
+	job.CompletedAt = nil
+	if err := orch.db.UpdateJob(job); err != nil {
+		t.Fatal(err)
+	}
+
+	var mu sync.Mutex
+	active := true
+	interrupted := false
+	waitStarted := make(chan struct{}, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/interrupt"):
+			mu.Lock()
+			interrupted = true
+			active = false
+			mu.Unlock()
+			w.WriteHeader(http.StatusNoContent)
+		case r.URL.Path == "/api/session/active":
+			mu.Lock()
+			busy := active
+			mu.Unlock()
+			if busy {
+				fmt.Fprint(w, `{"data":{"session":{}}}`)
+			} else {
+				fmt.Fprint(w, `{"data":{}}`)
+			}
+		case strings.HasSuffix(r.URL.Path, "/wait"):
+			select {
+			case waitStarted <- struct{}{}:
+			default:
+			}
+			// Block until CancelJob interrupts the session.
+			deadline := time.Now().Add(10 * time.Second)
+			for time.Now().Before(deadline) {
+				mu.Lock()
+				done := interrupted
+				mu.Unlock()
+				if done {
+					w.WriteHeader(http.StatusNoContent)
+					return
+				}
+				time.Sleep(20 * time.Millisecond)
+			}
+			w.WriteHeader(http.StatusGatewayTimeout)
+		case strings.HasSuffix(r.URL.Path, "/prompt"):
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(server.Close)
+	orch.opencode = opencode.NewClient(server.URL, "", "", "v2")
+	job.OpenCodeSessionID = "session"
+	if err := orch.db.UpdateJob(job); err != nil {
+		t.Fatal(err)
+	}
+
+	beforeRefs := deliveryGit(t, remote, "for-each-ref", "--format=%(refname)")
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		fresh, err := orch.db.GetJob(job.ID)
+		if err != nil {
+			t.Errorf("reload job: %v", err)
+			return
+		}
+		orch.resumeJobFromState(fresh)
+	}()
+
+	select {
+	case <-waitStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("coding wait never started")
+	}
+
+	if err := orch.CancelJob(job.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case <-done:
+	case <-time.After(15 * time.Second):
+		t.Fatal("pipeline did not exit after cancel")
+	}
+
+	stored, err := orch.db.GetJob(job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.State != db.StateCancelled {
+		t.Fatalf("expected cancelled, got %s (%s)", stored.State, stored.BlockerReason)
+	}
+	if stored.PRURL != "" {
+		t.Fatalf("unexpected PR after cancel: %s", stored.PRURL)
+	}
+	mu.Lock()
+	wasInterrupted := interrupted
+	mu.Unlock()
+	if !wasInterrupted {
+		t.Fatal("expected OpenCode interrupt on cancel")
+	}
+	afterRefs := deliveryGit(t, remote, "for-each-ref", "--format=%(refname)")
+	if afterRefs != beforeRefs {
+		t.Fatalf("cancel must not push/repair; refs before=%q after=%q", beforeRefs, afterRefs)
+	}
+	if _, err := os.Stat(job.WorktreePath); !os.IsNotExist(err) {
+		t.Fatalf("worktree should be cleaned: %v", err)
+	}
+}
+
+func TestFailJobDoesNotOverwriteCancelled(t *testing.T) {
+	orch, job, _ := deliveryFixture(t)
+	now := time.Now()
+	job.State = db.StateCancelled
+	job.CompletedAt = &now
+	job.BlockerReason = ""
+	if err := orch.db.UpdateJob(job); err != nil {
+		t.Fatal(err)
+	}
+
+	deliveryAgent(t, orch, job, false, nil)
+
+	stale := *job
+	stale.State = db.StateCoding
+	orch.failJob(&stale, "zombie coding failure after cancel")
+
+	stored, err := orch.db.GetJob(job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.State != db.StateCancelled {
+		t.Fatalf("cancelled overwritten to %s (%s)", stored.State, stored.BlockerReason)
+	}
+	if strings.Contains(stored.BlockerReason, "committed and pushed") {
+		t.Fatalf("checkpoint claimed after cancel: %s", stored.BlockerReason)
+	}
+}
+
+func TestFailJobIdenticalBranchDoesNotClaimCheckpoint(t *testing.T) {
+	orch, job, _ := deliveryFixture(t)
+	job.State = db.StateCoding
+	job.PRURL = ""
+	if err := orch.db.UpdateJob(job); err != nil {
+		t.Fatal(err)
+	}
+	deliveryAgent(t, orch, job, false, nil)
+
+	orch.failJob(job, "review timeout with no local changes")
+
+	stored, err := orch.db.GetJob(job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.State != db.StateFailed {
+		t.Fatalf("expected failed, got %s", stored.State)
+	}
+	if strings.Contains(stored.BlockerReason, "committed and pushed") {
+		t.Fatalf("identical branch must not be reported as recovered work: %s", stored.BlockerReason)
+	}
+	if strings.Contains(stored.BlockerReason, "Incomplete work checkpoint") {
+		t.Fatalf("unexpected checkpoint claim: %s", stored.BlockerReason)
+	}
+}

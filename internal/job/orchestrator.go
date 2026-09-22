@@ -2,6 +2,7 @@ package job
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -59,6 +60,38 @@ Quality and delivery requirements:
 - Do not stop after describing commands, errors, or suggested fixes. Execute the implementation and leave all completed changes in the assigned worktree.
 - Devbox owns final formatting, validation, commit, and push from its host delivery gate; do not wait for or depend on a model-side commit or push.
 `
+
+// errJobCancelled is returned when an in-flight pipeline observes that the
+// job was cancelled (typically via CancelJob). Callers must exit without
+// calling failJob so cancelled is not overwritten to failed.
+var errJobCancelled = errors.New("job cancelled")
+
+// checkCancelled re-reads the job from the DB and returns errJobCancelled when
+// the current persisted state is cancelled.
+func (o *Orchestrator) checkCancelled(jobID string) error {
+	current, err := o.db.GetJob(jobID)
+	if err != nil {
+		return fmt.Errorf("failed to re-read job for cancel check: %w", err)
+	}
+	if current != nil && current.State == db.StateCancelled {
+		return errJobCancelled
+	}
+	return nil
+}
+
+// handlePipelineErr exits quietly on cancel; otherwise marks the job failed.
+// Returns true when the caller should abort the pipeline.
+func (o *Orchestrator) handlePipelineErr(job *db.Job, phase string, err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, errJobCancelled) {
+		o.log(job.ID, "info", fmt.Sprintf("Job cancelled; aborting %s", phase))
+		return true
+	}
+	o.failJob(job, fmt.Sprintf("Failed to %s: %v", phase, err))
+	return true
+}
 
 // NewOrchestrator creates a new job orchestrator
 func NewOrchestrator(cfg *config.Config, database *db.DB) *Orchestrator {
@@ -159,39 +192,41 @@ func (o *Orchestrator) ProcessJob(jobID string) {
 		return
 	}
 
-	// Fetch Linear issue
-	if err := o.fetchLinearIssue(job); err != nil {
-		o.failJob(job, fmt.Sprintf("Failed to fetch Linear issue: %v", err))
+	runPhase := func(phase string, fn func(*db.Job) error) bool {
+		if err := o.checkCancelled(job.ID); err != nil {
+			return o.handlePipelineErr(job, phase, err)
+		}
+		if err := fn(job); err != nil {
+			return o.handlePipelineErr(job, phase, err)
+		}
+		return false
+	}
+
+	if runPhase("fetch Linear issue", o.fetchLinearIssue) {
+		return
+	}
+	if runPhase("prepare worktree", o.prepareWorktree) {
+		return
+	}
+	if runPhase("execute coding", o.executeCoding) {
+		return
+	}
+	if runPhase("review code", o.reviewCode) {
+		return
+	}
+	if runPhase("push branch", o.pushBranch) {
+		return
+	}
+	if runPhase("create PR", o.createPullRequest) {
 		return
 	}
 
-	// Prepare worktree
-	if err := o.prepareWorktree(job); err != nil {
-		o.failJob(job, fmt.Sprintf("Failed to prepare worktree: %v", err))
-		return
-	}
-
-	// Execute coding task
-	if err := o.executeCoding(job); err != nil {
-		o.failJob(job, fmt.Sprintf("Failed to execute coding: %v", err))
-		return
-	}
-
-	// Review code
-	if err := o.reviewCode(job); err != nil {
-		o.failJob(job, fmt.Sprintf("Failed to review code: %v", err))
-		return
-	}
-
-	// Push branch
-	if err := o.pushBranch(job); err != nil {
-		o.failJob(job, fmt.Sprintf("Failed to push branch: %v", err))
-		return
-	}
-
-	// Create PR
-	if err := o.createPullRequest(job); err != nil {
-		o.failJob(job, fmt.Sprintf("Failed to create PR: %v", err))
+	if err := o.checkCancelled(job.ID); err != nil {
+		if errors.Is(err, errJobCancelled) {
+			o.log(job.ID, "info", "Job cancelled; skipping completion")
+			return
+		}
+		o.log(job.ID, "error", fmt.Sprintf("Cancel check before complete failed: %v", err))
 		return
 	}
 
@@ -500,6 +535,9 @@ func (o *Orchestrator) validateWithOpenCodeRepair(job *db.Job, gitMgr *git.Manag
 	}
 
 	for attempt := 0; ; attempt++ {
+		if err := o.checkCancelled(job.ID); err != nil {
+			return err
+		}
 		validationErr := runValidation()
 		if validationErr == nil {
 			return nil
@@ -653,15 +691,41 @@ func (o *Orchestrator) completeJob(job *db.Job) {
 
 // failJob marks a job as failed
 func (o *Orchestrator) failJob(job *db.Job, reason string) {
+	// Re-read current state so a concurrent CancelJob (or successful complete)
+	// is never overwritten to failed, and so we do not checkpoint after cancel.
+	current, err := o.db.GetJob(job.ID)
+	if err != nil {
+		o.log(job.ID, "error", fmt.Sprintf("Failed to re-read job before fail: %v", err))
+		return
+	}
+	if current != nil && (current.State == db.StateCancelled || current.State == db.StateDone) {
+		o.log(job.ID, "info", fmt.Sprintf("Skipping failJob; job already terminal (%s): %s", current.State, reason))
+		return
+	}
+
 	// Preserve output on the remote even when quality checks or the model fail.
 	// This is explicitly an incomplete checkpoint, never successful delivery.
 	if job.WorktreePath != "" {
-		if err := o.checkpointFailedWork(job); err != nil {
+		published, err := o.checkpointFailedWork(job)
+		if err != nil {
 			reason += fmt.Sprintf("; recovery incomplete (worktree preserved at %s): %v", job.WorktreePath, err)
-		} else {
+		} else if published {
 			reason += "; incomplete work committed and pushed to " + job.BranchName
 		}
 	}
+
+	// Re-check after checkpoint: CancelJob may have won the race while we were
+	// pushing recovery commits.
+	current, err = o.db.GetJob(job.ID)
+	if err != nil {
+		o.log(job.ID, "error", fmt.Sprintf("Failed to re-read job after checkpoint: %v", err))
+		return
+	}
+	if current != nil && (current.State == db.StateCancelled || current.State == db.StateDone) {
+		o.log(job.ID, "info", fmt.Sprintf("Skipping fail overwrite; job already terminal (%s)", current.State))
+		return
+	}
+
 	now := time.Now()
 	job.State = db.StateFailed
 	job.BlockerReason = reason
@@ -674,25 +738,48 @@ func (o *Orchestrator) failJob(job *db.Job, reason string) {
 	o.log(job.ID, "error", fmt.Sprintf("Job failed: %s", reason))
 }
 
-func (o *Orchestrator) checkpointFailedWork(job *db.Job) error {
+// checkpointFailedWork stops the agent, commits any local changes, and pushes
+// only when the branch has real commits ahead of the base. Returns published=true
+// only when a real commit/diff was pushed. An identical branch is not recovery.
+func (o *Orchestrator) checkpointFailedWork(job *db.Job) (published bool, err error) {
 	if err := o.opencode.StopSession(job.OpenCodeSessionID, job.WorktreePath); err != nil {
-		return fmt.Errorf("cannot stop agent safely: %w", err)
+		return false, fmt.Errorf("cannot stop agent safely: %w", err)
 	}
 	manager := git.NewManager(job.RepoPath, o.baseBranch(job))
 	if err := manager.AssertBranch(job.WorktreePath, job.BranchName); err != nil {
-		return err
+		return false, err
 	}
-	if err := manager.CommitAll(job.WorktreePath, fmt.Sprintf("[%s] Checkpoint incomplete automated work", job.LinearIssueID)); err != nil {
-		return err
+
+	hasChanges, err := manager.HasUncommittedChanges(job.WorktreePath)
+	if err != nil {
+		return false, err
 	}
+	if hasChanges {
+		if err := manager.CommitAll(job.WorktreePath, fmt.Sprintf("[%s] Checkpoint incomplete automated work", job.LinearIssueID)); err != nil {
+			return false, err
+		}
+	}
+
+	hasCommits, err := manager.HasCommitsAheadOfBase(job.WorktreePath)
+	if err != nil {
+		return false, err
+	}
+	if !hasCommits {
+		o.log(job.ID, "info", "No incomplete work to checkpoint (branch identical to base)")
+		if err := manager.RemoveWorktree(job.WorktreePath); err != nil {
+			o.log(job.ID, "warn", fmt.Sprintf("Worktree cleanup deferred after empty checkpoint: %v", err))
+		}
+		return false, nil
+	}
+
 	if err := o.pushWithRetry(job, manager); err != nil {
-		return err
+		return false, err
 	}
 	o.log(job.ID, "warn", "Incomplete work checkpoint committed and verified on remote; job remains failed")
 	if err := manager.RemoveWorktree(job.WorktreePath); err != nil {
 		o.log(job.ID, "warn", fmt.Sprintf("Checkpoint published; worktree cleanup deferred: %v", err))
 	}
-	return nil
+	return true, nil
 }
 
 // buildCodingPrompt builds the prompt for OpenCode with optional operator context
@@ -813,38 +900,42 @@ func (o *Orchestrator) resumeJobFromState(job *db.Job) {
 
 	// Resume from the appropriate state. Coding must still send a review
 	// prompt, and preparation must start a new coding session.
+	runPhase := func(phase string, fn func(*db.Job) error) bool {
+		if err := o.checkCancelled(job.ID); err != nil {
+			return o.handlePipelineErr(job, phase, err)
+		}
+		if err := fn(job); err != nil {
+			return o.handlePipelineErr(job, phase, err)
+		}
+		return false
+	}
+
 	switch job.State {
 	case db.StateFetching:
 		// Resume from the beginning
-		if err := o.fetchLinearIssue(job); err != nil {
-			o.failJob(job, fmt.Sprintf("Failed to fetch Linear issue: %v", err))
+		if runPhase("fetch Linear issue", o.fetchLinearIssue) {
 			return
 		}
 		fallthrough
 
 	case db.StatePreparing:
 		// Continue with worktree preparation
-		if err := o.prepareWorktree(job); err != nil {
-			o.failJob(job, fmt.Sprintf("Failed to prepare worktree: %v", err))
+		if runPhase("prepare worktree", o.prepareWorktree) {
 			return
 		}
-		if err := o.executeCoding(job); err != nil {
-			o.failJob(job, fmt.Sprintf("Failed to execute coding: %v", err))
+		if runPhase("execute coding", o.executeCoding) {
 			return
 		}
-		if err := o.reviewCode(job); err != nil {
-			o.failJob(job, fmt.Sprintf("Failed to review code: %v", err))
+		if runPhase("review code", o.reviewCode) {
 			return
 		}
 
 	case db.StateCoding:
 		// Resume waiting for OpenCode coding session
-		if err := o.resumeCoding(job); err != nil {
-			o.failJob(job, fmt.Sprintf("Failed to resume coding: %v", err))
+		if runPhase("resume coding", o.resumeCoding) {
 			return
 		}
-		if err := o.reviewCode(job); err != nil {
-			o.failJob(job, fmt.Sprintf("Failed to review code: %v", err))
+		if runPhase("review code", o.reviewCode) {
 			return
 		}
 
@@ -856,13 +947,16 @@ func (o *Orchestrator) resumeJobFromState(job *db.Job) {
 			return
 		}
 		// Resume waiting for OpenCode review session
-		if err := o.resumeReviewing(job); err != nil {
-			o.failJob(job, fmt.Sprintf("Failed to resume reviewing: %v", err))
+		if runPhase("resume reviewing", o.resumeReviewing) {
 			return
 		}
 
 	case db.StatePushing:
 		// A repair may still be running in OpenCode after devboxd restarts.
+		if err := o.checkCancelled(job.ID); err != nil {
+			_ = o.handlePipelineErr(job, "resume pushing", err)
+			return
+		}
 		if err := o.opencode.StopSession(job.OpenCodeSessionID, job.WorktreePath); err != nil {
 			o.failJob(job, fmt.Sprintf("Cannot safely resume delivery: %v", err))
 			return
@@ -872,11 +966,14 @@ func (o *Orchestrator) resumeJobFromState(job *db.Job) {
 		o.failJob(job, fmt.Sprintf("Cannot resume from unknown state: %s", job.State))
 		return
 	}
-	if err := o.pushBranch(job); err != nil {
-		o.failJob(job, fmt.Sprintf("Failed to push branch: %v", err))
+	if runPhase("push branch", o.pushBranch) {
 		return
 	}
 	if job.PRURL != "" {
+		if err := o.checkCancelled(job.ID); err != nil {
+			_ = o.handlePipelineErr(job, "finish review", err)
+			return
+		}
 		job.State = db.StatePROpen
 		job.BlockerReason = ""
 		job.CompletedAt = nil
@@ -885,8 +982,11 @@ func (o *Orchestrator) resumeJobFromState(job *db.Job) {
 		}
 		return
 	}
-	if err := o.createPullRequest(job); err != nil {
-		o.failJob(job, fmt.Sprintf("Failed to create PR: %v", err))
+	if runPhase("create PR", o.createPullRequest) {
+		return
+	}
+	if err := o.checkCancelled(job.ID); err != nil {
+		_ = o.handlePipelineErr(job, "complete", err)
 		return
 	}
 	o.completeJob(job)
@@ -973,6 +1073,8 @@ func (o *Orchestrator) CancelJob(jobID string) error {
 		return fmt.Errorf("job is already in terminal state: %s", job.State)
 	}
 
+	// Persist cancelled first so any in-flight ProcessJob observes it before
+	// treating a StopSession-induced idle wait as successful coding/review.
 	now := time.Now()
 	job.State = db.StateCancelled
 	job.CompletedAt = &now
@@ -981,6 +1083,16 @@ func (o *Orchestrator) CancelJob(jobID string) error {
 	}
 
 	o.log(jobID, "info", "Job cancelled")
+
+	// Stop the active OpenCode session BEFORE worktree cleanup so the agent
+	// cannot keep writing after cancel.
+	if job.OpenCodeSessionID != "" {
+		if err := o.opencode.StopSession(job.OpenCodeSessionID, job.WorktreePath); err != nil {
+			o.log(jobID, "warn", fmt.Sprintf("Failed to stop OpenCode session on cancel: %v", err))
+		} else {
+			o.log(jobID, "info", "Stopped OpenCode session on cancel")
+		}
+	}
 
 	// Clean up worktree
 	if job.WorktreePath != "" {
@@ -1294,8 +1406,18 @@ func (o *Orchestrator) waitForSessionWithHealing(job *db.Job, phase string, logF
 	}
 
 	for {
+		if err := o.checkCancelled(job.ID); err != nil {
+			return sessionID, err
+		}
+
 		// Try to wait for the session with remaining timeout
 		err := o.opencode.WaitForSessionIdle(sessionID, timeout, job.WorktreePath, logFunc)
+
+		// CancelJob marks cancelled then StopSession; a stopped session may look
+		// idle. Prefer the cancelled terminal state over continuing the pipeline.
+		if cancelErr := o.checkCancelled(job.ID); cancelErr != nil {
+			return sessionID, cancelErr
+		}
 
 		if err == nil {
 			// Success - session completed, clear wait start time
