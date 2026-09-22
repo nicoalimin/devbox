@@ -193,7 +193,8 @@ func commandsFor(worktreePath string, configured []string) ([]Command, error) {
 		return nil, err
 	}
 	for _, dir := range packages {
-		nodeCommands, err := nodeCommands(filepath.Join(worktreePath, dir), filepath.Join(worktreePath, dir, "package.json"))
+		pkgDir := filepath.Join(worktreePath, dir)
+		nodeCommands, err := nodeCommands(pkgDir, worktreePath, filepath.Join(pkgDir, "package.json"))
 		if err != nil {
 			return nil, err
 		}
@@ -266,7 +267,7 @@ func Format(worktreePath string, configured []string, logFunc func(string)) erro
 		if err := json.Unmarshal(data, &manifest); err != nil {
 			return fmt.Errorf("invalid package.json in %s: %w", dir, err)
 		}
-		manager := detectPackageManager(path, manifest.PackageManager)
+		manager := detectPackageManager(path, worktreePath, manifest.PackageManager)
 		formatter := formatterCommand(manager, manifest.Scripts)
 		if formatter == nil {
 			continue
@@ -274,7 +275,7 @@ func Format(worktreePath string, configured []string, logFunc func(string)) erro
 		// Install before formatting in fresh worktrees. nodeCommands puts the
 		// repository's frozen install first, ahead of its checks.
 		if _, err := os.Stat(filepath.Join(path, "node_modules")); os.IsNotExist(err) {
-			checks, err := nodeCommands(path, filepath.Join(path, "package.json"))
+			checks, err := nodeCommands(path, worktreePath, filepath.Join(path, "package.json"))
 			if err != nil {
 				return err
 			}
@@ -311,7 +312,7 @@ func formatterCommand(manager string, scripts map[string]string) *Command {
 	return nil
 }
 
-func nodeCommands(worktreePath, packageJSONPath string) ([]Command, error) {
+func nodeCommands(packageDir, worktreeRoot, packageJSONPath string) ([]Command, error) {
 	data, err := os.ReadFile(packageJSONPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read package.json for local validation: %w", err)
@@ -324,7 +325,7 @@ func nodeCommands(worktreePath, packageJSONPath string) ([]Command, error) {
 		return nil, fmt.Errorf("failed to parse package.json for local validation: %w", err)
 	}
 
-	manager := detectPackageManager(worktreePath, manifest.PackageManager)
+	manager := detectPackageManager(packageDir, worktreeRoot, manifest.PackageManager)
 	if manager == "" {
 		return nil, nil
 	}
@@ -335,7 +336,7 @@ func nodeCommands(worktreePath, packageJSONPath string) ([]Command, error) {
 		commands = append(commands, Command{Name: "pnpm", Args: []string{"install", "--frozen-lockfile"}})
 	case "npm":
 		args := []string{"install", "--no-package-lock"}
-		if fileExists(filepath.Join(worktreePath, "package-lock.json")) {
+		if fileExists(filepath.Join(packageDir, "package-lock.json")) {
 			args = []string{"ci"}
 		}
 		commands = append(commands, Command{Name: "npm", Args: args})
@@ -356,7 +357,7 @@ func nodeCommands(worktreePath, packageJSONPath string) ([]Command, error) {
 	return commands, nil
 }
 
-func detectPackageManager(worktreePath, declared string) string {
+func detectPackageManager(packageDir, worktreeRoot, declared string) string {
 	if declared != "" {
 		name, _, _ := strings.Cut(declared, "@")
 		switch name {
@@ -364,7 +365,7 @@ func detectPackageManager(worktreePath, declared string) string {
 			return name
 		}
 	}
-	for _, candidate := range []struct {
+	candidates := []struct {
 		file    string
 		manager string
 	}{
@@ -373,10 +374,28 @@ func detectPackageManager(worktreePath, declared string) string {
 		{"yarn.lock", "yarn"},
 		{"bun.lock", "bun"},
 		{"bun.lockb", "bun"},
-	} {
-		if fileExists(filepath.Join(worktreePath, candidate.file)) {
-			return candidate.manager
+	}
+	// Walk packageDir up to worktreeRoot so monorepo apps (e.g. web/) inherit
+	// the root lockfile when they omit packageManager / a local lockfile.
+	dir := packageDir
+	root := worktreeRoot
+	if root == "" {
+		root = packageDir
+	}
+	for {
+		for _, candidate := range candidates {
+			if fileExists(filepath.Join(dir, candidate.file)) {
+				return candidate.manager
+			}
 		}
+		if filepath.Clean(dir) == filepath.Clean(root) {
+			break
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			break
+		}
+		dir = parent
 	}
 	return "npm"
 }
