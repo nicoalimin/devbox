@@ -373,3 +373,49 @@ func TestRunCommandsHardFailsTestsProtocolWithoutPrimary(t *testing.T) {
 		t.Fatalf("expected hard-fail, got %v", err)
 	}
 }
+
+func TestDetectPackageManagerInheritsRootLockfile(t *testing.T) {
+	root := t.TempDir()
+	web := filepath.Join(root, "web")
+	if err := os.MkdirAll(web, 0755); err != nil {
+		t.Fatal(err)
+	}
+	writeTestFile(t, filepath.Join(root, "pnpm-lock.yaml"), "lockfileVersion: '9.0'\n")
+	// Nested web has no packageManager and no local lockfile — must inherit pnpm.
+	got := detectPackageManager(web, root, "")
+	if got != "pnpm" {
+		t.Fatalf("expected pnpm from root lockfile, got %q", got)
+	}
+	// Declared still wins.
+	if detectPackageManager(web, root, "npm@10") != "npm" {
+		t.Fatal("declared packageManager must win")
+	}
+	// Must not walk past worktree root into unrelated parents.
+	outer := t.TempDir()
+	writeTestFile(t, filepath.Join(outer, "yarn.lock"), "")
+	nestedRoot := filepath.Join(outer, "repo")
+	if err := os.MkdirAll(filepath.Join(nestedRoot, "web"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	got = detectPackageManager(filepath.Join(nestedRoot, "web"), nestedRoot, "")
+	if got != "npm" {
+		t.Fatalf("expected default npm when root has no lockfile, got %q (leaked parent?)", got)
+	}
+}
+
+func TestNodeCommandsUsesPnpmForWebViaRootLockfile(t *testing.T) {
+	root := t.TempDir()
+	web := filepath.Join(root, "web")
+	if err := os.MkdirAll(web, 0755); err != nil {
+		t.Fatal(err)
+	}
+	writeTestFile(t, filepath.Join(root, "pnpm-lock.yaml"), "lockfileVersion: '9.0'\n")
+	writeTestFile(t, filepath.Join(web, "package.json"), `{"scripts":{"test":"vitest run","typecheck":"tsc -p ."}}`)
+	cmds, err := nodeCommands(web, root, filepath.Join(web, "package.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cmds) == 0 || cmds[0].Name != "pnpm" || len(cmds[0].Args) == 0 || cmds[0].Args[0] != "install" {
+		t.Fatalf("expected leading pnpm install, got %#v", cmds)
+	}
+}
