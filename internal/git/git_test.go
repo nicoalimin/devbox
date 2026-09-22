@@ -778,3 +778,88 @@ https://github.com/nicoalimin/tokoboss/pull/9`,
 		})
 	}
 }
+
+func TestAlignAssignedBranchAndPushBranchAlso(t *testing.T) {
+	repo := setupTestRepo(t)
+	defer os.RemoveAll(repo)
+	mgr := NewManager(repo, "main")
+
+	// Worktree starts on assigned branch B.
+	worktree, err := mgr.CreateWorktree("UTA-88")
+	if err != nil {
+		t.Fatal(err)
+	}
+	assigned := worktree.BranchName
+
+	// Simulate continue job: create PR tip branch A with commits, then reset
+	// worktree onto A so local branch name no longer matches assigned.
+	prBranch := "devbox/uta-82-32"
+	runGit(t, worktree.Path, "checkout", "-b", prBranch)
+	if err := os.WriteFile(filepath.Join(worktree.Path, "continue.txt"), []byte("from-pr-tip"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, worktree.Path, "add", "continue.txt")
+	runGit(t, worktree.Path, "commit", "-m", "continue tip")
+	runGit(t, worktree.Path, "push", "-u", "origin", prBranch)
+
+	// Wrong-branch still refused before align.
+	if err := mgr.PushBranch(worktree.Path, assigned); err == nil {
+		t.Fatal("expected PushBranch to refuse wrong local branch before align")
+	}
+
+	// Align keeps commits and renames local branch to assigned.
+	if err := mgr.AlignAssignedBranch(worktree.Path, assigned); err != nil {
+		t.Fatalf("AlignAssignedBranch: %v", err)
+	}
+	if err := mgr.AssertBranch(worktree.Path, assigned); err != nil {
+		t.Fatalf("AssertBranch after align: %v", err)
+	}
+	head := runGit(t, worktree.Path, "rev-parse", "HEAD")
+
+	if err := mgr.PushBranch(worktree.Path, assigned); err != nil {
+		t.Fatalf("PushBranch after align: %v", err)
+	}
+
+	// Dual-push updates extraRef to the same tip.
+	if err := mgr.PushExtraRef(worktree.Path, assigned, prBranch); err != nil {
+		t.Fatalf("PushExtraRef: %v", err)
+	}
+	remoteExtra := strings.Fields(runGit(t, worktree.Path, "ls-remote", "origin", "refs/heads/"+prBranch))
+	if len(remoteExtra) < 1 || remoteExtra[0] != head {
+		t.Fatalf("extraRef tip %v does not match HEAD %s", remoteExtra, head)
+	}
+
+	// PushBranchAlso: assigned + another extra in one call.
+	extra2 := "devbox/uta-88-extra"
+	if err := os.WriteFile(filepath.Join(worktree.Path, "more.txt"), []byte("more"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, worktree.Path, "add", "more.txt")
+	runGit(t, worktree.Path, "commit", "-m", "more")
+	if err := mgr.PushBranchAlso(worktree.Path, assigned, extra2); err != nil {
+		t.Fatalf("PushBranchAlso: %v", err)
+	}
+	head2 := runGit(t, worktree.Path, "rev-parse", "HEAD")
+	for _, ref := range []string{assigned, extra2} {
+		fields := strings.Fields(runGit(t, worktree.Path, "ls-remote", "origin", "refs/heads/"+ref))
+		if len(fields) < 1 || fields[0] != head2 {
+			t.Fatalf("ref %s tip %v != HEAD %s", ref, fields, head2)
+		}
+	}
+
+	// No-op dual-push when extra equals assigned.
+	if err := mgr.PushExtraRef(worktree.Path, assigned, assigned); err != nil {
+		t.Fatalf("PushExtraRef no-op: %v", err)
+	}
+}
+
+func runGit(t *testing.T, dir string, args ...string) string {
+	t.Helper()
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %v: %v\n%s", args, err, out)
+	}
+	return strings.TrimSpace(string(out))
+}

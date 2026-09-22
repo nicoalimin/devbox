@@ -446,6 +446,28 @@ func (o *Orchestrator) recoverFromReviewWaitFailure(job *db.Job, waitErr error) 
 	return nil
 }
 
+// continueOptions parses OperatorContext for continue-existing-PR delivery.
+func (o *Orchestrator) continueOptions(job *db.Job) ContinuePROptions {
+	if job == nil {
+		return ContinuePROptions{}
+	}
+	return ParseContinuePRContext(job.OperatorContext)
+}
+
+// alignAssignedBranchIfContinue renames the worktree local branch to the job's
+// assigned branch when push_ref continue context is set (keeps commits).
+func (o *Orchestrator) alignAssignedBranchIfContinue(job *db.Job, gitMgr *git.Manager) error {
+	opts := o.continueOptions(job)
+	if !opts.Active() {
+		return nil
+	}
+	o.log(job.ID, "info", fmt.Sprintf("Continue PR: aligning worktree onto assigned branch %q (push_ref=%q)", job.BranchName, opts.PushRef))
+	if err := gitMgr.AlignAssignedBranch(job.WorktreePath, job.BranchName); err != nil {
+		return err
+	}
+	return nil
+}
+
 // pushBranch pushes the branch to the remote
 func (o *Orchestrator) pushBranch(job *db.Job) error {
 	job.State = db.StatePushing
@@ -456,6 +478,9 @@ func (o *Orchestrator) pushBranch(job *db.Job) error {
 	o.log(job.ID, "info", "Preparing validated commits before push")
 
 	gitMgr := git.NewManager(job.RepoPath, o.baseBranch(job))
+	if err := o.alignAssignedBranchIfContinue(job, gitMgr); err != nil {
+		return err
+	}
 	if err := gitMgr.AssertBranch(job.WorktreePath, job.BranchName); err != nil {
 		return err
 	}
@@ -506,6 +531,9 @@ func (o *Orchestrator) validateWithOpenCodeRepair(job *db.Job, gitMgr *git.Manag
 	runValidation := func() error {
 		// A repair agent can run arbitrary Git commands. Reassert the assigned
 		// branch before every host-owned format/commit pass.
+		if err := o.alignAssignedBranchIfContinue(job, gitMgr); err != nil {
+			return err
+		}
 		if err := gitMgr.AssertBranch(job.WorktreePath, job.BranchName); err != nil {
 			return err
 		}
@@ -593,9 +621,18 @@ func (o *Orchestrator) formatCommands(job *db.Job) []string {
 }
 
 func (o *Orchestrator) pushWithRetry(job *db.Job, manager *git.Manager) error {
+	opts := o.continueOptions(job)
 	var err error
 	for attempt := 1; attempt <= 3; attempt++ {
-		if err = manager.PushBranch(job.WorktreePath, job.BranchName); err == nil {
+		if opts.Active() {
+			err = manager.PushBranchAlso(job.WorktreePath, job.BranchName, opts.PushRef)
+		} else {
+			err = manager.PushBranch(job.WorktreePath, job.BranchName)
+		}
+		if err == nil {
+			if opts.Active() && opts.PushRef != job.BranchName {
+				o.log(job.ID, "info", fmt.Sprintf("Continue PR: dual-pushed HEAD to push_ref %q", opts.PushRef))
+			}
 			return nil
 		}
 		o.log(job.ID, "warn", fmt.Sprintf("Push attempt %d/3 failed: %v", attempt, err))
@@ -641,9 +678,22 @@ func (o *Orchestrator) createPullRequest(job *db.Job) error {
 	// Determine base branch
 	baseBranch := o.baseBranch(job)
 
-	prURL, err := git.CreatePR(job.WorktreePath, prTitle, prBody, baseBranch)
-	if err != nil {
-		return err
+	var prURL string
+	if opts := o.continueOptions(job); opts.Active() {
+		existing, findErr := git.FindPRURLByHead(job.WorktreePath, opts.PushRef)
+		if findErr != nil {
+			o.log(job.ID, "warn", fmt.Sprintf("Continue PR: could not look up existing PR for push_ref %q: %v", opts.PushRef, findErr))
+		} else if existing != "" {
+			o.log(job.ID, "info", fmt.Sprintf("Continue PR: reusing existing PR for push_ref %q: %s", opts.PushRef, existing))
+			prURL = existing
+		}
+	}
+	if prURL == "" {
+		var createErr error
+		prURL, createErr = git.CreatePR(job.WorktreePath, prTitle, prBody, baseBranch)
+		if createErr != nil {
+			return createErr
+		}
 	}
 
 	job.PRURL = prURL
@@ -746,6 +796,9 @@ func (o *Orchestrator) checkpointFailedWork(job *db.Job) (published bool, err er
 		return false, fmt.Errorf("cannot stop agent safely: %w", err)
 	}
 	manager := git.NewManager(job.RepoPath, o.baseBranch(job))
+	if err := o.alignAssignedBranchIfContinue(job, manager); err != nil {
+		return false, err
+	}
 	if err := manager.AssertBranch(job.WorktreePath, job.BranchName); err != nil {
 		return false, err
 	}
@@ -812,6 +865,10 @@ func (o *Orchestrator) buildCodingPrompt(issue *linear.Issue, operatorContext st
 		sb.WriteString("## Additional Operator Context\n\n")
 		sb.WriteString(operatorContext)
 		sb.WriteString("\n\n")
+		if opts := ParseContinuePRContext(operatorContext); opts.Active() {
+			sb.WriteString("## Continue existing PR (host delivery)\n\n")
+			sb.WriteString(fmt.Sprintf("This is a continue job. After resetting onto the existing tip, leave commits in the worktree. Host will align onto the assigned branch and dual-push to push_ref %q so the existing PR updates.\n\n", opts.PushRef))
+		}
 	}
 
 	sb.WriteString("Instructions:\n")

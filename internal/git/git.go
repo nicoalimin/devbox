@@ -178,6 +178,85 @@ func (m *Manager) PushBranch(worktreePath, branchName string) error {
 	return m.VerifyPublished(worktreePath, branchName)
 }
 
+// AlignAssignedBranch renames the current local branch to assignedBranch while
+// keeping HEAD commits (git checkout -B). Used by continue-existing-PR jobs that
+// reset onto an existing PR tip before host delivery.
+func (m *Manager) AlignAssignedBranch(worktreePath, assignedBranch string) error {
+	if assignedBranch == "" || assignedBranch == m.baseBranch {
+		return fmt.Errorf("refusing align to empty or base branch %q", assignedBranch)
+	}
+	output, err := runDeliveryGit(worktreePath, "checkout", "-B", assignedBranch)
+	if err != nil {
+		return fmt.Errorf("failed to align worktree onto assigned branch %q: %w\nOutput: %s", assignedBranch, err, string(output))
+	}
+	return m.AssertBranch(worktreePath, assignedBranch)
+}
+
+// PushBranchAlso pushes the assigned branch, then optionally dual-pushes HEAD to
+// extraRef (e.g. an existing PR head) when extraRef is non-empty and differs.
+func (m *Manager) PushBranchAlso(worktreePath, assignedBranch, extraRef string) error {
+	if err := m.PushBranch(worktreePath, assignedBranch); err != nil {
+		return err
+	}
+	return m.PushExtraRef(worktreePath, assignedBranch, extraRef)
+}
+
+// PushExtraRef updates refs/heads/extraRef to match HEAD after the assigned
+// branch has already been published. No-op when extraRef is empty or equal to
+// assignedBranch. AssertBranch remains strict for the assigned branch.
+func (m *Manager) PushExtraRef(worktreePath, assignedBranch, extraRef string) error {
+	if extraRef == "" || extraRef == assignedBranch {
+		return nil
+	}
+	if err := m.AssertBranch(worktreePath, assignedBranch); err != nil {
+		return err
+	}
+	if extraRef == m.baseBranch {
+		return fmt.Errorf("refusing dual-push to base branch %q", extraRef)
+	}
+	output, err := runDeliveryGit(worktreePath, "push", "origin", "HEAD:refs/heads/"+extraRef)
+	if err != nil {
+		return fmt.Errorf("failed to dual-push extra ref %q: %w\nOutput: %s", extraRef, err, string(output))
+	}
+	return m.verifyRemoteTip(worktreePath, extraRef)
+}
+
+// verifyRemoteTip checks that origin/<branchName> matches local HEAD without
+// requiring the worktree to be checked out on that branch name.
+func (m *Manager) verifyRemoteTip(worktreePath, branchName string) error {
+	cmd := exec.Command("git", "rev-parse", "HEAD")
+	cmd.Dir = worktreePath
+	head, err := cmd.Output()
+	if err != nil {
+		return fmt.Errorf("failed to read HEAD: %w", err)
+	}
+	remote, err := runDeliveryGit(worktreePath, "ls-remote", "--exit-code", "origin", "refs/heads/"+branchName)
+	fields := strings.Fields(string(remote))
+	if err != nil || len(fields) != 2 || fields[0] != strings.TrimSpace(string(head)) {
+		return fmt.Errorf("remote branch %s does not match local HEAD: %s (error: %v)", branchName, remote, err)
+	}
+	return nil
+}
+
+// FindPRURLByHead returns the open PR URL whose head branch is headBranch, or
+// empty string / nil when none exists. Used by continue-existing-PR delivery.
+func FindPRURLByHead(worktreePath, headBranch string) (string, error) {
+	if headBranch == "" {
+		return "", nil
+	}
+	cmd := exec.Command("gh", "pr", "list", "--head", headBranch, "--state", "open", "--json", "url", "--jq", ".[0].url // empty")
+	cmd.Dir = worktreePath
+	output, err := cmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("failed to list PR for head %q: %w", headBranch, err)
+	}
+	url := strings.TrimSpace(string(output))
+	if url == "" || !strings.HasPrefix(url, "http") {
+		return "", nil
+	}
+	return url, nil
+}
+
 // Bound credential helpers, hooks and transport processes as well as Git
 // itself so host recovery cannot hang indefinitely after a model timeout.
 func runDeliveryGit(worktreePath string, args ...string) ([]byte, error) {
