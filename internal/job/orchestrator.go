@@ -492,6 +492,20 @@ func (o *Orchestrator) pushBranch(job *db.Job) error {
 
 	o.log(job.ID, "info", "Commits verified, pushing branch to remote")
 
+	// If we have a PR URL and continue context in operator context, try to use the PR branch for updates
+	continuePR := o.shouldContinuePR(job)
+	if continuePR && job.PRURL != "" {
+		o.log(job.ID, "info", "Continuing existing PR - attempting to update existing branch")
+		err = o.continueExistingPRBranch(job, gitMgr)
+		if err != nil {
+			o.log(job.ID, "error", fmt.Sprintf("Failed to continue existing PR branch: %v", err))
+			// Fall back to normal pushing if this fails
+			o.log(job.ID, "info", "Falling back to normal push behavior")
+		} else {
+			return nil // Successfully handled continuation logic
+		}
+	}
+
 	if err := o.pushWithRetry(job, gitMgr); err != nil {
 		return err
 	}
@@ -1840,4 +1854,57 @@ func (o *Orchestrator) cleanupWorktreeBestEffort(j *db.Job) {
 	if err := gitMgr.RemoveWorktree(j.WorktreePath); err != nil {
 		o.log(j.ID, "warn", fmt.Sprintf("Failed to remove worktree: %v", err))
 	}
+}
+
+// shouldContinuePR returns true if we have continue_pr or push_ref setting in operator context and PR exists
+func (o *Orchestrator) shouldContinuePR(job *db.Job) bool {
+	// OperatorContext is stored as a JSON string, not as a map
+	if job.OperatorContext == "" {
+		return false
+	}
+
+	// Try to parse the JSON string for operator context
+	var ctx map[string]interface{}
+	if err := json.Unmarshal([]byte(job.OperatorContext), &ctx); err != nil {
+		// If parsing fails, treat it as no special context
+		return false
+	}
+
+	// Check for continue_pr field
+	continuePR, ok := ctx["continue_pr"]
+	if ok {
+		if continuePRBool, ok := continuePR.(bool); ok && continuePRBool {
+			return true
+		}
+	}
+
+	// Also check for push_ref field as an alternative indication
+	_, ok = ctx["push_ref"]
+	return ok && job.PRURL != ""
+}
+
+// continueExistingPRBranch updates the existing PR head to point to current branch
+func (o *Orchestrator) continueExistingPRBranch(job *db.Job, gitMgr *git.Manager) error {
+	o.log(job.ID, "info", "Attempting to update existing PR branch")
+	
+	// Get the current commit hash
+	cmd := exec.Command("git", "rev-parse", "HEAD")
+	cmd.Dir = job.WorktreePath
+	output, err := cmd.Output()
+	if err != nil {
+		return fmt.Errorf("failed to get current commit: %w", err)
+	}
+	currentCommit := strings.TrimSpace(string(output))
+	
+	// Set the PR head to the current commit using force-with-lease 
+	// This updates existing branch without creating a new PR
+	cmd = exec.Command("git", "push", "--force-with-lease", "origin", currentCommit+":refs/heads/"+job.BranchName)
+	cmd.Dir = job.WorktreePath
+	output, err = cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("failed to continue existing PR branch: %w\nOutput: %s", err, string(output))
+	}
+	
+	o.log(job.ID, "info", "Successfully continued existing PR branch")
+	return nil
 }
