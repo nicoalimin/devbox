@@ -684,7 +684,8 @@ func (o *Orchestrator) completeJob(job *db.Job) {
 	if job.WorktreePath != "" {
 		gitMgr := git.NewManager(job.RepoPath, o.cfg.GitHub.DefaultBaseBranch)
 		if err := gitMgr.RemoveWorktree(job.WorktreePath); err != nil {
-			o.log(job.ID, "warn", fmt.Sprintf("Failed to remove worktree: %v", err))
+			o.log(job.ID, "error", fmt.Sprintf("Failed to remove worktree: %v", err))
+			return // Don't mark job as complete if cleanup fails
 		}
 	}
 }
@@ -767,7 +768,8 @@ func (o *Orchestrator) checkpointFailedWork(job *db.Job) (published bool, err er
 	if !hasCommits {
 		o.log(job.ID, "info", "No incomplete work to checkpoint (branch identical to base)")
 		if err := manager.RemoveWorktree(job.WorktreePath); err != nil {
-			o.log(job.ID, "warn", fmt.Sprintf("Worktree cleanup deferred after empty checkpoint: %v", err))
+			o.log(job.ID, "error", fmt.Sprintf("Worktree cleanup failed after empty checkpoint: %v", err))
+			return false, err // Return error to prevent job from being marked as completed
 		}
 		return false, nil
 	}
@@ -777,7 +779,8 @@ func (o *Orchestrator) checkpointFailedWork(job *db.Job) (published bool, err er
 	}
 	o.log(job.ID, "warn", "Incomplete work checkpoint committed and verified on remote; job remains failed")
 	if err := manager.RemoveWorktree(job.WorktreePath); err != nil {
-		o.log(job.ID, "warn", fmt.Sprintf("Checkpoint published; worktree cleanup deferred: %v", err))
+		o.log(job.ID, "error", fmt.Sprintf("Checkpoint published; worktree cleanup failed: %v", err))
+		return true, err // Return error to prevent job from being marked as completed
 	}
 	return true, nil
 }
@@ -1098,7 +1101,8 @@ func (o *Orchestrator) CancelJob(jobID string) error {
 	if job.WorktreePath != "" {
 		gitMgr := git.NewManager(job.RepoPath, o.cfg.GitHub.DefaultBaseBranch)
 		if err := gitMgr.RemoveWorktree(job.WorktreePath); err != nil {
-			o.log(jobID, "warn", fmt.Sprintf("Failed to remove worktree: %v", err))
+			o.log(jobID, "error", fmt.Sprintf("Failed to remove worktree: %v", err))
+			return fmt.Errorf("failed to remove worktree: %w", err) // Return error to prevent job from being marked as cancelled
 		}
 	}
 

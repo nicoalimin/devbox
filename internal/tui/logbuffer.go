@@ -125,7 +125,7 @@ func RedirectStdLog() {
 	if globalLogBuffer == nil {
 		return
 	}
-	
+
 	// Redirect standard log package
 	log.SetOutput(&LogWriter{buffer: globalLogBuffer, level: "INFO"})
 	log.SetFlags(0) // Remove default timestamp/prefix since we add our own

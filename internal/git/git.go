@@ -157,6 +157,12 @@ func (m *Manager) RecreateWorktree(identifier, branchName string) (*WorktreeInfo
 
 // RemoveWorktree removes a git worktree
 func (m *Manager) RemoveWorktree(worktreePath string) error {
+	// Check if the worktree path exists first
+	if _, err := os.Stat(worktreePath); os.IsNotExist(err) {
+		// Worktree already removed, that's fine
+		return nil
+	}
+
 	cmd := exec.Command("git", "worktree", "remove", worktreePath)
 	cmd.Dir = m.repoPath
 	output, err := cmd.CombinedOutput()
