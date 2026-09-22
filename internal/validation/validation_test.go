@@ -307,3 +307,69 @@ func TestRunCommandsHardFailsNonProtocolMobile(t *testing.T) {
 		t.Fatalf("expected hard-fail for mobile lint, got %v", err)
 	}
 }
+
+func TestShouldSoftSkipTestsInstallHelpers(t *testing.T) {
+	cmd := Command{Name: "npm", Args: []string{"install", "--no-package-lock"}, Dir: "tests/example-use-case"}
+	out := []byte("npm ERR! code EUNSUPPORTEDPROTOCOL\nnpm ERR! Unsupported URL Type \"workspace:\": workspace:*\n")
+	if !shouldSoftSkipMobileInstall(cmd, out, true) {
+		t.Fatal("expected soft-skip when primary passed + tests/* install protocol error")
+	}
+	if shouldSoftSkipMobileInstall(cmd, out, false) {
+		t.Fatal("must hard-fail when no primary package succeeded yet")
+	}
+	lint := Command{Name: "npm", Args: []string{"run", "lint"}, Dir: "tests/example-use-case"}
+	if shouldSoftSkipMobileInstall(lint, out, true) {
+		t.Fatal("non-install tests/* failures must stay hard-fail")
+	}
+	other := []byte("npm ERR! code E404\nnpm ERR! 404 Not Found\n")
+	if shouldSoftSkipMobileInstall(cmd, other, true) {
+		t.Fatal("non-protocol tests/* install failures must stay hard-fail")
+	}
+}
+
+func TestRunCommandsSoftSkipsTestsProtocolAfterPrimary(t *testing.T) {
+	orig := runCommandFn
+	defer func() { runCommandFn = orig }()
+
+	var logs []string
+	logFunc := func(s string) { logs = append(logs, s) }
+
+	runCommandFn = func(ctx context.Context, worktreePath string, command Command) ([]byte, error) {
+		if command.Dir == "web" {
+			return []byte("ok"), nil
+		}
+		if command.Dir == "tests/example-use-case" && isInstallCommand(command) {
+			return []byte("npm ERR! code EUNSUPPORTEDPROTOCOL\nUnsupported URL Type \"workspace:\": workspace:*\n"), fmt.Errorf("exit status 1")
+		}
+		return nil, fmt.Errorf("unexpected command: %+v", command)
+	}
+
+	err := runCommands(t.TempDir(), []Command{
+		{Name: "pnpm", Args: []string{"install", "--frozen-lockfile"}, Dir: "web"},
+		{Name: "pnpm", Args: []string{"run", "typecheck"}, Dir: "web"},
+		{Name: "npm", Args: []string{"install", "--no-package-lock"}, Dir: "tests/example-use-case"},
+	}, logFunc)
+	if err != nil {
+		t.Fatalf("expected soft-skip success, got %v", err)
+	}
+	joined := strings.Join(logs, "\n")
+	if !strings.Contains(joined, "Local validation soft-skipped: [tests/example-use-case] npm install --no-package-lock (EUNSUPPORTEDPROTOCOL; web gates already green)") {
+		t.Fatalf("missing soft-skip log: %s", joined)
+	}
+}
+
+func TestRunCommandsHardFailsTestsProtocolWithoutPrimary(t *testing.T) {
+	orig := runCommandFn
+	defer func() { runCommandFn = orig }()
+
+	runCommandFn = func(ctx context.Context, worktreePath string, command Command) ([]byte, error) {
+		return []byte("npm ERR! code EUNSUPPORTEDPROTOCOL\nworkspace:*\n"), fmt.Errorf("exit status 1")
+	}
+
+	err := runCommands(t.TempDir(), []Command{
+		{Name: "npm", Args: []string{"install", "--no-package-lock"}, Dir: "tests/example-use-case"},
+	}, nil)
+	if err == nil || !strings.Contains(err.Error(), "local validation failed") {
+		t.Fatalf("expected hard-fail, got %v", err)
+	}
+}
