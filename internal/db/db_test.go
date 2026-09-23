@@ -666,7 +666,7 @@ func TestMigrationEmptyDatabase(t *testing.T) {
 	now := time.Now()
 	codingWaitStarted := now.Add(-5 * time.Minute)
 	reviewingWaitStarted := now.Add(-2 * time.Minute)
-	
+
 	job := &Job{
 		ID:                     "migration-test-1",
 		LinearIssueID:          "ENG-MIGRATE-1",
@@ -781,7 +781,7 @@ func TestMigrationIdempotent(t *testing.T) {
 func TestDirectoryCreation(t *testing.T) {
 	testDir := "test_subdir/nested/path"
 	dbPath := filepath.Join(testDir, "jobs.db")
-	
+
 	// Clean up before and after
 	defer os.RemoveAll("test_subdir")
 	os.RemoveAll("test_subdir")
@@ -813,5 +813,55 @@ func TestDirectoryCreation(t *testing.T) {
 	}
 	if err := db.CreateJob(job); err != nil {
 		t.Fatalf("Failed to create job in nested database: %v", err)
+	}
+}
+
+func TestGetPriorReusableJob(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "prior.db")
+	database, err := Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+
+	older := &Job{
+		ID: "old", LinearIssueID: "UTA-96", State: StateDone,
+		BranchName: "devbox/uta-96", WorktreePath: "/tmp/old",
+		PRURL:     "https://example.com/pull/1",
+		CreatedAt: time.Now().Add(-2 * time.Hour), UpdatedAt: time.Now(),
+	}
+	newer := &Job{
+		ID: "new", LinearIssueID: "UTA-96", State: StateDone,
+		BranchName: "devbox/uta-96-2", WorktreePath: "/tmp/new",
+		PRURL:     "https://example.com/pull/2",
+		CreatedAt: time.Now().Add(-1 * time.Hour), UpdatedAt: time.Now(),
+	}
+	current := &Job{
+		ID: "current", LinearIssueID: "UTA-96", State: StateFetching,
+		CreatedAt: time.Now(), UpdatedAt: time.Now(),
+	}
+	for _, j := range []*Job{older, newer, current} {
+		if err := database.CreateJob(j); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	got, err := database.GetPriorReusableJob("UTA-96", "current")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got == nil || got.ID != "new" {
+		t.Fatalf("want newest prior with PR, got %+v", got)
+	}
+	got, err = database.GetPriorReusableJob("UTA-96", "new")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got == nil || got.ID != "old" {
+		t.Fatalf("excluding new should return old, got %+v", got)
+	}
+	got, err = database.GetPriorReusableJob("OTHER", "current")
+	if err != nil || got != nil {
+		t.Fatalf("expected nil for other issue, got %+v err=%v", got, err)
 	}
 }

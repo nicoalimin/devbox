@@ -492,3 +492,139 @@ func (m *Manager) HasCommitsAheadOfBase(worktreePath string) (bool, error) {
 
 	return true, nil
 }
+
+// FindWorktreeForBranch returns the path of an existing worktree checked out on
+// branchName, or "" when none is registered. Uses `git worktree list --porcelain`.
+func (m *Manager) FindWorktreeForBranch(branchName string) (string, error) {
+	if branchName == "" {
+		return "", nil
+	}
+	cmd := exec.Command("git", "worktree", "list", "--porcelain")
+	cmd.Dir = m.repoPath
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("failed to list worktrees: %w\nOutput: %s", err, string(output))
+	}
+	want := "refs/heads/" + branchName
+	var currentPath string
+	for _, line := range strings.Split(string(output), "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "worktree ") {
+			currentPath = strings.TrimPrefix(line, "worktree ")
+			continue
+		}
+		if strings.HasPrefix(line, "branch ") {
+			branch := strings.TrimPrefix(line, "branch ")
+			if branch == want && currentPath != "" {
+				if _, statErr := os.Stat(currentPath); statErr == nil {
+					return currentPath, nil
+				}
+			}
+		}
+		if line == "" {
+			currentPath = ""
+		}
+	}
+	return "", nil
+}
+
+// CreateWorktreeOnRef creates a worktree checked out on an existing branch/ref
+// (local or origin/<ref>), without creating a new numbered branch from main.
+// Prefer FindWorktreeForBranch / reattach before calling this.
+func (m *Manager) CreateWorktreeOnRef(identifier, ref string) (*WorktreeInfo, error) {
+	if ref == "" || ref == m.baseBranch {
+		return nil, fmt.Errorf("refusing worktree on empty or base branch %q", ref)
+	}
+	if err := m.fetchRef(ref); err != nil {
+		return nil, fmt.Errorf("failed to fetch ref %q: %w", ref, err)
+	}
+
+	if existing, err := m.FindWorktreeForBranch(ref); err != nil {
+		return nil, err
+	} else if existing != "" {
+		return &WorktreeInfo{Path: existing, BranchName: ref}, nil
+	}
+
+	worktreePath := filepath.Join(m.repoPath, ".devbox-worktrees", identifier)
+	if _, err := os.Stat(worktreePath); err == nil {
+		// Path occupied (possibly unrelated); use a stable reuse suffix.
+		worktreePath = filepath.Join(m.repoPath, ".devbox-worktrees", identifier+"-reuse")
+	}
+	if _, err := os.Stat(worktreePath); err == nil {
+		return nil, fmt.Errorf("refusing to replace existing worktree at %s", worktreePath)
+	}
+	if err := os.MkdirAll(filepath.Dir(worktreePath), 0755); err != nil {
+		return nil, fmt.Errorf("failed to create worktree directory: %w", err)
+	}
+
+	var cmd *exec.Cmd
+	if m.localBranchExists(ref) {
+		cmd = exec.Command("git", "worktree", "add", worktreePath, ref)
+	} else if m.remoteBranchExists(ref) {
+		cmd = exec.Command("git", "worktree", "add", "-b", ref, worktreePath, "origin/"+ref)
+	} else {
+		return nil, fmt.Errorf("branch %q does not exist locally or on origin", ref)
+	}
+	cmd.Dir = m.repoPath
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return nil, fmt.Errorf("failed to create worktree on %q: %w\nOutput: %s", ref, err, string(output))
+	}
+
+	return &WorktreeInfo{Path: worktreePath, BranchName: ref}, nil
+}
+
+// EnsureWorktreeOnBranch checks out branchName in an existing worktree path
+// (keeps commits via checkout -B when renaming, or plain checkout when already tracking).
+func (m *Manager) EnsureWorktreeOnBranch(worktreePath, branchName string) error {
+	if worktreePath == "" || branchName == "" {
+		return fmt.Errorf("worktree path and branch name are required")
+	}
+	if _, err := os.Stat(worktreePath); err != nil {
+		return fmt.Errorf("worktree path missing: %w", err)
+	}
+	cmd := exec.Command("git", "symbolic-ref", "--quiet", "--short", "HEAD")
+	cmd.Dir = worktreePath
+	out, err := cmd.Output()
+	if err == nil && strings.TrimSpace(string(out)) == branchName {
+		return nil
+	}
+	return m.AlignAssignedBranch(worktreePath, branchName)
+}
+
+func (m *Manager) localBranchExists(branchName string) bool {
+	cmd := exec.Command("git", "show-ref", "--verify", "--quiet", fmt.Sprintf("refs/heads/%s", branchName))
+	cmd.Dir = m.repoPath
+	return cmd.Run() == nil
+}
+
+func (m *Manager) remoteBranchExists(branchName string) bool {
+	cmd := exec.Command("git", "show-ref", "--verify", "--quiet", fmt.Sprintf("refs/remotes/origin/%s", branchName))
+	cmd.Dir = m.repoPath
+	return cmd.Run() == nil
+}
+
+func (m *Manager) fetchRef(ref string) error {
+	cmd := exec.Command("git", "fetch", "origin", ref)
+	cmd.Dir = m.repoPath
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		// Fall back to fetching base + all remotes tip for the ref name.
+		cmd2 := exec.Command("git", "fetch", "origin")
+		cmd2.Dir = m.repoPath
+		out2, err2 := cmd2.CombinedOutput()
+		if err2 != nil {
+			return fmt.Errorf("git fetch %s failed: %w (%s); full fetch: %v (%s)", ref, err, string(output), err2, string(out2))
+		}
+	}
+	return nil
+}
+
+// WorktreePathExists reports whether path is present on disk.
+func WorktreePathExists(path string) bool {
+	if path == "" {
+		return false
+	}
+	_, err := os.Stat(path)
+	return err == nil
+}

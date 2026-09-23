@@ -254,7 +254,9 @@ func (o *Orchestrator) fetchLinearIssue(job *db.Job) error {
 	return nil
 }
 
-// prepareWorktree creates a git worktree for the job
+// prepareWorktree creates a git worktree for the job.
+// UTA-96: when continue/reuse applies, reattach or checkout the existing PR
+// branch instead of minting a new numbered branch from main.
 func (o *Orchestrator) prepareWorktree(job *db.Job) error {
 	job.State = db.StatePreparing
 	if err := o.db.UpdateJob(job); err != nil {
@@ -286,8 +288,18 @@ func (o *Orchestrator) prepareWorktree(job *db.Job) error {
 			issue.Team.Key, projectName, labels)
 	}
 
-	// Create worktree
 	gitMgr := git.NewManager(repo.Path, repo.BaseBranch)
+	opts := o.continueOptions(job)
+	prior, priorErr := o.db.GetPriorReusableJob(job.LinearIssueID, job.ID)
+	if priorErr != nil {
+		o.log(job.ID, "warn", fmt.Sprintf("Failed to look up prior job for reuse: %v", priorErr))
+	}
+	plan := ResolveReusePlan(opts, prior)
+	if plan.Reuse {
+		return o.prepareReuseWorktree(job, gitMgr, issue.Identifier, repo.Path, plan)
+	}
+
+	// Fresh assign: new numbered branch from main
 	worktree, err := gitMgr.CreateWorktree(issue.Identifier)
 	if err != nil {
 		return err
@@ -301,6 +313,67 @@ func (o *Orchestrator) prepareWorktree(job *db.Job) error {
 	}
 
 	o.log(job.ID, "info", fmt.Sprintf("Created worktree at %s (branch: %s)", worktree.Path, worktree.BranchName))
+	return nil
+}
+
+// prepareReuseWorktree reattaches an existing worktree or creates one checked
+// out on plan.Ref (the PR head). Assigned branch == plan.Ref so dual-push is a no-op.
+func (o *Orchestrator) prepareReuseWorktree(job *db.Job, gitMgr *git.Manager, identifier, repoPath string, plan ReusePlan) error {
+	o.log(job.ID, "info", fmt.Sprintf("Reuse path: iterating on existing branch %q (not a new branch from main)", plan.Ref))
+
+	job.RepoPath = repoPath
+	if plan.RepoPath != "" {
+		job.RepoPath = plan.RepoPath
+		gitMgr = git.NewManager(job.RepoPath, o.baseBranch(job))
+	}
+	job.BranchName = plan.Ref
+	if job.PRURL == "" && plan.PRURL != "" {
+		job.PRURL = plan.PRURL
+	}
+	// Ensure operator context carries push_ref so delivery + coding prompt
+	// treat this as continue even when only auto-detected from a prior PR.
+	job.OperatorContext = ensurePushRefInContext(job.OperatorContext, plan.Ref)
+
+	var worktreePath string
+
+	// 1) Prefer last job's worktree_path if still on disk
+	if git.WorktreePathExists(plan.PreferWorktreePath) {
+		if err := gitMgr.EnsureWorktreeOnBranch(plan.PreferWorktreePath, plan.Ref); err != nil {
+			o.log(job.ID, "warn", fmt.Sprintf("Could not reattach preferred worktree %s: %v", plan.PreferWorktreePath, err))
+		} else {
+			worktreePath = plan.PreferWorktreePath
+			o.log(job.ID, "info", fmt.Sprintf("Reattached existing worktree at %s on %s", worktreePath, plan.Ref))
+		}
+	}
+
+	// 2) Else any registered worktree already on that branch
+	if worktreePath == "" {
+		existing, err := gitMgr.FindWorktreeForBranch(plan.Ref)
+		if err != nil {
+			o.log(job.ID, "warn", fmt.Sprintf("FindWorktreeForBranch: %v", err))
+		} else if existing != "" {
+			if err := gitMgr.EnsureWorktreeOnBranch(existing, plan.Ref); err != nil {
+				return fmt.Errorf("found worktree for %q but could not ensure checkout: %w", plan.Ref, err)
+			}
+			worktreePath = existing
+			o.log(job.ID, "info", fmt.Sprintf("Reusing registered worktree at %s on %s", worktreePath, plan.Ref))
+		}
+	}
+
+	// 3) Else create worktree checked out on push_ref / prior branch
+	if worktreePath == "" {
+		worktree, err := gitMgr.CreateWorktreeOnRef(identifier, plan.Ref)
+		if err != nil {
+			return fmt.Errorf("failed to create reuse worktree on %q: %w", plan.Ref, err)
+		}
+		worktreePath = worktree.Path
+		o.log(job.ID, "info", fmt.Sprintf("Created reuse worktree at %s (branch: %s)", worktree.Path, worktree.BranchName))
+	}
+
+	job.WorktreePath = worktreePath
+	if err := o.db.UpdateJob(job); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -679,13 +752,24 @@ func (o *Orchestrator) createPullRequest(job *db.Job) error {
 	baseBranch := o.baseBranch(job)
 
 	var prURL string
-	if opts := o.continueOptions(job); opts.Active() {
-		existing, findErr := git.FindPRURLByHead(job.WorktreePath, opts.PushRef)
-		if findErr != nil {
-			o.log(job.ID, "warn", fmt.Sprintf("Continue PR: could not look up existing PR for push_ref %q: %v", opts.PushRef, findErr))
-		} else if existing != "" {
-			o.log(job.ID, "info", fmt.Sprintf("Continue PR: reusing existing PR for push_ref %q: %s", opts.PushRef, existing))
-			prURL = existing
+	// Prefer PR already inherited from a prior continue/reuse job.
+	if job.PRURL != "" {
+		prURL = job.PRURL
+		o.log(job.ID, "info", fmt.Sprintf("Reuse: keeping existing PR %s", prURL))
+	}
+	if prURL == "" {
+		head := job.BranchName
+		if opts := o.continueOptions(job); opts.Active() {
+			head = opts.PushRef
+		}
+		if head != "" {
+			existing, findErr := git.FindPRURLByHead(job.WorktreePath, head)
+			if findErr != nil {
+				o.log(job.ID, "warn", fmt.Sprintf("Continue/reuse: could not look up existing PR for head %q: %v", head, findErr))
+			} else if existing != "" {
+				o.log(job.ID, "info", fmt.Sprintf("Continue/reuse: reusing existing PR for head %q: %s", head, existing))
+				prURL = existing
+			}
 		}
 	}
 	if prURL == "" {
@@ -730,13 +814,56 @@ func (o *Orchestrator) completeJob(job *db.Job) {
 
 	o.log(job.ID, "info", "Job completed successfully")
 
-	// Clean up worktree
+	// Preserve worktree when a PR is still open so assign --continue / review
+	// can reattach and iterate in place (UTA-96). Reconciler cleans up after
+	// the PR is merged or closed.
 	if job.WorktreePath != "" {
-		gitMgr := git.NewManager(job.RepoPath, o.cfg.GitHub.DefaultBaseBranch)
-		if err := gitMgr.RemoveWorktree(job.WorktreePath); err != nil {
-			o.log(job.ID, "warn", fmt.Sprintf("Failed to remove worktree: %v", err))
+		if job.PRURL != "" || o.shouldPreserveWorktree(job) {
+			o.log(job.ID, "info", fmt.Sprintf("Preserving worktree at %s for PR iteration", job.WorktreePath))
+		} else {
+			gitMgr := git.NewManager(job.RepoPath, o.cfg.GitHub.DefaultBaseBranch)
+			if err := gitMgr.RemoveWorktree(job.WorktreePath); err != nil {
+				o.log(job.ID, "warn", fmt.Sprintf("Failed to remove worktree: %v", err))
+			}
 		}
 	}
+}
+
+// ensurePushRefInContext adds push_ref / continue_pr markers when missing so
+// reuse jobs share the continue delivery path.
+func ensurePushRefInContext(operatorContext, ref string) string {
+	if ref == "" {
+		return operatorContext
+	}
+	opts := ParseContinuePRContext(operatorContext)
+	var b strings.Builder
+	if !opts.ContinuePR {
+		b.WriteString("continue_pr: true\n")
+	}
+	if opts.PushRef == "" {
+		b.WriteString(fmt.Sprintf("push_ref: %s\n", ref))
+	}
+	if b.Len() == 0 {
+		return operatorContext
+	}
+	prefix := strings.TrimSpace(b.String())
+	if strings.TrimSpace(operatorContext) == "" {
+		return prefix
+	}
+	return prefix + "\n\n" + operatorContext
+}
+
+// shouldPreserveWorktree reports whether the worktree should stay on disk after
+// a terminal state so a successor continue/review can reattach.
+func (o *Orchestrator) shouldPreserveWorktree(job *db.Job) bool {
+	if job == nil {
+		return false
+	}
+	if job.PRURL != "" {
+		return true
+	}
+	opts := o.continueOptions(job)
+	return opts.Active() || opts.ContinuePR
 }
 
 // failJob marks a job as failed
@@ -819,9 +946,7 @@ func (o *Orchestrator) checkpointFailedWork(job *db.Job) (published bool, err er
 	}
 	if !hasCommits {
 		o.log(job.ID, "info", "No incomplete work to checkpoint (branch identical to base)")
-		if err := manager.RemoveWorktree(job.WorktreePath); err != nil {
-			o.log(job.ID, "warn", fmt.Sprintf("Worktree cleanup deferred after empty checkpoint: %v", err))
-		}
+		o.maybeRemoveWorktreeAfterTerminal(job, manager, "empty checkpoint")
 		return false, nil
 	}
 
@@ -829,10 +954,18 @@ func (o *Orchestrator) checkpointFailedWork(job *db.Job) (published bool, err er
 		return false, err
 	}
 	o.log(job.ID, "warn", "Incomplete work checkpoint committed and verified on remote; job remains failed")
-	if err := manager.RemoveWorktree(job.WorktreePath); err != nil {
-		o.log(job.ID, "warn", fmt.Sprintf("Checkpoint published; worktree cleanup deferred: %v", err))
-	}
+	o.maybeRemoveWorktreeAfterTerminal(job, manager, "checkpoint published")
 	return true, nil
+}
+
+func (o *Orchestrator) maybeRemoveWorktreeAfterTerminal(job *db.Job, manager *git.Manager, reason string) {
+	if o.shouldPreserveWorktree(job) {
+		o.log(job.ID, "info", fmt.Sprintf("Preserving worktree at %s after %s (PR/continue reuse)", job.WorktreePath, reason))
+		return
+	}
+	if err := manager.RemoveWorktree(job.WorktreePath); err != nil {
+		o.log(job.ID, "warn", fmt.Sprintf("Worktree cleanup deferred after %s: %v", reason, err))
+	}
 }
 
 // buildCodingPrompt builds the prompt for OpenCode with optional operator context
@@ -865,9 +998,12 @@ func (o *Orchestrator) buildCodingPrompt(issue *linear.Issue, operatorContext st
 		sb.WriteString("## Additional Operator Context\n\n")
 		sb.WriteString(operatorContext)
 		sb.WriteString("\n\n")
-		if opts := ParseContinuePRContext(operatorContext); opts.Active() {
-			sb.WriteString("## Continue existing PR (host delivery)\n\n")
-			sb.WriteString(fmt.Sprintf("This is a continue job. After resetting onto the existing tip, leave commits in the worktree. Host will align onto the assigned branch and dual-push to push_ref %q so the existing PR updates.\n\n", opts.PushRef))
+		if opts := ParseContinuePRContext(operatorContext); opts.Active() || opts.ContinuePR {
+			sb.WriteString("## Continue existing PR (iterate in place)\n\n")
+			sb.WriteString("This worktree is (or will be) checked out on the existing PR head branch. Do NOT create a new branch from main. Leave commits on the current branch so the existing PR updates.\n\n")
+			if opts.PushRef != "" {
+				sb.WriteString(fmt.Sprintf("Target PR head / push_ref: %q. Prefer staying on that branch; host delivery uses the same ref (dual-push is a no-op when assigned == push_ref).\n\n", opts.PushRef))
+			}
 		}
 	}
 

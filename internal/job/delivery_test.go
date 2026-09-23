@@ -176,8 +176,9 @@ func TestFailedReviewPublishesCheckpointAndReportsFailure(t *testing.T) {
 	if got := deliveryGit(t, remote, "show", "refs/heads/"+job.BranchName+":output.txt"); got != "partial" {
 		t.Fatal(got)
 	}
-	if _, err := os.Stat(job.WorktreePath); !os.IsNotExist(err) {
-		t.Fatalf("published failed worktree was not cleaned: %v", err)
+	// UTA-96: jobs with an open PR preserve the worktree so continue/review can reattach.
+	if _, err := os.Stat(job.WorktreePath); err != nil {
+		t.Fatalf("expected worktree preserved for open-PR iteration: %v", err)
 	}
 }
 

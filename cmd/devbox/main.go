@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"github.com/nicoalimin/devbox/internal/buildinfo"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -124,6 +125,7 @@ func statusCmd() *cobra.Command {
 
 func assignCmd() *cobra.Command {
 	var queue bool
+	var continueFlag bool
 	var context string
 	var contextFile string
 	var notes []string
@@ -137,6 +139,10 @@ You can provide additional context to the coding agent using:
   --context "inline context"
   --context-file path/to/file
   --note "first note" --note "second note" (can be used multiple times)
+
+Use --continue to reuse an existing worktree/branch/PR for the issue
+(iterate in place) instead of creating a new numbered branch from main.
+See docs/CONTINUE_PR.md.
 
 All context sources are combined and passed to the OpenCode worker.`,
 		Args: cobra.ExactArgs(1),
@@ -168,6 +174,10 @@ All context sources are combined and passed to the OpenCode worker.`,
 				}
 			}
 
+			if continueFlag {
+				operatorContext = ensureContinueMarker(operatorContext)
+			}
+
 			c := newAPIClient()
 			job, err := c.Assign(args[0], operatorContext)
 			if err != nil {
@@ -188,6 +198,7 @@ All context sources are combined and passed to the OpenCode worker.`,
 		},
 	}
 	cmd.Flags().BoolVar(&queue, "queue", false, "queue if server is busy")
+	cmd.Flags().BoolVar(&continueFlag, "continue", false, "reuse existing worktree/branch/PR for this issue (iterate in place)")
 	cmd.Flags().StringVar(&context, "context", "", "additional context for the coding agent")
 	cmd.Flags().StringVar(&contextFile, "context-file", "", "path to file containing additional context")
 	cmd.Flags().StringArrayVar(&notes, "note", []string{}, "additional note (can be specified multiple times)")
@@ -340,7 +351,9 @@ You can provide feedback using:
   --comments "inline feedback"
   --comments-file path/to/file
 
-The job can be identified by job ID or Linear issue ID.`,
+The job can be identified by job ID or Linear issue ID.
+After a prior job finished (done/failed) with a PR still open, review by Linear
+id reuses that job's branch/worktree (recreating the worktree if needed).`,
 		Args: cobra.ExactArgs(1),
 		Run: func(cmd *cobra.Command, args []string) {
 			feedback := comments
@@ -457,4 +470,17 @@ func printJSON(v interface{}) {
 func exitError(msg string, err error) {
 	fmt.Fprintf(os.Stderr, "Error: %s: %v\n", msg, err)
 	os.Exit(1)
+}
+
+// ensureContinueMarker injects continue_pr: true for assign --continue.
+func ensureContinueMarker(operatorContext string) string {
+	lower := strings.ToLower(operatorContext)
+	if strings.Contains(lower, "continue_pr") {
+		return operatorContext
+	}
+	marker := "continue_pr: true"
+	if strings.TrimSpace(operatorContext) == "" {
+		return marker
+	}
+	return marker + "\n\n" + operatorContext
 }

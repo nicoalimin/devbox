@@ -1,6 +1,10 @@
 package job
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/nicoalimin/devbox/internal/db"
+)
 
 func TestParseContinuePRContext(t *testing.T) {
 	tests := []struct {
@@ -67,5 +71,79 @@ func TestParseContinuePRContext(t *testing.T) {
 				t.Fatalf("Active()=%v want %v", got.Active(), tt.active)
 			}
 		})
+	}
+}
+
+func TestResolveReusePlan_FreshVsReuse(t *testing.T) {
+	prior := &db.Job{
+		ID:           "prior-1",
+		BranchName:   "devbox/uta-94-5",
+		WorktreePath: "/tmp/wt-uta-94-5",
+		PRURL:        "https://github.com/example/repo/pull/35",
+		RepoPath:     "/code/tokoboss",
+	}
+
+	t.Run("fresh assign no prior", func(t *testing.T) {
+		plan := ResolveReusePlan(ContinuePROptions{}, nil)
+		if plan.Reuse {
+			t.Fatal("expected fresh assign")
+		}
+	})
+
+	t.Run("push_ref alone triggers reuse", func(t *testing.T) {
+		plan := ResolveReusePlan(ContinuePROptions{PushRef: "devbox/uta-94-5"}, nil)
+		if !plan.Reuse || plan.Ref != "devbox/uta-94-5" {
+			t.Fatalf("plan=%+v", plan)
+		}
+	})
+
+	t.Run("continue_pr with prior branch reuses prior", func(t *testing.T) {
+		plan := ResolveReusePlan(ContinuePROptions{ContinuePR: true}, prior)
+		if !plan.Reuse || plan.Ref != "devbox/uta-94-5" {
+			t.Fatalf("plan=%+v", plan)
+		}
+		if plan.PreferWorktreePath != prior.WorktreePath || plan.PRURL != prior.PRURL {
+			t.Fatalf("did not inherit prior metadata: %+v", plan)
+		}
+	})
+
+	t.Run("prior open PR auto-reuses without markers", func(t *testing.T) {
+		plan := ResolveReusePlan(ContinuePROptions{}, prior)
+		if !plan.Reuse || plan.Ref != "devbox/uta-94-5" {
+			t.Fatalf("expected auto-reuse from prior PR, got %+v", plan)
+		}
+	})
+
+	t.Run("push_ref wins over prior branch", func(t *testing.T) {
+		plan := ResolveReusePlan(ContinuePROptions{PushRef: "devbox/uta-94-3"}, prior)
+		if !plan.Reuse || plan.Ref != "devbox/uta-94-3" {
+			t.Fatalf("plan=%+v", plan)
+		}
+		// Still inherit worktree/PR hints from prior for reattach / PR URL.
+		if plan.PRURL != prior.PRURL {
+			t.Fatalf("expected prior PRURL inheritance, got %+v", plan)
+		}
+	})
+
+	t.Run("prior without pr or worktree does not auto-reuse", func(t *testing.T) {
+		thin := &db.Job{ID: "thin", BranchName: "devbox/uta-1"}
+		plan := ResolveReusePlan(ContinuePROptions{}, thin)
+		if plan.Reuse {
+			t.Fatalf("unexpected reuse: %+v", plan)
+		}
+	})
+}
+
+func TestEnsureContinueMarker(t *testing.T) {
+	if got := EnsureContinueMarker(""); got != "continue_pr: true" {
+		t.Fatalf("empty: %q", got)
+	}
+	got := EnsureContinueMarker("do the thing")
+	if got != "continue_pr: true\n\ndo the thing" {
+		t.Fatalf("inject: %q", got)
+	}
+	existing := "continue_pr: true\npush_ref: x"
+	if got := EnsureContinueMarker(existing); got != existing {
+		t.Fatalf("idempotent: %q", got)
 	}
 }
