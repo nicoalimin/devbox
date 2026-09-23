@@ -1,29 +1,61 @@
-# Continue existing PR (operator_context)
+# Continue existing PR — reuse worktree/branch (UTA-96)
 
-TokoBoss / CoS continue jobs must update an **existing** PR tip (for example `#34` on `devbox/uta-82-32`) while the host still assigns a **new** worktree branch from main (e.g. `devbox/uta-82-46`).
+When a Linear issue already has an open PR / prior Devbox job, **iterate in place** on the same worktree, branch, and PR. Do **not** mint a new numbered branch from main (`devbox/uta-N-K`) for each continue.
 
-Without continue hints, OpenCode may `git reset --hard origin/<existing-pr-branch>`, then host delivery fails:
+## Operator CLI
 
-> worktree must be on assigned branch "devbox/uta-82-46" (found "devbox/uta-82-32")
+```bash
+# Preferred: reuse path
+devbox assign UTA-N --continue --context-file notes.md
 
-## Required `operator_context` keys
+# Or include continue markers in operator context (server also auto-detects
+# when a prior job for the issue already has a PR / branch):
+devbox assign UTA-N --note "continue_pr: true" --note "push_ref: devbox/uta-n-5"
 
-Include these keys in free-form operator context (case-insensitive; `:` or `=`):
+# After a job finished done/failed with PR still open — same branch/worktree:
+devbox review UTA-N --comments-file feedback.md
+```
+
+`--continue` injects `continue_pr: true`. The server resolves the branch from `push_ref` or the prior job’s `branch_name` / `pr_url` / `worktree_path`.
+
+## Required / useful `operator_context` keys
 
 ```
 continue_pr: true
 push_ref: devbox/uta-82-32
 ```
 
-- **`push_ref`**: existing PR head branch to keep updated. **Required** to activate continue delivery.
-- **`continue_pr: true`**: optional marker; alone does not activate align/dual-push.
+| Key | Role |
+|-----|------|
+| **`push_ref`** | Existing PR head branch to keep updating. When set, reuse checks out this ref (assigned branch == `push_ref`). |
+| **`continue_pr: true`** | Marks continue intent. Alone is enough when a prior job for the issue already recorded `branch_name` / `pr_url`. |
 
-CoS **must** include `push_ref` when asking OpenCode to reset onto an existing PR tip.
+Keys are case-insensitive; `:` or `=` separators; one key per line.
 
-## Host behavior (UTA-88)
+## Host behavior
 
-1. Before `AssertBranch` / format / checkpoint: `git checkout -B <assigned-branch>` (keeps commits; renames local branch).
-2. Push assigned branch as usual, then dual-push `HEAD:refs/heads/<push_ref>` so the existing PR tip advances.
-3. Prefer resolving the open PR for `head=push_ref` instead of opening a second PR from the assigned branch alone. If none exists, fall back to normal `gh pr create`.
+### Reuse path (UTA-96)
 
-Non-continue jobs keep strict assigned-branch checks unchanged.
+When `push_ref` / `continue_pr` is present **or** a prior job for the issue has an open PR / worktree:
+
+1. Prefer **reattach** to the prior job’s `worktree_path` if it still exists on disk (ensure checkout on the reuse ref).
+2. Else reuse any git worktree already registered on that branch.
+3. Else `git worktree add` checked out **on** the existing ref (not `origin/main` + new `devbox/uta-N-K`).
+4. Persist `worktree_path`, `branch_name` (= reuse ref), and `pr_url` on the job.
+5. After `done`/`failed` with PR still open, **preserve** the worktree so `assign --continue` / `review` can reattach. Reconciler removes it when the PR is merged or closed.
+
+Assigned branch equals `push_ref` on the reuse path, so AssertBranch / dual-push complexity collapses (dual-push is a no-op when refs match).
+
+### Legacy align + dual-push (UTA-88)
+
+If a continue job still lands on a *different* assigned branch (older hosts / unusual contexts), the host:
+
+1. `git checkout -B <assigned-branch>` before AssertBranch / format / checkpoint (keeps commits).
+2. Pushes the assigned branch, then dual-pushes `HEAD:refs/heads/<push_ref>` so the existing PR tip advances.
+3. Prefers the open PR for `head=push_ref` instead of opening a second PR.
+
+Fresh assigns (no continue markers and no prior PR/worktree) still create a new numbered branch from main.
+
+## Review after finished job
+
+`devbox review <job_id|LINEAR_ISSUE_ID>` accepts a Linear id after the prior job is `done`/`failed`, as long as `pr_url` / `branch_name` remain. Missing worktrees are recreated from the branch (or reattached when preserved).

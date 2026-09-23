@@ -318,6 +318,56 @@ func (db *DB) GetJobByLinearIssueID(linearIssueID string) (*Job, error) {
 	return &job, err
 }
 
+// GetPriorReusableJob returns the most recent prior job for a Linear issue that
+// still has a branch (and preferably a PR or worktree) so a continue/reuse assign
+// can reattach instead of creating a new numbered branch from main.
+// excludeJobID skips the newly created successor job.
+func (db *DB) GetPriorReusableJob(linearIssueID, excludeJobID string) (*Job, error) {
+	rows, err := db.conn.Query(`
+		SELECT id, linear_issue_id, linear_url, state, repo_path, branch_name,
+			worktree_path, pr_url, blocker_reason, opencode_session_id,
+			operator_context, review_feedback,
+			coding_wait_started_at, reviewing_wait_started_at,
+			created_at, updated_at, completed_at
+		FROM jobs
+		WHERE linear_issue_id = ?
+			AND id != ?
+			AND branch_name != ''
+			AND (pr_url != '' OR worktree_path != '')
+		ORDER BY created_at DESC
+		LIMIT 5
+	`, linearIssueID, excludeJobID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var best *Job
+	for rows.Next() {
+		var job Job
+		if err := rows.Scan(
+			&job.ID, &job.LinearIssueID, &job.LinearURL, &job.State, &job.RepoPath,
+			&job.BranchName, &job.WorktreePath, &job.PRURL, &job.BlockerReason,
+			&job.OpenCodeSessionID, &job.OperatorContext, &job.ReviewFeedback,
+			&job.CodingWaitStartedAt, &job.ReviewingWaitStartedAt,
+			&job.CreatedAt, &job.UpdatedAt, &job.CompletedAt,
+		); err != nil {
+			return nil, err
+		}
+		// Prefer a job that already has a PR URL.
+		if job.PRURL != "" {
+			return &job, nil
+		}
+		if best == nil {
+			best = &job
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return best, nil
+}
+
 // GetBlockedJobs returns jobs in blocked state
 func (db *DB) GetBlockedJobs() ([]*Job, error) {
 	rows, err := db.conn.Query(`

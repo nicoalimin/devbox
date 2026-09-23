@@ -863,3 +863,98 @@ func runGit(t *testing.T, dir string, args ...string) string {
 	}
 	return strings.TrimSpace(string(out))
 }
+
+func TestCreateWorktreeOnRef_ReusesExistingBranchNotMain(t *testing.T) {
+	repo := setupTestRepo(t)
+	defer os.RemoveAll(repo)
+	mgr := NewManager(repo, "main")
+
+	bootstrap, err := mgr.CreateWorktree("UTA-96")
+	if err != nil {
+		t.Fatal(err)
+	}
+	prBranch := bootstrap.BranchName
+	if err := os.WriteFile(filepath.Join(bootstrap.Path, "feature.txt"), []byte("on-pr"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, bootstrap.Path, "add", "feature.txt")
+	runGit(t, bootstrap.Path, "commit", "-m", "pr tip")
+	runGit(t, bootstrap.Path, "push", "-u", "origin", prBranch)
+	prTip := strings.TrimSpace(runGit(t, bootstrap.Path, "rev-parse", "HEAD"))
+	mainTip := strings.TrimSpace(runGit(t, repo, "rev-parse", "origin/main"))
+	if prTip == mainTip {
+		t.Fatal("setup failed: PR tip identical to main")
+	}
+
+	// Remove bootstrap worktree but keep the branch — simulate post-done cleanup
+	// of an older host, then reuse via CreateWorktreeOnRef.
+	if err := mgr.RemoveWorktree(bootstrap.Path); err != nil {
+		t.Fatal(err)
+	}
+
+	reused, err := mgr.CreateWorktreeOnRef("UTA-96", prBranch)
+	if err != nil {
+		t.Fatalf("CreateWorktreeOnRef: %v", err)
+	}
+	defer mgr.RemoveWorktree(reused.Path)
+
+	if reused.BranchName != prBranch {
+		t.Fatalf("branch=%q want %q", reused.BranchName, prBranch)
+	}
+	if err := mgr.AssertBranch(reused.Path, prBranch); err != nil {
+		t.Fatal(err)
+	}
+	got := strings.TrimSpace(runGit(t, reused.Path, "rev-parse", "HEAD"))
+	if got != prTip {
+		t.Fatalf("HEAD=%s want PR tip %s (not main %s)", got, prTip, mainTip)
+	}
+	if _, err := os.Stat(filepath.Join(reused.Path, "feature.txt")); err != nil {
+		t.Fatalf("missing feature from PR tip: %v", err)
+	}
+}
+
+func TestFindWorktreeForBranch_AndReattach(t *testing.T) {
+	repo := setupTestRepo(t)
+	defer os.RemoveAll(repo)
+	mgr := NewManager(repo, "main")
+
+	wt, err := mgr.CreateWorktree("UTA-96-FIND")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mgr.RemoveWorktree(wt.Path)
+
+	found, err := mgr.FindWorktreeForBranch(wt.BranchName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if found != wt.Path {
+		t.Fatalf("found=%q want %q", found, wt.Path)
+	}
+
+	// CreateWorktreeOnRef should reattach rather than create a second worktree.
+	again, err := mgr.CreateWorktreeOnRef("UTA-96-FIND", wt.BranchName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again.Path != wt.Path {
+		t.Fatalf("expected reattach to %s, got %s", wt.Path, again.Path)
+	}
+
+	missing, err := mgr.FindWorktreeForBranch("devbox/does-not-exist")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if missing != "" {
+		t.Fatalf("expected empty, got %q", missing)
+	}
+}
+
+func TestCreateWorktreeOnRef_RefusesBaseBranch(t *testing.T) {
+	repo := setupTestRepo(t)
+	defer os.RemoveAll(repo)
+	mgr := NewManager(repo, "main")
+	if _, err := mgr.CreateWorktreeOnRef("UTA-96", "main"); err == nil {
+		t.Fatal("expected refuse base branch")
+	}
+}
