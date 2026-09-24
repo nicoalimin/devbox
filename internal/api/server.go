@@ -28,6 +28,7 @@ type Server struct {
 	orchestrator *job.Orchestrator
 	upgrader     *upgrade.Manager
 	instanceID   string
+	startedAt    time.Time
 	httpServer   *http.Server
 }
 
@@ -38,11 +39,13 @@ func NewServer(cfg *config.Config, database *db.DB, orch *job.Orchestrator) *Ser
 		db:           database,
 		orchestrator: orch,
 		instanceID:   uuid.NewString(),
+		startedAt:    time.Now().UTC(),
 		httpServer:   &http.Server{ReadHeaderTimeout: 10 * time.Second},
 	}
 }
 
 func (s *Server) InstanceID() string                   { return s.instanceID }
+func (s *Server) StartedAt() time.Time                 { return s.startedAt }
 func (s *Server) SetUpgrader(manager *upgrade.Manager) { s.upgrader = manager }
 func (s *Server) Shutdown(ctx context.Context) error   { return s.httpServer.Shutdown(ctx) }
 
@@ -165,6 +168,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		"version":    Version,
 		"revision":   buildinfo.Revision,
 		"instanceId": s.instanceID,
+		"startedAt":  s.startedAt,
 	})
 }
 
@@ -181,6 +185,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		"busy":       currentJob != nil,
 		"revision":   buildinfo.Revision,
 		"instanceId": s.instanceID,
+		"startedAt":  s.startedAt,
 		"draining":   s.orchestrator.IsDraining(),
 	}
 

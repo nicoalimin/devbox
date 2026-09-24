@@ -66,21 +66,23 @@ func NewClient(baseURL, token string) *Client {
 
 // HealthResponse represents the health check response
 type HealthResponse struct {
-	Healthy    bool   `json:"healthy"`
-	Version    string `json:"version"`
-	Revision   string `json:"revision"`
-	InstanceID string `json:"instanceId"`
+	Healthy    bool      `json:"healthy"`
+	Version    string    `json:"version"`
+	Revision   string    `json:"revision"`
+	InstanceID string    `json:"instanceId"`
+	StartedAt  time.Time `json:"startedAt"`
 }
 
 // StatusResponse represents the status response
 type StatusResponse struct {
-	Version         string `json:"version"`
-	Busy            bool   `json:"busy"`
-	CurrentJobID    string `json:"currentJobId,omitempty"`
-	CurrentJobState string `json:"currentJobState,omitempty"`
-	Revision        string `json:"revision"`
-	InstanceID      string `json:"instanceId"`
-	Draining        bool   `json:"draining"`
+	Version         string    `json:"version"`
+	Busy            bool      `json:"busy"`
+	CurrentJobID    string    `json:"currentJobId,omitempty"`
+	CurrentJobState string    `json:"currentJobState,omitempty"`
+	Revision        string    `json:"revision"`
+	InstanceID      string    `json:"instanceId"`
+	Draining        bool      `json:"draining"`
+	StartedAt       time.Time `json:"startedAt"`
 }
 
 // Job represents a job

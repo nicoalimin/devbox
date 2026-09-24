@@ -11,16 +11,11 @@ GOFLAGS=-ldflags="-s -w"
 all: build
 
 # Build both binaries
-build: clean $(SERVER_BINARY) $(CLIENT_BINARY)
-
-$(SERVER_BINARY):
+build:
 	@echo "Building devboxd..."
 	@mkdir -p $(BINARY_DIR)
 	go build $(GOFLAGS) -o $(SERVER_BINARY) ./cmd/devboxd
-
-$(CLIENT_BINARY):
 	@echo "Building devbox..."
-	@mkdir -p $(BINARY_DIR)
 	go build $(GOFLAGS) -o $(CLIENT_BINARY) ./cmd/devbox
 
 # Install binaries to /usr/local/bin
@@ -37,7 +32,6 @@ test:
 # Clean build artifacts
 clean:
 	rm -rf $(BINARY_DIR)
-	rm -f devboxd.db devboxd.db-shm devboxd.db-wal
 	find . -name "*.test" -delete
 
 # Run the server (for development)

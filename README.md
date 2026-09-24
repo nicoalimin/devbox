@@ -979,8 +979,10 @@ startup recovers persisted upgrade state. An upgrade cannot make an unavailable
 Git remote, full disk, or broken toolchain succeed: failures remain visible and
 never count as completion. Keep ordinary database backups as well.
 
-`/health`, `/v1/status`, and response headers expose the server revision and
-instance ID. Polling CLI commands announce an instance change. `devbox upgrade`
+`/health` and `/v1/status` expose the server revision, instance ID, and start
+time. The TUI's Integrations panel shows the short deployed revision and live
+uptime, and `devbox status` reports the same deployment details remotely.
+Polling CLI commands announce an instance change. `devbox upgrade`
 verifies both the target SHA and a new healthy instance and prints the client
 restart action. The sibling client on the server host is updated automatically;
 restart long-running clients. Clients on other machines should build/install

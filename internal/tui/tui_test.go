@@ -149,6 +149,35 @@ func TestCalculateRenderedHeight(t *testing.T) {
 	}
 }
 
+func TestDeploymentDisplayHelpers(t *testing.T) {
+	for _, tt := range []struct {
+		revision string
+		want     string
+	}{
+		{"4b96c7732d9482a", "4b96c77"},
+		{"4b96c7732d9482a-dirty", "4b96c77*"},
+		{"dev", "dev"},
+	} {
+		if got := shortRevision(tt.revision); got != tt.want {
+			t.Errorf("shortRevision(%q) = %q, want %q", tt.revision, got, tt.want)
+		}
+	}
+
+	for _, tt := range []struct {
+		duration time.Duration
+		want     string
+	}{
+		{42 * time.Second, "42s"},
+		{17 * time.Minute, "17m"},
+		{2*time.Hour + 15*time.Minute, "2h15m"},
+		{49*time.Hour + 30*time.Minute, "2d1h"},
+	} {
+		if got := formatUptime(tt.duration); got != tt.want {
+			t.Errorf("formatUptime(%s) = %q, want %q", tt.duration, got, tt.want)
+		}
+	}
+}
+
 func TestGetHeaderHeight(t *testing.T) {
 	tests := []struct {
 		name           string

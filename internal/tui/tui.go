@@ -10,6 +10,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/nicoalimin/devbox/internal/api"
+	"github.com/nicoalimin/devbox/internal/buildinfo"
 	"github.com/nicoalimin/devbox/internal/config"
 	"github.com/nicoalimin/devbox/internal/db"
 )
@@ -36,6 +37,7 @@ type Model struct {
 	jobsViewport       viewport.Model
 	errorsViewport     viewport.Model
 	lastUpdate         time.Time
+	startedAt          time.Time
 	currentJob         *db.Job
 	recentJobs         []*db.Job
 	blockedJobs        []*db.Job
@@ -50,11 +52,19 @@ type tickMsg time.Time
 
 // NewModel creates a new TUI model
 func NewModel(cfg *config.Config, database *db.DB) Model {
+	return NewModelWithStartedAt(cfg, database, time.Now())
+}
+
+// NewModelWithStartedAt creates a TUI model tied to the current daemon
+// instance, so the displayed uptime resets when the daemon restarts.
+func NewModelWithStartedAt(cfg *config.Config, database *db.DB, startedAt time.Time) Model {
+	now := time.Now()
 	return Model{
 		cfg:            cfg,
 		database:       database,
 		focusedPane:    ServerLogsPane,
-		lastUpdate:     time.Now(),
+		lastUpdate:     now,
+		startedAt:      startedAt,
 		selectedJobIdx: 0,
 	}
 }
@@ -558,19 +568,24 @@ func (m Model) renderIntegrationsBar() string {
 	title := lipgloss.NewStyle().
 		Bold(true).
 		Foreground(lipgloss.Color("86")).
-		Render("INTEGRATIONS")
+		Render(fmt.Sprintf("INTEGRATIONS (%d repos)", len(m.cfg.Repos)))
 
 	health := successStyle.Render("✓ Linear") + " " +
 		successStyle.Render("✓ GitHub") + " " +
 		successStyle.Render("✓ OpenCode")
 
-	repos := dimStyle.Render(fmt.Sprintf("%d repos configured", len(m.cfg.Repos)))
+	uptime := m.lastUpdate.Sub(m.startedAt)
+	if uptime < 0 {
+		uptime = 0
+	}
+	deployment := dimStyle.Render(fmt.Sprintf("%s@%s · up %s",
+		api.Version, shortRevision(buildinfo.Revision), formatUptime(uptime)))
 
 	content := lipgloss.JoinVertical(
 		lipgloss.Left,
 		title,
 		health,
-		repos,
+		deployment,
 	)
 
 	return barStyle.Render(content)
@@ -834,6 +849,31 @@ func formatDuration(d time.Duration) string {
 	return fmt.Sprintf("%dh%dm", int(d.Hours()), int(d.Minutes())%60)
 }
 
+func formatUptime(d time.Duration) string {
+	if d < time.Minute {
+		return fmt.Sprintf("%ds", int(d.Seconds()))
+	}
+	if d < time.Hour {
+		return fmt.Sprintf("%dm", int(d.Minutes()))
+	}
+	if d < 24*time.Hour {
+		return fmt.Sprintf("%dh%dm", int(d.Hours()), int(d.Minutes())%60)
+	}
+	return fmt.Sprintf("%dd%dh", int(d.Hours())/24, int(d.Hours())%24)
+}
+
+func shortRevision(revision string) string {
+	dirty := strings.HasSuffix(revision, "-dirty")
+	revision = strings.TrimSuffix(revision, "-dirty")
+	if len(revision) > 7 {
+		revision = revision[:7]
+	}
+	if dirty {
+		revision += "*"
+	}
+	return revision
+}
+
 // calculateRenderedHeight calculates how many lines a text string will occupy
 // when rendered with lipgloss at a given width, accounting for padding.
 // This is critical for proper TUI height calculations when text wraps.
@@ -913,7 +953,12 @@ func Run(cfg *config.Config, database *db.DB) error {
 
 // RunContext restores the terminal before a graceful daemon restart.
 func RunContext(ctx context.Context, cfg *config.Config, database *db.DB) error {
-	m := NewModel(cfg, database)
+	return RunContextWithStartedAt(ctx, cfg, database, time.Now())
+}
+
+// RunContextWithStartedAt runs the TUI with the daemon instance start time.
+func RunContextWithStartedAt(ctx context.Context, cfg *config.Config, database *db.DB, startedAt time.Time) error {
+	m := NewModelWithStartedAt(cfg, database, startedAt)
 	p := tea.NewProgram(m, tea.WithAltScreen())
 	done := make(chan struct{})
 	defer close(done)

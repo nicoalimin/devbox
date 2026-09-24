@@ -139,7 +139,7 @@ func serve(cfg *config.Config, configPath, dbPath string, useTUI bool) error {
 	var uiDone chan error
 	if useTUI {
 		uiDone = make(chan error, 1)
-		go func() { uiDone <- tui.RunContext(uiCtx, cfg, database) }()
+		go func() { uiDone <- tui.RunContextWithStartedAt(uiCtx, cfg, database, server.StartedAt()) }()
 	}
 	restarting := false
 	var serveErr error

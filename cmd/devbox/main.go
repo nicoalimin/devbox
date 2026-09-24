@@ -4,11 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"github.com/nicoalimin/devbox/internal/buildinfo"
 	"os"
 	"strings"
 	"time"
 
+	"github.com/nicoalimin/devbox/internal/buildinfo"
 	"github.com/spf13/cobra"
 )
 
@@ -109,6 +109,9 @@ func statusCmd() *cobra.Command {
 			} else {
 				fmt.Printf("Version: %s\n", resp.Version)
 				fmt.Printf("Revision: %s (instance %s)\n", resp.Revision, resp.InstanceID)
+				if !resp.StartedAt.IsZero() {
+					fmt.Printf("Uptime: %s (since %s)\n", formatStatusUptime(time.Since(resp.StartedAt)), resp.StartedAt.Local().Format(time.RFC3339))
+				}
 				if resp.Draining {
 					fmt.Println("Server is draining jobs for upgrade")
 				}
@@ -121,6 +124,22 @@ func statusCmd() *cobra.Command {
 			}
 		},
 	}
+}
+
+func formatStatusUptime(d time.Duration) string {
+	if d < 0 {
+		d = 0
+	}
+	if d < time.Minute {
+		return fmt.Sprintf("%ds", int(d.Seconds()))
+	}
+	if d < time.Hour {
+		return fmt.Sprintf("%dm", int(d.Minutes()))
+	}
+	if d < 24*time.Hour {
+		return fmt.Sprintf("%dh%dm", int(d.Hours()), int(d.Minutes())%60)
+	}
+	return fmt.Sprintf("%dd%dh", int(d.Hours())/24, int(d.Hours())%24)
 }
 
 func assignCmd() *cobra.Command {

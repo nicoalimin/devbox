@@ -46,4 +46,7 @@ func TestUpgradeRequiresAuthAndOptIn(t *testing.T) {
 	if health["revision"] != buildinfo.Revision || health["instanceId"] != server.InstanceID() || w.Header().Get("X-Devbox-Instance") != server.InstanceID() {
 		t.Fatalf("missing restart signal: %v", health)
 	}
+	if health["startedAt"] == nil {
+		t.Fatalf("missing daemon start time: %v", health)
+	}
 }
