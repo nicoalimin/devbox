@@ -1,5 +1,6 @@
-// Package upgrade builds trusted remote revisions and drains the daemon before
-// atomically installing both binaries. State survives the process replacement.
+// Package upgrade builds trusted remote revisions and atomically installs both
+// binaries before immediately replacing the daemon process. State survives the
+// process replacement and in-flight jobs resume from SQLite after startup.
 package upgrade
 
 import (
@@ -17,12 +18,6 @@ import (
 	"github.com/google/uuid"
 	"github.com/nicoalimin/devbox/internal/config"
 )
-
-type Gate interface {
-	BeginDrain()
-	EndDrain()
-	IsDrained() (bool, error)
-}
 
 type State struct {
 	ID                 string    `json:"id"`
@@ -55,7 +50,6 @@ type record struct {
 type Options struct {
 	Config                                                 config.UpgradeConfig
 	StateDir, BinaryPath, ConfigPath, Revision, InstanceID string
-	Gate                                                   Gate
 	// Restart requests a graceful process replacement by the main goroutine.
 	Restart      func() error
 	DatabasePath string
@@ -85,8 +79,8 @@ func New(options Options) *Manager {
 func (m *Manager) Enabled() bool { return m.options.Config.Enabled }
 
 // SetRuntime is called during startup, before serving the upgrade endpoint.
-func (m *Manager) SetRuntime(gate Gate, snapshot func(string) error, instanceID string) {
-	m.options.Gate, m.options.Snapshot = gate, snapshot
+func (m *Manager) SetRuntime(snapshot func(string) error, instanceID string) {
+	m.options.Snapshot = snapshot
 	m.options.InstanceID = instanceID
 }
 
@@ -150,7 +144,7 @@ func (m *Manager) Start() (State, error) {
 	if previous.Phase == "restarting" || previous.Phase == "installing" {
 		return State{}, fmt.Errorf("previous upgrade is awaiting restart verification")
 	}
-	if m.options.Gate == nil || m.options.Restart == nil {
+	if m.options.Restart == nil {
 		return State{}, fmt.Errorf("upgrade restart support is unavailable")
 	}
 	s := State{ID: uuid.NewString(), Phase: "building", FromRevision: m.options.Revision, PreviousInstanceID: m.options.InstanceID, ProcessID: os.Getpid()}
@@ -178,9 +172,6 @@ func (m *Manager) run(s State) {
 	defer close(m.done)
 	restarting := false
 	defer func() {
-		if !restarting {
-			m.options.Gate.EndDrain()
-		}
 		m.mu.Lock()
 		m.running = restarting
 		m.mu.Unlock()
@@ -204,18 +195,6 @@ func (m *Manager) run(s State) {
 		if err := m.setPhase(&s, "up_to_date"); err != nil {
 			fail(err)
 		}
-		return
-	}
-	m.options.Gate.BeginDrain()
-	if err := m.setPhase(&s, "draining"); err != nil {
-		fail(err)
-		return
-	}
-	ctx, cancel = context.WithTimeout(m.ctx, m.options.Config.DrainTimeout)
-	err = waitForDrain(ctx, m.options.Gate)
-	cancel()
-	if err != nil {
-		fail(err)
 		return
 	}
 	// Save rollback copies before installing either executable. The plan is
@@ -261,23 +240,6 @@ func (m *Manager) run(s State) {
 	restarting = true
 }
 
-func waitForDrain(ctx context.Context, gate Gate) error {
-	for {
-		drained, err := gate.IsDrained()
-		if err != nil {
-			return fmt.Errorf("cannot verify job drain: %w", err)
-		}
-		if drained {
-			return nil
-		}
-		select {
-		case <-ctx.Done():
-			return fmt.Errorf("upgrade drain timed out; existing jobs continue: %w", ctx.Err())
-		case <-time.After(250 * time.Millisecond):
-		}
-	}
-}
-
 // RecoverStartup runs before accepting work. Interrupted installs roll back;
 // a replacement process is only confirmed after its HTTP health check passes.
 func (m *Manager) RecoverStartup() error {
@@ -287,7 +249,7 @@ func (m *Manager) RecoverStartup() error {
 	if err != nil {
 		return err
 	}
-	if s.ProcessID > 0 && s.ProcessID != os.Getpid() && (s.Phase == "building" || s.Phase == "draining" || s.Phase == "installing" || s.Phase == "restarting") {
+	if s.ProcessID > 0 && s.ProcessID != os.Getpid() && (s.Phase == "building" || s.Phase == "installing" || s.Phase == "restarting") {
 		if err := syscall.Kill(s.ProcessID, 0); err == nil || err == syscall.EPERM {
 			return fmt.Errorf("upgrade is owned by running process %d", s.ProcessID)
 		}
@@ -305,9 +267,6 @@ func (m *Manager) RecoverStartup() error {
 		return ErrRollbackRestart
 	case "restarting":
 		if s.TargetRevision == m.options.Revision && s.PreviousInstanceID != m.options.InstanceID {
-			if m.options.Gate != nil {
-				m.options.Gate.BeginDrain()
-			}
 			return nil
 		}
 		s.Error = m.restoreDatabase(&s, m.rollback(&s, fmt.Errorf("replacement started with unexpected revision %s", m.options.Revision))).Error()
@@ -319,7 +278,7 @@ func (m *Manager) RecoverStartup() error {
 			return fmt.Errorf("%w: %s", ErrRollbackFailed, s.Error)
 		}
 		return ErrRollbackRestart
-	case "building", "draining":
+	case "building":
 		s.Phase, s.Error = "failed", "upgrade interrupted by server shutdown; retry the upgrade"
 		return m.save(&s)
 	}
@@ -344,7 +303,6 @@ func (m *Manager) ConfirmHealthy() error {
 	if err := m.save(&s); err != nil {
 		return err
 	}
-	m.options.Gate.EndDrain()
 	return nil
 }
 
@@ -369,41 +327,25 @@ func (m *Manager) RestartFailed(cause error) error {
 
 func (m *Manager) prepareBuild(ctx context.Context, s *State) error {
 	cfg := m.options.Config
-	remote, err := run(ctx, cfg.SourcePath, "git", "remote", "get-url", cfg.Remote)
-	if err != nil {
-		return fmt.Errorf("read upgrade remote: %w", err)
-	}
-	remoteURL := strings.TrimSpace(string(remote))
-	// Resolve local remotes relative to the source checkout, not the build dir.
-	if !strings.Contains(remoteURL, ":") && !filepath.IsAbs(remoteURL) {
-		remoteURL = filepath.Join(cfg.SourcePath, remoteURL)
-	}
-	releaseDir := filepath.Join(m.options.StateDir, s.ID)
-	checkout := filepath.Join(releaseDir, "source")
-	if err := os.MkdirAll(checkout, 0700); err != nil {
-		return err
-	}
-	defer os.RemoveAll(checkout) // Owned temporary checkout; binaries/backups remain.
-	for _, args := range [][]string{{"init"}, {"remote", "add", "origin", remoteURL}, {"fetch", "--depth=1", "origin", "refs/heads/" + cfg.Branch}, {"checkout", "--detach", "FETCH_HEAD"}} {
-		if _, err := run(ctx, checkout, "git", args...); err != nil {
-			return fmt.Errorf("fetch trusted upgrade revision: %w", err)
-		}
-	}
-	revision, err := run(ctx, checkout, "git", "rev-parse", "HEAD")
+	revision, err := pullSource(ctx, cfg)
 	if err != nil {
 		return err
 	}
-	s.TargetRevision = strings.TrimSpace(string(revision))
+	s.TargetRevision = revision
 	if err := m.setPhase(s, "building"); err != nil {
 		return err
 	}
 	if s.TargetRevision == m.options.Revision {
 		return nil
 	}
+	releaseDir := filepath.Join(m.options.StateDir, s.ID)
+	if err := os.MkdirAll(releaseDir, 0700); err != nil {
+		return err
+	}
 	for _, name := range []string{"devboxd", "devbox"} {
 		built := filepath.Join(releaseDir, name)
 		flags := "-X github.com/nicoalimin/devbox/internal/buildinfo.Revision=" + s.TargetRevision
-		if _, err := run(ctx, checkout, "go", "build", "-buildvcs=false", "-ldflags", flags, "-o", built, "./cmd/"+name); err != nil {
+		if _, err := run(ctx, cfg.SourcePath, "go", "build", "-buildvcs=false", "-ldflags", flags, "-o", built, "./cmd/"+name); err != nil {
 			return fmt.Errorf("build %s: %w", name, err)
 		}
 		s.Files = append(s.Files, File{Target: filepath.Join(filepath.Dir(m.options.BinaryPath), name), Built: built})
@@ -414,4 +356,29 @@ func (m *Manager) prepareBuild(ctx context.Context, s *State) error {
 		return fmt.Errorf("candidate config preflight: %w", err)
 	}
 	return nil
+}
+
+func pullSource(ctx context.Context, cfg config.UpgradeConfig) (string, error) {
+	branch, err := run(ctx, cfg.SourcePath, "git", "branch", "--show-current")
+	if err != nil {
+		return "", fmt.Errorf("read upgrade branch: %w", err)
+	}
+	if current := strings.TrimSpace(string(branch)); current != cfg.Branch {
+		return "", fmt.Errorf("upgrade source is on branch %q; check out %q first", current, cfg.Branch)
+	}
+	dirty, err := run(ctx, cfg.SourcePath, "git", "status", "--porcelain")
+	if err != nil {
+		return "", fmt.Errorf("check upgrade source: %w", err)
+	}
+	if strings.TrimSpace(string(dirty)) != "" {
+		return "", fmt.Errorf("upgrade source has uncommitted changes; commit or stash them before upgrading")
+	}
+	if _, err := run(ctx, cfg.SourcePath, "git", "pull", "--ff-only", cfg.Remote, cfg.Branch); err != nil {
+		return "", fmt.Errorf("pull trusted upgrade revision: %w", err)
+	}
+	revision, err := run(ctx, cfg.SourcePath, "git", "rev-parse", "HEAD")
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(revision)), nil
 }

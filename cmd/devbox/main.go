@@ -112,9 +112,6 @@ func statusCmd() *cobra.Command {
 				if !resp.StartedAt.IsZero() {
 					fmt.Printf("Uptime: %s (since %s)\n", formatStatusUptime(time.Since(resp.StartedAt)), resp.StartedAt.Local().Format(time.RFC3339))
 				}
-				if resp.Draining {
-					fmt.Println("Server is draining jobs for upgrade")
-				}
 				if resp.Busy {
 					fmt.Printf("Status: BUSY\n")
 					fmt.Printf("Current Job: %s (state: %s)\n", resp.CurrentJobID, resp.CurrentJobState)

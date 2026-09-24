@@ -186,7 +186,6 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		"revision":   buildinfo.Revision,
 		"instanceId": s.instanceID,
 		"startedAt":  s.startedAt,
-		"draining":   s.orchestrator.IsDraining(),
 	}
 
 	if currentJob != nil {

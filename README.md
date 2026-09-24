@@ -924,23 +924,21 @@ upgrade:
   remote: origin
   branch: main
   build_timeout: 20m
-  drain_timeout: 1h
 ```
 
 The service account needs Git access to that trusted remote, Go (and the C
 toolchain required by SQLite), and write access to the installed binary
-directory and database directory. The configured checkout may contain other
-branches or dirty files: upgrades fetch into an isolated temporary checkout and
-never pull/reset the host checkout. Both `devboxd` and the sibling `devbox`
-executable are installed atomically. Run from a compiled, installed binary,
-not `go run`. No sudo or privilege escalation is performed by the upgrader.
+directory and database directory. The configured checkout must be on the
+configured branch with a clean worktree. Upgrades run `git pull --ff-only`,
+build both `devboxd` and `devbox`, install them atomically, and immediately
+restart the daemon. Run from a compiled, installed binary, not `go run`. No
+sudo or privilege escalation is performed by the upgrader.
 
 The first deployment of this feature needs the normal bootstrap once:
 
 ```sh
-go build -o bin/devboxd ./cmd/devboxd
-go build -o bin/devbox ./cmd/devbox
-# Stop the old daemon only when its jobs have finished, then start:
+make build
+# In-flight jobs are resumed from SQLite after startup:
 ./bin/devboxd --config devboxd.yaml
 ```
 
@@ -951,23 +949,23 @@ devbox upgrade                       # Wait through restart and verify health
 devbox upgrade --wait=false          # Accept asynchronously
 devbox upgrade --status              # Inspect durable progress/failure
 devbox version                      # Client revision
-devbox status                       # Server revision, instance, and drain state
+devbox status                       # Server revision, instance, and uptime
 ```
 
 `POST /v1/upgrade` returns HTTP 202 and an upgrade ID; `GET /v1/upgrade` returns
 its persisted state. Both require the usual bearer token. Targets come only
 from the host configuration, not request input. Progress is `building` →
-`draining` → `installing` → `restarting` → `complete` (or `up_to_date`/`failed`).
-Duplicate upgrades are rejected. While draining, new assignments, reviews,
-and replies are rejected; existing workers finish normally. If the drain
-deadline expires, installation is abandoned and admission resumes.
+`installing` → `restarting` → `complete` (or `up_to_date`/`failed`). Duplicate
+upgrades are rejected. The daemon restarts as soon as the build is ready; it
+does not wait for active jobs. In-flight jobs and their OpenCode session IDs
+are loaded from SQLite and resumed on startup.
 
 Before replacing binaries, Devbox saves rollback copies and a consistent
 SQLite snapshot, including committed WAL data. It closes HTTP, restores the
 TUI terminal, closes SQLite, and uses `exec` to preserve the daemon PID, working
 directory, arguments, environment, and foreground terminal. The new process
 runs normal database migrations and must pass a local HTTP health check before
-the upgrade is marked complete and job admission resumes. Installation/exec
+the upgrade is marked complete. Installation/exec
 failures restore the binaries. Startup failures restore the binaries and
 database snapshot; failed database/sidecar files are retained for diagnosis.
 

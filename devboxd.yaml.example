@@ -9,7 +9,6 @@ upgrade:
   remote: "origin"
   branch: "main"
   build_timeout: "20m"
-  drain_timeout: "1h"
 
 database:
   # path: ""  # Path to SQLite database file

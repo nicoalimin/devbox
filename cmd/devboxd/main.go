@@ -31,6 +31,9 @@ func main() {
 	version := flag.Bool("version", false, "print version and build revision")
 	checkConfig := flag.Bool("check-config", false, "validate configuration without starting the server")
 	flag.Parse()
+	if flag.NArg() != 0 {
+		log.Fatalf("unexpected argument %q; use the devbox client for commands (for example: devbox upgrade)", flag.Arg(0))
+	}
 	if *version {
 		fmt.Printf("devboxd %s (%s)\n", buildinfo.Version, buildinfo.Revision)
 		return
@@ -105,11 +108,9 @@ func serve(cfg *config.Config, configPath, dbPath string, useTUI bool) error {
 	defer database.Close()
 	orchestrator := job.NewOrchestrator(cfg, database)
 	server := api.NewServer(cfg, database, orchestrator)
-	upgrader.SetRuntime(orchestrator, database.Backup, server.InstanceID())
-	if state, err := upgrader.Status(); err != nil {
+	upgrader.SetRuntime(database.Backup, server.InstanceID())
+	if _, err := upgrader.Status(); err != nil {
 		return err
-	} else if state.Phase == "restarting" {
-		orchestrator.BeginDrain()
 	}
 	server.SetUpgrader(upgrader)
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

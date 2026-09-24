@@ -15,7 +15,7 @@ func upgradeCmd() *cobra.Command {
 	var statusOnly, wait bool
 	var timeout time.Duration
 	cmd := &cobra.Command{
-		Use: "upgrade", Short: "Build the server's configured main branch, drain jobs, and restart",
+		Use: "upgrade", Short: "Build the server's configured main branch and restart immediately",
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			c := newAPIClient()

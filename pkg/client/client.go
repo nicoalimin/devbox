@@ -81,7 +81,6 @@ type StatusResponse struct {
 	CurrentJobState string    `json:"currentJobState,omitempty"`
 	Revision        string    `json:"revision"`
 	InstanceID      string    `json:"instanceId"`
-	Draining        bool      `json:"draining"`
 	StartedAt       time.Time `json:"startedAt"`
 }
 

@@ -29,7 +29,6 @@ type UpgradeConfig struct {
 	Remote       string        `yaml:"remote"`
 	Branch       string        `yaml:"branch"`
 	BuildTimeout time.Duration `yaml:"build_timeout"`
-	DrainTimeout time.Duration `yaml:"drain_timeout"`
 }
 
 // ServerConfig defines HTTP server settings
@@ -134,7 +133,6 @@ func LoadConfig(path string) (*Config, error) {
 	cfg.Upgrade.Remote = "origin"
 	cfg.Upgrade.Branch = "main"
 	cfg.Upgrade.BuildTimeout = 20 * time.Minute
-	cfg.Upgrade.DrainTimeout = time.Hour
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
 		return nil, fmt.Errorf("failed to parse config file: %w", err)
 	}
@@ -195,8 +193,8 @@ func LoadConfig(path string) (*Config, error) {
 		if cfg.Upgrade.SourcePath == "" || cfg.Upgrade.Remote == "" || cfg.Upgrade.Branch == "" {
 			return nil, fmt.Errorf("upgrade requires source_path, remote, and branch")
 		}
-		if cfg.Upgrade.BuildTimeout <= 0 || cfg.Upgrade.DrainTimeout <= 0 {
-			return nil, fmt.Errorf("upgrade build_timeout and drain_timeout must be positive")
+		if cfg.Upgrade.BuildTimeout <= 0 {
+			return nil, fmt.Errorf("upgrade build_timeout must be positive")
 		}
 	}
 	if cfg.Server.AuthToken == "" {

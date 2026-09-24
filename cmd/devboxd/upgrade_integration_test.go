@@ -71,7 +71,7 @@ func testSelfUpgradeProcess(t *testing.T, failMigration bool) {
 	address := listener.Addr().String()
 	listener.Close()
 	configPath := filepath.Join(dir, "devboxd.yaml")
-	body := fmt.Sprintf("server:\n  listen: %q\n  auth_token: test-token\nlinear:\n  api_key: test-key\nrepos:\n  - match:\n      team: TEST\n    repo:\n      path: %q\nreconciler:\n  enabled: false\nupgrade:\n  enabled: true\n  source_path: %q\n  build_timeout: 2m\n  drain_timeout: 10s\n", address, source, source)
+	body := fmt.Sprintf("server:\n  listen: %q\n  auth_token: test-token\nlinear:\n  api_key: test-key\nrepos:\n  - match:\n      team: TEST\n    repo:\n      path: %q\nreconciler:\n  enabled: false\nupgrade:\n  enabled: true\n  source_path: %q\n  build_timeout: 2m\n", address, source, source)
 	if err := os.WriteFile(configPath, []byte(body), 0600); err != nil {
 		t.Fatal(err)
 	}
