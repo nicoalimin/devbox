@@ -510,7 +510,7 @@ func (m Model) renderJobsContent() string {
 			stateStyle = successStyle
 		case db.StateFailed, db.StateCancelled:
 			stateStyle = errorStyle
-		case db.StateBlocked:
+		case db.StateBlocked, db.StateStuck:
 			stateStyle = warningStyle
 		default:
 			stateStyle = activeStyle

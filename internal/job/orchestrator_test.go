@@ -21,7 +21,7 @@ func TestBuildCodingPromptDefersDeliveryToHost(t *testing.T) {
 		Title:      "Fix formatting",
 		Team:       linear.Team{Name: "Test", Key: "TEST"},
 		State:      linear.State{Name: "Todo"},
-	}, "")
+	}, "", "")
 
 	for _, required := range []string{
 		"formatting, lint, typecheck, test, and build failures as work to fix",

@@ -98,6 +98,7 @@ type Job struct {
 	OpenCodeSessionID string     `json:"opencode_session_id"`
 	OperatorContext   string     `json:"operator_context"`
 	ReviewFeedback    string     `json:"review_feedback"`
+	FailureSignature  string     `json:"failure_signature,omitempty"`
 	CreatedAt         time.Time  `json:"created_at"`
 	UpdatedAt         time.Time  `json:"updated_at"`
 	CompletedAt       *time.Time `json:"completed_at"`
@@ -230,7 +231,7 @@ func (c *Client) WaitForReview(ctx context.Context, jobID string, interval time.
 		switch job.State {
 		case "pr_open", "done":
 			return &job, nil
-		case "failed", "cancelled", "blocked":
+		case "failed", "stuck", "cancelled", "blocked":
 			return &job, fmt.Errorf("review %s: %s (branch: %s, worktree: %s)", job.State, job.BlockerReason, job.BranchName, job.WorktreePath)
 		}
 		timer := time.NewTimer(interval)

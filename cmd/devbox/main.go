@@ -290,6 +290,12 @@ func jobCmd() *cobra.Command {
 				if job.BlockerReason != "" {
 					fmt.Printf("Blocker: %s\n", job.BlockerReason)
 				}
+				if job.FailureSignature != "" {
+					fmt.Printf("Failure signature: %s\n", job.FailureSignature)
+				}
+				if job.State == "stuck" {
+					fmt.Printf("Note: stuck = same validation failure as the previous attempt; add guidance before another --continue\n")
+				}
 				fmt.Printf("Created: %s\n", job.CreatedAt.Format(time.RFC3339))
 				fmt.Printf("Updated: %s\n", job.UpdatedAt.Format(time.RFC3339))
 				if job.CompletedAt != nil {

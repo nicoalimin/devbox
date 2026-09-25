@@ -13,6 +13,8 @@ CREATE TABLE IF NOT EXISTS jobs (
     review_feedback TEXT,
     coding_wait_started_at TIMESTAMP,
     reviewing_wait_started_at TIMESTAMP,
+    failure_signature TEXT NOT NULL DEFAULT '',
+    failure_summary TEXT NOT NULL DEFAULT '',
     created_at TIMESTAMP NOT NULL,
     updated_at TIMESTAMP NOT NULL,
     completed_at TIMESTAMP
@@ -20,6 +22,7 @@ CREATE TABLE IF NOT EXISTS jobs (
 
 CREATE INDEX IF NOT EXISTS idx_jobs_state ON jobs(state);
 CREATE INDEX IF NOT EXISTS idx_jobs_created_at ON jobs(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_jobs_linear_issue_created ON jobs(linear_issue_id, created_at DESC);
 
 CREATE TABLE IF NOT EXISTS job_logs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,

@@ -2,6 +2,7 @@ package job
 
 import (
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -72,12 +73,27 @@ func (deliveryIssues) GetIssue(string) (*linear.Issue, error) {
 }
 func (deliveryIssues) AddComment(string, string) error { return nil }
 
+type titledIssues struct{ title string }
+
+func (i titledIssues) GetIssue(string) (*linear.Issue, error) {
+	return &linear.Issue{Identifier: "TEST-1", Title: i.title}, nil
+}
+func (titledIssues) AddComment(string, string) error { return nil }
+
 // The model writes files but never commits. Optionally it also times out.
 func deliveryAgent(t *testing.T, orch *Orchestrator, job *db.Job, timeout bool, repair func(int)) {
+	t.Helper()
+	recordingDeliveryAgent(t, orch, job, timeout, repair)
+}
+
+// recordingDeliveryAgent is deliveryAgent that also returns the prompt bodies
+// the orchestrator sent, in order.
+func recordingDeliveryAgent(t *testing.T, orch *Orchestrator, job *db.Job, timeout bool, repair func(int)) func() []string {
 	t.Helper()
 	var mu sync.Mutex
 	active := false
 	prompts := 0
+	var bodies []string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		mu.Lock()
 		defer mu.Unlock()
@@ -87,6 +103,8 @@ func deliveryAgent(t *testing.T, orch *Orchestrator, job *db.Job, timeout bool, 
 		case strings.HasSuffix(r.URL.Path, "/prompt"):
 			active = true
 			prompts++
+			body, _ := io.ReadAll(r.Body)
+			bodies = append(bodies, string(body))
 			if repair != nil {
 				repair(prompts)
 			}
@@ -116,6 +134,11 @@ func deliveryAgent(t *testing.T, orch *Orchestrator, job *db.Job, timeout bool, 
 	job.OpenCodeSessionID = "session"
 	if err := orch.db.UpdateJob(job); err != nil {
 		t.Fatal(err)
+	}
+	return func() []string {
+		mu.Lock()
+		defer mu.Unlock()
+		return append([]string(nil), bodies...)
 	}
 }
 
@@ -176,6 +199,9 @@ func TestFailedReviewPublishesCheckpointAndReportsFailure(t *testing.T) {
 	if got := deliveryGit(t, remote, "show", "refs/heads/"+job.BranchName+":output.txt"); got != "partial" {
 		t.Fatal(got)
 	}
+	if stored.FailureSignature == "" || !strings.Contains(stored.FailureSummary, "exit 9") {
+		t.Fatalf("validation failure signature/summary not recorded: %+v", stored)
+	}
 	// UTA-96: jobs with an open PR preserve the worktree so continue/review can reattach.
 	if _, err := os.Stat(job.WorktreePath); err != nil {
 		t.Fatalf("expected worktree preserved for open-PR iteration: %v", err)
@@ -221,8 +247,17 @@ func TestReviewAcceptanceIsDurableAndRejectsDuplicates(t *testing.T) {
 	}
 }
 
+// writeAgentWork simulates uncommitted agent output in the worktree.
+func writeAgentWork(t *testing.T, job *db.Job) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(job.WorktreePath, "feature.txt"), []byte("agent work\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestHostFormattingRunsBeforeValidation(t *testing.T) {
 	orch, job, remote := deliveryFixture(t)
+	writeAgentWork(t, job)
 	orch.cfg.Repos[0].Repo.FormatCommands = []string{"printf 'formatted\n' > output.txt"}
 	orch.cfg.Repos[0].Repo.ValidationCommands = []string{"test \"$(cat output.txt)\" = formatted"}
 	if err := orch.pushBranch(job); err != nil {
@@ -231,8 +266,110 @@ func TestHostFormattingRunsBeforeValidation(t *testing.T) {
 	if got := deliveryGit(t, remote, "show", "refs/heads/"+job.BranchName+":output.txt"); got != "formatted" {
 		t.Fatal(got)
 	}
-	if got := deliveryGit(t, remote, "log", "-1", "--format=%s", job.BranchName); got != "chore: format" {
-		t.Fatalf("format commit subject = %q", got)
+	if got := deliveryGit(t, remote, "log", "-1", "--format=%s", job.BranchName); got != "[TEST-1] Automated implementation changes" {
+		t.Fatalf("work commit subject = %q", got)
+	}
+}
+
+// UTA-97: agent code + formatter output land in ONE meaningful commit.
+func TestAgentWorkAndFormattingFoldedIntoSingleCommit(t *testing.T) {
+	orch, job, remote := deliveryFixture(t)
+	orch.linear = titledIssues{title: "Warehouse transfer API"}
+	writeAgentWork(t, job)
+	orch.cfg.Repos[0].Repo.FormatCommands = []string{"printf 'formatted\n' > output.txt && printf 'agent work formatted\n' > feature.txt"}
+	orch.cfg.Repos[0].Repo.ValidationCommands = []string{"test -f output.txt"}
+	if err := orch.pushBranch(job); err != nil {
+		t.Fatal(err)
+	}
+	if got := deliveryGit(t, remote, "rev-list", "--count", "main.."+job.BranchName); got != "1" {
+		t.Fatalf("expected exactly one delivery commit, got %s", got)
+	}
+	subject := deliveryGit(t, remote, "log", "-1", "--format=%s", job.BranchName)
+	if subject != "[TEST-1] Warehouse transfer API" || strings.Contains(subject, "chore: format") {
+		t.Fatalf("commit subject = %q", subject)
+	}
+	files := deliveryGit(t, remote, "show", "--name-only", "--format=", job.BranchName)
+	if !strings.Contains(files, "feature.txt") || !strings.Contains(files, "output.txt") {
+		t.Fatalf("commit does not contain both agent and formatter changes: %q", files)
+	}
+	if got := deliveryGit(t, remote, "show", "refs/heads/"+job.BranchName+":feature.txt"); got != "agent work formatted" {
+		t.Fatal(got)
+	}
+}
+
+// publishedFixture pushes one existing commit so the remote PR branch is at
+// HEAD, as on a continue of an open PR.
+func publishedFixture(t *testing.T) (*Orchestrator, *db.Job, string, string) {
+	t.Helper()
+	orch, job, remote := deliveryFixture(t)
+	if err := os.WriteFile(filepath.Join(job.WorktreePath, "output.txt"), []byte("unformatted\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	deliveryGit(t, job.WorktreePath, "add", "output.txt")
+	deliveryGit(t, job.WorktreePath, "commit", "-m", "[TEST-1] earlier work")
+	deliveryGit(t, job.WorktreePath, "push", "origin", job.BranchName)
+	head := deliveryGit(t, job.WorktreePath, "rev-parse", "HEAD")
+	orch.cfg.Repos[0].Repo.FormatCommands = []string{"printf 'formatted\n' > output.txt"}
+	return orch, job, remote, head
+}
+
+func jobLogText(t *testing.T, orch *Orchestrator, jobID string) string {
+	t.Helper()
+	logs, err := orch.db.GetLogs(jobID, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var b strings.Builder
+	for _, l := range logs {
+		b.WriteString(l.Message + "\n")
+	}
+	return b.String()
+}
+
+// UTA-97: a format-only diff (agent changed nothing) makes no commit and no push.
+func TestFormatOnlyDiffMakesNoCommitAndNoPush(t *testing.T) {
+	orch, job, remote, head := publishedFixture(t)
+	orch.cfg.Repos[0].Repo.ValidationCommands = []string{"true"}
+	if err := orch.pushBranch(job); err != nil {
+		t.Fatal(err)
+	}
+	if got := deliveryGit(t, job.WorktreePath, "rev-parse", "HEAD"); got != head {
+		t.Fatalf("format-only diff created a commit: %s != %s", got, head)
+	}
+	if got := deliveryGit(t, remote, "rev-parse", "refs/heads/"+job.BranchName); got != head {
+		t.Fatalf("remote moved: %s", got)
+	}
+	if got := deliveryGit(t, job.WorktreePath, "status", "--porcelain"); got != "" {
+		t.Fatalf("format-only output left in worktree: %s", got)
+	}
+	logs := jobLogText(t, orch, job.ID)
+	if !strings.Contains(logs, "format-only") || !strings.Contains(logs, "skipping push") || strings.Contains(logs, "pushing branch to remote") {
+		t.Fatalf("expected format-only no-push path, logs:\n%s", logs)
+	}
+}
+
+// UTA-97: the failure checkpoint must not commit or push a format-only diff.
+func TestFormatOnlyDiffCheckpointDoesNotCommitOrPush(t *testing.T) {
+	orch, job, remote, head := publishedFixture(t)
+	orch.cfg.Repos[0].Repo.ValidationCommands = []string{"exit 3"}
+	job.OpenCodeSessionID = "" // no repair attempts
+	err := orch.pushBranch(job)
+	if err == nil {
+		t.Fatal("expected validation failure")
+	}
+	orch.failJob(job, fmt.Sprintf("Failed to push branch: %v", err))
+	stored, _ := orch.db.GetJob(job.ID)
+	if stored.State != db.StateFailed || strings.Contains(stored.BlockerReason, "committed and pushed") {
+		t.Fatalf("job: %s %q", stored.State, stored.BlockerReason)
+	}
+	if got := deliveryGit(t, job.WorktreePath, "rev-parse", "HEAD"); got != head {
+		t.Fatalf("checkpoint committed format-only diff: %s", got)
+	}
+	if got := deliveryGit(t, remote, "rev-parse", "refs/heads/"+job.BranchName); got != head {
+		t.Fatalf("remote moved: %s", got)
+	}
+	if logs := jobLogText(t, orch, job.ID); !strings.Contains(logs, "skipping push") {
+		t.Fatalf("expected checkpoint push skip, logs:\n%s", logs)
 	}
 }
 
@@ -256,18 +393,20 @@ func TestHostFormattingDoesNotCreateEmptyCommit(t *testing.T) {
 
 func TestHostFormattingCommitDoesNotBypassValidation(t *testing.T) {
 	orch, job, _ := deliveryFixture(t)
+	writeAgentWork(t, job)
 	orch.cfg.Repos[0].Repo.FormatCommands = []string{"printf 'formatted\\n' > output.txt"}
 	orch.cfg.Repos[0].Repo.ValidationCommands = []string{"exit 7"}
 	if err := orch.pushBranch(job); err == nil || !strings.Contains(err.Error(), "local validation failed") {
 		t.Fatalf("expected validation failure after formatting, got %v", err)
 	}
-	if got := deliveryGit(t, job.WorktreePath, "log", "-1", "--format=%s"); got != "chore: format" {
-		t.Fatalf("format changes were not committed before failed check: %q", got)
+	if got := deliveryGit(t, job.WorktreePath, "log", "-1", "--format=%s"); got != "[TEST-1] Automated implementation changes" {
+		t.Fatalf("work + format changes were not committed before failed check: %q", got)
 	}
 }
 
 func TestHostFormattingReportsCommitFailure(t *testing.T) {
 	orch, job, _ := deliveryFixture(t)
+	writeAgentWork(t, job)
 	orch.cfg.Repos[0].Repo.FormatCommands = []string{"printf 'formatted\\n' > output.txt"}
 	if err := os.WriteFile(filepath.Join(job.RepoPath, ".git", "hooks", "pre-commit"), []byte("#!/bin/sh\nexit 1\n"), 0755); err != nil {
 		t.Fatal(err)
@@ -280,6 +419,7 @@ func TestHostFormattingReportsCommitFailure(t *testing.T) {
 
 func TestHostDeliveryFormatsAndCommitsWithoutOpenCode(t *testing.T) {
 	orch, job, remote := deliveryFixture(t)
+	writeAgentWork(t, job)
 	orch.cfg.Repos[0].Repo.FormatCommands = []string{"printf 'formatted\\n' > output.txt"}
 	orch.cfg.Repos[0].Repo.ValidationCommands = []string{"test \"$(cat output.txt)\" = formatted"}
 
@@ -301,7 +441,7 @@ func TestHostDeliveryFormatsAndCommitsWithoutOpenCode(t *testing.T) {
 	if got := deliveryGit(t, remote, "show", "refs/heads/"+job.BranchName+":output.txt"); got != "formatted" {
 		t.Fatal(got)
 	}
-	if subject := deliveryGit(t, job.WorktreePath, "show", "-s", "--format=%s", "HEAD"); subject != "chore: format" {
+	if subject := deliveryGit(t, job.WorktreePath, "show", "-s", "--format=%s", "HEAD"); subject != "[TEST-1] Automated implementation changes" {
 		t.Fatalf("commit subject = %q", subject)
 	}
 }
@@ -595,5 +735,25 @@ func TestFailJobIdenticalBranchDoesNotClaimCheckpoint(t *testing.T) {
 	}
 	if strings.Contains(stored.BlockerReason, "Incomplete work checkpoint") {
 		t.Fatalf("unexpected checkpoint claim: %s", stored.BlockerReason)
+	}
+}
+
+// An agent that committed itself (unpublished) still gets formatting folded
+// into a delivery commit rather than silently discarded.
+func TestFormattingOfUnpublishedAgentCommitIsCommitted(t *testing.T) {
+	orch, job, remote := deliveryFixture(t)
+	writeAgentWork(t, job)
+	deliveryGit(t, job.WorktreePath, "add", "feature.txt")
+	deliveryGit(t, job.WorktreePath, "commit", "-m", "agent commit")
+	orch.cfg.Repos[0].Repo.FormatCommands = []string{"printf 'formatted\\n' > output.txt"}
+	orch.cfg.Repos[0].Repo.ValidationCommands = []string{"true"}
+	if err := orch.pushBranch(job); err != nil {
+		t.Fatal(err)
+	}
+	if got := deliveryGit(t, remote, "show", "refs/heads/"+job.BranchName+":output.txt"); got != "formatted" {
+		t.Fatal(got)
+	}
+	if got := deliveryGit(t, remote, "log", "-1", "--format=%s", job.BranchName); got != "[TEST-1] Automated implementation changes" {
+		t.Fatalf("subject = %q", got)
 	}
 }

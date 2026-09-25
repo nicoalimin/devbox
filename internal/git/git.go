@@ -351,6 +351,79 @@ func (m *Manager) CommitAll(worktreePath, message string) error {
 	return nil
 }
 
+// HeadTree returns the tree object of HEAD.
+func (m *Manager) HeadTree(worktreePath string) (string, error) {
+	output, err := runDeliveryGit(worktreePath, "rev-parse", "HEAD^{tree}")
+	if err != nil {
+		return "", fmt.Errorf("failed to read HEAD tree: %w\nOutput: %s", err, string(output))
+	}
+	return strings.TrimSpace(string(output)), nil
+}
+
+// WorktreeTree snapshots the full worktree (tracked, modified, and untracked
+// non-ignored files) as a tree object without touching the real index, so
+// callers can compare worktree states before and after formatting.
+func (m *Manager) WorktreeTree(worktreePath string) (string, error) {
+	tmp, err := os.CreateTemp("", "devbox-index-*")
+	if err != nil {
+		return "", err
+	}
+	indexPath := tmp.Name()
+	tmp.Close()
+	os.Remove(indexPath) // git refuses an empty (zero-byte) index file
+	defer os.Remove(indexPath)
+
+	run := func(args ...string) (string, error) {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = worktreePath
+		cmd.Env = append(os.Environ(), "GIT_INDEX_FILE="+indexPath)
+		output, err := cmd.CombinedOutput()
+		if err != nil {
+			return "", fmt.Errorf("git %s: %w\nOutput: %s", strings.Join(args, " "), err, string(output))
+		}
+		return strings.TrimSpace(string(output)), nil
+	}
+	if _, err := run("read-tree", "HEAD"); err != nil {
+		return "", err
+	}
+	if _, err := run("add", "--all"); err != nil {
+		return "", err
+	}
+	return run("write-tree")
+}
+
+// DiscardUncommittedChanges resets the worktree and index to HEAD and removes
+// untracked (non-ignored) files. Only used for host-generated formatter output.
+func (m *Manager) DiscardUncommittedChanges(worktreePath string) error {
+	if output, err := runDeliveryGit(worktreePath, "reset", "--quiet", "--hard", "HEAD"); err != nil {
+		return fmt.Errorf("failed to reset worktree: %w\nOutput: %s", err, string(output))
+	}
+	if output, err := runDeliveryGit(worktreePath, "clean", "-fdq"); err != nil {
+		return fmt.Errorf("failed to clean worktree: %w\nOutput: %s", err, string(output))
+	}
+	return nil
+}
+
+// RemoteBranchAtHead reports whether origin's branch already points at local
+// HEAD, i.e. a push would publish nothing new.
+func (m *Manager) RemoteBranchAtHead(worktreePath, branchName string) (bool, error) {
+	head, err := runDeliveryGit(worktreePath, "rev-parse", "HEAD")
+	if err != nil {
+		return false, fmt.Errorf("failed to read HEAD: %w", err)
+	}
+	remote, err := runDeliveryGit(worktreePath, "ls-remote", "origin", "refs/heads/"+branchName)
+	if err != nil {
+		return false, fmt.Errorf("failed to query remote branch %s: %w", branchName, err)
+	}
+	for _, line := range strings.Split(string(remote), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) == 2 && fields[1] == "refs/heads/"+branchName {
+			return fields[0] == strings.TrimSpace(string(head)), nil
+		}
+	}
+	return false, nil
+}
+
 // fetchBaseBranch fetches the latest changes for the base branch
 func (m *Manager) fetchBaseBranch() error {
 	cmd := exec.Command("git", "fetch", "origin", m.baseBranch)
