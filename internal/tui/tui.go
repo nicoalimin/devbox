@@ -13,6 +13,7 @@ import (
 	"github.com/nicoalimin/devbox/internal/buildinfo"
 	"github.com/nicoalimin/devbox/internal/config"
 	"github.com/nicoalimin/devbox/internal/db"
+	"github.com/nicoalimin/devbox/internal/linear"
 )
 
 // Pane represents which pane has focus
@@ -20,10 +21,15 @@ type Pane int
 
 const (
 	JobsPane Pane = iota
+	TicketInfoPane
 	ServerLogsPane
 	JobLogsPane
 	IntegrationsPane
 )
+
+type issueGetter interface {
+	GetIssue(string) (*linear.Issue, error)
+}
 
 // Model represents the TUI state
 type Model struct {
@@ -35,15 +41,19 @@ type Model struct {
 	serverLogsViewport viewport.Model
 	jobLogsViewport    viewport.Model
 	jobsViewport       viewport.Model
-	errorsViewport     viewport.Model
+	ticketViewport     viewport.Model
 	lastUpdate         time.Time
 	startedAt          time.Time
 	currentJob         *db.Job
 	recentJobs         []*db.Job
-	blockedJobs        []*db.Job
 	serverLogs         []*db.JobLog
 	jobLogs            []*db.JobLog
 	selectedJobIdx     int
+	issueClient        issueGetter
+	ticketIssue        *linear.Issue
+	ticketError        string
+	ticketLoadingFor   string
+	ticketLoadedFor    string
 	quitting           bool
 	ready              bool
 }
@@ -65,7 +75,8 @@ func NewModelWithStartedAt(cfg *config.Config, database *db.DB, startedAt time.T
 		focusedPane:    ServerLogsPane,
 		lastUpdate:     now,
 		startedAt:      startedAt,
-		selectedJobIdx: 0,
+		selectedJobIdx: -1,
+		issueClient:    linear.NewClient(cfg.Linear.APIKey),
 	}
 }
 
@@ -91,15 +102,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		case "tab":
 			// Cycle through panes
-			m.focusedPane = (m.focusedPane + 1) % 4
+			m.focusedPane = (m.focusedPane + 1) % 5
 			return m, nil
 
 		case "shift+tab":
 			// Cycle backward through panes
-			m.focusedPane = (m.focusedPane + 3) % 4
+			m.focusedPane = (m.focusedPane + 4) % 5
 			return m, nil
 
 		case "r":
+			m.ticketLoadedFor = ""
 			cmds = append(cmds, m.refreshData())
 			return m, tea.Batch(cmds...)
 
@@ -113,8 +125,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					if m.ready {
 						m.jobLogsViewport.GotoBottom()
 					}
-					cmds = append(cmds, m.refreshJobLogs())
+					m.ticketViewport.GotoTop()
+					cmds = append(cmds, m.refreshJobLogs(), m.startTicketRefresh())
 				}
+			case TicketInfoPane:
+				m.ticketViewport.LineDown(1)
 			case ServerLogsPane:
 				m.serverLogsViewport.LineDown(1)
 			case JobLogsPane:
@@ -132,8 +147,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					if m.ready {
 						m.jobLogsViewport.GotoBottom()
 					}
-					cmds = append(cmds, m.refreshJobLogs())
+					m.ticketViewport.GotoTop()
+					cmds = append(cmds, m.refreshJobLogs(), m.startTicketRefresh())
 				}
+			case TicketInfoPane:
+				m.ticketViewport.LineUp(1)
 			case ServerLogsPane:
 				m.serverLogsViewport.LineUp(1)
 			case JobLogsPane:
@@ -150,7 +168,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if m.ready {
 					m.jobLogsViewport.GotoBottom()
 				}
-				cmds = append(cmds, m.refreshJobLogs())
+				m.ticketViewport.GotoTop()
+				cmds = append(cmds, m.refreshJobLogs(), m.startTicketRefresh())
+			case TicketInfoPane:
+				m.ticketViewport.GotoTop()
 			case ServerLogsPane:
 				m.serverLogsViewport.GotoTop()
 			case JobLogsPane:
@@ -168,8 +189,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					if m.ready {
 						m.jobLogsViewport.GotoBottom()
 					}
-					cmds = append(cmds, m.refreshJobLogs())
+					m.ticketViewport.GotoTop()
+					cmds = append(cmds, m.refreshJobLogs(), m.startTicketRefresh())
 				}
+			case TicketInfoPane:
+				m.ticketViewport.GotoBottom()
 			case ServerLogsPane:
 				m.serverLogsViewport.GotoBottom()
 			case JobLogsPane:
@@ -206,13 +230,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		// Sidebar (stacked vertically):
 		//   - Jobs section: title (1) + viewport content + borders (2) = viewport + 3
-		//   - Errors section: title (1) + viewport content + borders (2) = viewport + 3
+		//   - Ticket Information: title (1) + viewport content + borders (2) = viewport + 3
 		//   - Integrations bar: 5 lines (3 content + 2 borders)
-		//   Total sidebar = (jobsViewport + 3) + (errorsViewport + 3) + 5 = jobsViewport + errorsViewport + 11
+		//   Total sidebar = (jobsViewport + 3) + (ticketViewport + 3) + 5 = jobsViewport + ticketViewport + 11
 		//
 		// For sidebar to equal availableContentHeight:
-		//   jobsViewport + errorsViewport + 11 = availableContentHeight
-		//   jobsViewport + errorsViewport = availableContentHeight - 11
+		//   jobsViewport + ticketViewport + 11 = availableContentHeight
+		//   jobsViewport + ticketViewport = availableContentHeight - 11
 		//   Split equally: each = (availableContentHeight - 11) / 2
 		//
 		// Logs pane (split into job logs + server logs, stacked vertically):
@@ -223,12 +247,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		sidebarWidth := 30
 
-		// Jobs and errors split the available height, accounting for integrations bar (~5 lines)
+		// Jobs and ticket information split the available height, accounting for integrations bar (~5 lines)
 		// Each section needs: title (1) + viewport + borders (2) = viewport + 3
-		// Total: jobsViewport + errorsViewport + 6 + integrations (5) = availableContentHeight
-		sidebarJobsErrors := availableContentHeight - 5 // 5 for integrations bar
-		jobsHeight := (sidebarJobsErrors - 6) / 2       // -6 for titles (2) and borders (4) across both sections
-		errorsHeight := (sidebarJobsErrors - 6) / 2
+		// Total: jobsViewport + ticketViewport + 6 + integrations (5) = availableContentHeight
+		sidebarJobsTicket := availableContentHeight - 5 // 5 for integrations bar
+		jobsHeight := (sidebarJobsTicket - 6) / 2       // -6 for titles (2) and borders (4) across both sections
+		ticketHeight := (sidebarJobsTicket - 6) / 2
 
 		// Split logs pane into two sections (job logs above, server logs beneath)
 		// Each section renders as: title (1) + subtitle (1) + viewport + borders (2) = viewport + 4
@@ -243,8 +267,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if jobsHeight < 3 {
 			jobsHeight = 3
 		}
-		if errorsHeight < 3 {
-			errorsHeight = 3
+		if ticketHeight < 3 {
+			ticketHeight = 3
 		}
 		if serverLogsHeight < 3 {
 			serverLogsHeight = 3
@@ -259,7 +283,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.serverLogsViewport = viewport.New(logsWidth, serverLogsHeight)
 			m.jobLogsViewport = viewport.New(logsWidth, jobLogsHeight)
 			m.jobsViewport = viewport.New(sidebarWidth-2, jobsHeight)
-			m.errorsViewport = viewport.New(sidebarWidth-2, errorsHeight)
+			m.ticketViewport = viewport.New(sidebarWidth-2, ticketHeight)
 			m.ready = true
 		} else {
 			// Update viewport sizes on resize
@@ -270,8 +294,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.jobLogsViewport.Height = jobLogsHeight
 			m.jobsViewport.Width = sidebarWidth - 2
 			m.jobsViewport.Height = jobsHeight
-			m.errorsViewport.Width = sidebarWidth - 2
-			m.errorsViewport.Height = errorsHeight
+			m.ticketViewport.Width = sidebarWidth - 2
+			m.ticketViewport.Height = ticketHeight
 		}
 
 		return m, nil
@@ -285,7 +309,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case dataRefreshMsg:
 		m.currentJob = msg.currentJob
 		m.recentJobs = msg.recentJobs
-		m.blockedJobs = msg.blockedJobs
 		m.serverLogs = msg.serverLogs
 		m.jobLogs = msg.jobLogs
 
@@ -294,7 +317,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			setViewportContent(m.serverLogsViewport.AtBottom(), &m.serverLogsViewport, m.renderServerLogsContent())
 			setViewportContent(m.jobLogsViewport.AtBottom(), &m.jobLogsViewport, m.renderJobLogsContent())
 			m.jobsViewport.SetContent(m.renderJobsContent())
-			m.errorsViewport.SetContent(m.renderErrorsContent())
+			m.ticketViewport.SetContent(m.renderTicketContent())
+		}
+
+		target := m.ticketJob()
+		if target == nil {
+			m.ticketIssue = nil
+			m.ticketError = ""
+			m.ticketLoadingFor = ""
+			m.ticketLoadedFor = ""
+		} else if m.ticketLoadedFor != target.ID && m.ticketLoadingFor != target.ID {
+			return m, m.startTicketRefresh()
 		}
 		return m, nil
 
@@ -302,6 +335,18 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.jobLogs = msg.jobLogs
 		if m.ready {
 			setViewportContent(m.jobLogsViewport.AtBottom(), &m.jobLogsViewport, m.renderJobLogsContent())
+		}
+		return m, nil
+
+	case ticketRefreshMsg:
+		if target := m.ticketJob(); target != nil && target.ID == msg.jobID {
+			m.ticketIssue = msg.issue
+			m.ticketError = msg.err
+			m.ticketLoadingFor = ""
+			m.ticketLoadedFor = msg.jobID
+			if m.ready {
+				m.ticketViewport.SetContent(m.renderTicketContent())
+			}
 		}
 		return m, nil
 	}
@@ -317,6 +362,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			cmds = append(cmds, cmd)
 		case JobsPane:
 			m.jobsViewport, cmd = m.jobsViewport.Update(msg)
+			cmds = append(cmds, cmd)
+		case TicketInfoPane:
+			m.ticketViewport, cmd = m.ticketViewport.Update(msg)
 			cmds = append(cmds, cmd)
 		}
 	}
@@ -408,7 +456,7 @@ func (m Model) renderHeader() string {
 
 // renderMainContent renders the main content area with sidebar and logs
 func (m Model) renderMainContent() string {
-	// Sidebar (left): Jobs + Errors + Integrations
+	// Sidebar (left): Jobs + Ticket Information + Integrations
 	sidebar := m.renderSidebar()
 
 	// Main pane (right): Logs
@@ -422,7 +470,7 @@ func (m Model) renderMainContent() string {
 	)
 }
 
-// renderSidebar renders the left sidebar with jobs, errors, integrations
+// renderSidebar renders the left sidebar with jobs, ticket information, integrations
 func (m Model) renderSidebar() string {
 	sidebarWidth := 30
 
@@ -447,25 +495,25 @@ func (m Model) renderSidebar() string {
 		m.jobsViewport.View(),
 	)
 
-	// Errors section - height includes title (1) + viewport + borders (2)
-	errorsStyle := lipgloss.NewStyle().
+	// Ticket Information section - height includes title (1) + viewport + borders (2)
+	ticketStyle := lipgloss.NewStyle().
 		Width(sidebarWidth).
-		Height(m.errorsViewport.Height + 3).
+		Height(m.ticketViewport.Height + 3).
 		BorderStyle(lipgloss.RoundedBorder()).
-		BorderForeground(lipgloss.Color("241"))
+		BorderForeground(m.getBorderColor(TicketInfoPane))
 
-	errorsTitle := lipgloss.NewStyle().
+	ticketTitle := lipgloss.NewStyle().
 		Bold(true).
-		Foreground(lipgloss.Color("196")).
-		Render(fmt.Sprintf("ERRORS (%d)", len(m.blockedJobs)))
+		Foreground(lipgloss.Color("117")).
+		Render("TICKET INFORMATION")
 
-	errorsContent := m.renderErrorsContent()
-	m.errorsViewport.SetContent(errorsContent)
+	ticketContent := m.renderTicketContent()
+	m.ticketViewport.SetContent(ticketContent)
 
-	errors := lipgloss.JoinVertical(
+	ticket := lipgloss.JoinVertical(
 		lipgloss.Left,
-		errorsTitle,
-		m.errorsViewport.View(),
+		ticketTitle,
+		m.ticketViewport.View(),
 	)
 
 	// Integrations section
@@ -475,7 +523,7 @@ func (m Model) renderSidebar() string {
 	sidebar := lipgloss.JoinVertical(
 		lipgloss.Left,
 		jobsStyle.Render(jobs),
-		errorsStyle.Render(errors),
+		ticketStyle.Render(ticket),
 		integrationsBar,
 	)
 
@@ -530,31 +578,50 @@ func (m Model) renderJobsContent() string {
 	return s.String()
 }
 
-// renderErrorsContent renders blocked/failed jobs
-func (m Model) renderErrorsContent() string {
+// renderTicketContent renders the selected Linear ticket's details.
+func (m Model) renderTicketContent() string {
+	target := m.ticketJob()
+	if target == nil {
+		return dimStyle.Render("No running task")
+	}
+	if m.ticketLoadingFor == target.ID {
+		return dimStyle.Render("Loading " + target.LinearIssueID + "…")
+	}
+	if m.ticketError != "" {
+		return warningStyle.Render(target.LinearIssueID) + "\n" +
+			dimStyle.Render(wrapText("Unable to load ticket: "+m.ticketError, m.ticketViewport.Width))
+	}
+	issue := m.ticketIssue
+	if issue == nil || issue.Identifier != target.LinearIssueID {
+		return dimStyle.Render("Ticket details unavailable")
+	}
+
+	width := m.ticketViewport.Width
 	var s strings.Builder
-
-	if len(m.blockedJobs) == 0 {
-		s.WriteString(dimStyle.Render("No blockers"))
-		return s.String()
+	s.WriteString(highlightStyle.Render(issue.Identifier) + "\n")
+	s.WriteString(lipgloss.NewStyle().Bold(true).Render(wrapText(issue.Title, width)) + "\n\n")
+	writeTicketField(&s, "State", issue.State.Name, width)
+	writeTicketField(&s, "Priority", linearPriority(issue.Priority), width)
+	writeTicketField(&s, "Team", issue.Team.Name, width)
+	if issue.Project != nil {
+		writeTicketField(&s, "Project", issue.Project.Name, width)
 	}
-
-	for i, job := range m.blockedJobs {
-		if i >= 5 { // Show max 5 blockers
-			break
+	if len(issue.Labels) > 0 {
+		labels := make([]string, 0, len(issue.Labels))
+		for _, label := range issue.Labels {
+			labels = append(labels, label.Name)
 		}
-
-		s.WriteString(errorStyle.Render("• ") + job.LinearIssueID + "\n")
-		if job.BlockerReason != "" {
-			reason := job.BlockerReason
-			if len(reason) > 22 {
-				reason = reason[:22] + "…"
-			}
-			s.WriteString(dimStyle.Render("  "+reason) + "\n")
-		}
+		writeTicketField(&s, "Labels", strings.Join(labels, ", "), width)
 	}
-
-	return s.String()
+	if issue.Description != "" {
+		s.WriteString("\n" + dimStyle.Render("Description") + "\n")
+		s.WriteString(wrapText(issue.Description, width) + "\n")
+	}
+	if issue.URL != "" {
+		s.WriteString("\n" + dimStyle.Render("URL") + "\n")
+		s.WriteString(wrapText(issue.URL, width))
+	}
+	return strings.TrimRight(s.String(), "\n")
 }
 
 // renderIntegrationsBar renders the integrations health bar
@@ -608,11 +675,8 @@ func (m Model) renderLogsPane() string {
 		Render("JOB LOGS")
 
 	var jobSubtitle string
-	if m.selectedJobIdx < len(m.recentJobs) {
-		selectedJob := m.recentJobs[m.selectedJobIdx]
-		jobSubtitle = dimStyle.Render(fmt.Sprintf("(showing logs for %s)", selectedJob.LinearIssueID))
-	} else if m.currentJob != nil {
-		jobSubtitle = dimStyle.Render(fmt.Sprintf("(showing logs for %s)", m.currentJob.LinearIssueID))
+	if target := m.ticketJob(); target != nil {
+		jobSubtitle = dimStyle.Render(fmt.Sprintf("(showing logs for %s)", target.LinearIssueID))
 	} else {
 		jobSubtitle = dimStyle.Render("(no job selected)")
 	}
@@ -731,6 +795,8 @@ func (m Model) renderFooter() string {
 	switch m.focusedPane {
 	case JobsPane:
 		focusedPaneName = "Jobs"
+	case TicketInfoPane:
+		focusedPaneName = "Ticket Information"
 	case ServerLogsPane:
 		focusedPaneName = "Server Logs"
 	case JobLogsPane:
@@ -759,7 +825,6 @@ func (m Model) refreshData() tea.Cmd {
 	return func() tea.Msg {
 		currentJob, _ := m.database.GetCurrentJob()
 		recentJobs, _ := m.database.ListJobs(50)
-		blockedJobs, _ := m.database.GetBlockedJobs()
 
 		// Get server logs from the global log buffer (live daemon logs)
 		// This includes HTTP access logs, orchestration logs, etc.
@@ -779,10 +844,23 @@ func (m Model) refreshData() tea.Cmd {
 		var jobLogs []*db.JobLog
 		var targetJob *db.Job
 
-		// Priority: selected job > current job
+		// Priority: selected job > topmost running job.
 		if len(recentJobs) > 0 && m.selectedJobIdx < len(recentJobs) {
-			targetJob = recentJobs[m.selectedJobIdx]
+			if m.selectedJobIdx >= 0 {
+				targetJob = recentJobs[m.selectedJobIdx]
+			}
 		} else if currentJob != nil {
+			targetJob = currentJob
+		}
+		if targetJob == nil {
+			for _, job := range recentJobs {
+				if job.State.IsBusy() {
+					targetJob = job
+					break
+				}
+			}
+		}
+		if targetJob == nil {
 			targetJob = currentJob
 		}
 
@@ -791,11 +869,10 @@ func (m Model) refreshData() tea.Cmd {
 		}
 
 		return dataRefreshMsg{
-			currentJob:  currentJob,
-			recentJobs:  recentJobs,
-			blockedJobs: blockedJobs,
-			serverLogs:  serverLogs,
-			jobLogs:     jobLogs,
+			currentJob: currentJob,
+			recentJobs: recentJobs,
+			serverLogs: serverLogs,
+			jobLogs:    jobLogs,
 		}
 	}
 }
@@ -806,8 +883,7 @@ func (m Model) refreshJobLogs() tea.Cmd {
 		var jobLogs []*db.JobLog
 
 		// Get logs for the selected job
-		if len(m.recentJobs) > 0 && m.selectedJobIdx < len(m.recentJobs) {
-			targetJob := m.recentJobs[m.selectedJobIdx]
+		if targetJob := m.ticketJob(); targetJob != nil {
 			jobLogs, _ = m.database.GetLogs(targetJob.ID, 200)
 		}
 
@@ -817,13 +893,112 @@ func (m Model) refreshJobLogs() tea.Cmd {
 	}
 }
 
+// ticketJob returns the explicitly selected job, or the topmost running job
+// when there is no selection.
+func (m Model) ticketJob() *db.Job {
+	if m.selectedJobIdx >= 0 && m.selectedJobIdx < len(m.recentJobs) {
+		return m.recentJobs[m.selectedJobIdx]
+	}
+	for _, job := range m.recentJobs {
+		if job.State.IsBusy() {
+			return job
+		}
+	}
+	return m.currentJob
+}
+
+func (m *Model) startTicketRefresh() tea.Cmd {
+	target := m.ticketJob()
+	client := m.issueClient
+	if target == nil || client == nil {
+		return nil
+	}
+	jobID, issueID := target.ID, target.LinearIssueID
+	m.ticketLoadingFor = jobID
+	m.ticketLoadedFor = ""
+	m.ticketIssue = nil
+	m.ticketError = ""
+	return func() tea.Msg {
+		issue, err := client.GetIssue(issueID)
+		msg := ticketRefreshMsg{jobID: jobID, issue: issue}
+		if err != nil {
+			msg.err = err.Error()
+		}
+		return msg
+	}
+}
+
 // dataRefreshMsg carries refreshed data
 type dataRefreshMsg struct {
-	currentJob  *db.Job
-	recentJobs  []*db.Job
-	blockedJobs []*db.Job
-	serverLogs  []*db.JobLog
-	jobLogs     []*db.JobLog
+	currentJob *db.Job
+	recentJobs []*db.Job
+	serverLogs []*db.JobLog
+	jobLogs    []*db.JobLog
+}
+
+type ticketRefreshMsg struct {
+	jobID string
+	issue *linear.Issue
+	err   string
+}
+
+func writeTicketField(s *strings.Builder, label, value string, width int) {
+	if value == "" {
+		value = "—"
+	}
+	s.WriteString(dimStyle.Render(label+": ") + wrapText(value, width-len(label)-2) + "\n")
+}
+
+func linearPriority(priority int) string {
+	switch priority {
+	case 1:
+		return "Urgent"
+	case 2:
+		return "High"
+	case 3:
+		return "Medium"
+	case 4:
+		return "Low"
+	default:
+		return "No priority"
+	}
+}
+
+func wrapText(text string, width int) string {
+	if width < 1 {
+		width = 1
+	}
+	paragraphs := strings.Split(text, "\n")
+	for i, paragraph := range paragraphs {
+		words := strings.Fields(paragraph)
+		if len(words) == 0 {
+			paragraphs[i] = ""
+			continue
+		}
+		var expanded []string
+		for _, word := range words {
+			runes := []rune(word)
+			for len(runes) > width {
+				expanded = append(expanded, string(runes[:width]))
+				runes = runes[width:]
+			}
+			if len(runes) > 0 {
+				expanded = append(expanded, string(runes))
+			}
+		}
+		var lines []string
+		line := expanded[0]
+		for _, word := range expanded[1:] {
+			if len([]rune(line))+1+len([]rune(word)) <= width {
+				line += " " + word
+			} else {
+				lines = append(lines, line)
+				line = word
+			}
+		}
+		paragraphs[i] = strings.Join(append(lines, line), "\n")
+	}
+	return strings.Join(paragraphs, "\n")
 }
 
 // jobLogsRefreshMsg carries refreshed job logs only

@@ -6,7 +6,9 @@ import (
 	"time"
 
 	"github.com/charmbracelet/bubbles/viewport"
+	tea "github.com/charmbracelet/bubbletea"
 	"github.com/nicoalimin/devbox/internal/db"
+	"github.com/nicoalimin/devbox/internal/linear"
 )
 
 func TestDataRefreshPreservesScrolledLogPositions(t *testing.T) {
@@ -15,7 +17,7 @@ func TestDataRefreshPreservesScrolledLogPositions(t *testing.T) {
 		serverLogsViewport: viewport.New(80, 3),
 		jobLogsViewport:    viewport.New(80, 3),
 		jobsViewport:       viewport.New(20, 3),
-		errorsViewport:     viewport.New(20, 3),
+		ticketViewport:     viewport.New(20, 3),
 	}
 	m.serverLogsViewport.SetContent(strings.Repeat("old server line\n", 10))
 	m.jobLogsViewport.SetContent(strings.Repeat("old job line\n", 10))
@@ -46,7 +48,7 @@ func TestDataRefreshFollowsLogsWhenAlreadyAtBottom(t *testing.T) {
 		serverLogsViewport: viewport.New(80, 3),
 		jobLogsViewport:    viewport.New(80, 3),
 		jobsViewport:       viewport.New(20, 3),
-		errorsViewport:     viewport.New(20, 3),
+		ticketViewport:     viewport.New(20, 3),
 	}
 	m.serverLogsViewport.SetContent(strings.Repeat("old server line\n", 10))
 	m.jobLogsViewport.SetContent(strings.Repeat("old job line\n", 10))
@@ -77,6 +79,67 @@ func testLogs(count int, prefix string) []*db.JobLog {
 		}
 	}
 	return logs
+}
+
+func TestTicketJobUsesSelectionThenTopmostRunningJob(t *testing.T) {
+	jobs := []*db.Job{
+		{ID: "done", LinearIssueID: "ENG-1", State: db.StateDone},
+		{ID: "running", LinearIssueID: "ENG-2", State: db.StateCoding},
+		{ID: "older-running", LinearIssueID: "ENG-3", State: db.StateReviewing},
+	}
+	m := Model{recentJobs: jobs, selectedJobIdx: -1}
+
+	if got := m.ticketJob(); got == nil || got.ID != "running" {
+		t.Fatalf("fallback ticket job = %#v, want topmost running job", got)
+	}
+
+	m.selectedJobIdx = 0
+	if got := m.ticketJob(); got == nil || got.ID != "done" {
+		t.Fatalf("selected ticket job = %#v, want explicitly selected job", got)
+	}
+}
+
+func TestRenderTicketContentShowsLinearDetails(t *testing.T) {
+	m := Model{
+		recentJobs:      []*db.Job{{ID: "job", LinearIssueID: "ENG-42", State: db.StateCoding}},
+		selectedJobIdx:  0,
+		ticketLoadedFor: "job",
+		ticketViewport:  viewport.New(28, 4),
+		ticketIssue: &linear.Issue{
+			Identifier:  "ENG-42",
+			Title:       "Improve ticket information panel",
+			Description: "Show the complete Linear ticket in a scrollable pane.",
+			URL:         "https://linear.app/example/ENG-42",
+			Priority:    2,
+			State:       linear.State{Name: "In Progress"},
+			Team:        linear.Team{Name: "Engineering"},
+			Project:     &linear.Project{Name: "Devbox"},
+			Labels:      []linear.Label{{Name: "TUI"}},
+		},
+	}
+
+	content := m.renderTicketContent()
+	for _, want := range []string{"ENG-42", "Improve ticket", "In Progress", "High", "Engineering", "Devbox", "TUI", "Show the complete Linear"} {
+		if !strings.Contains(content, want) {
+			t.Errorf("ticket content missing %q:\n%s", want, content)
+		}
+	}
+}
+
+func TestTicketPaneNavigationScrolls(t *testing.T) {
+	m := Model{
+		ready:          true,
+		focusedPane:    TicketInfoPane,
+		ticketViewport: viewport.New(28, 3),
+		selectedJobIdx: -1,
+	}
+	m.ticketViewport.SetContent(strings.Repeat("ticket line\n", 10))
+
+	updatedModel, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'j'}})
+	updated := updatedModel.(Model)
+	if updated.ticketViewport.YOffset != 1 {
+		t.Fatalf("ticket viewport offset = %d, want 1", updated.ticketViewport.YOffset)
+	}
 }
 
 func TestCalculateRenderedHeight(t *testing.T) {

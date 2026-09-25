@@ -116,7 +116,7 @@ When you run `devboxd --config devboxd.yaml`, it launches an immersive full-scre
 - **Header**: Real-time status (BUSY/IDLE), current job, elapsed time
 - **Sidebar** (left):
   - **Jobs**: Recent job list with states (done/busy/failed/blocked)
-  - **Errors**: Blocked jobs requiring attention
+  - **Ticket Information**: Scrollable Linear details for the selected task, or the topmost running task when none is selected
   - **Integrations**: Health of Linear, GitHub, OpenCode, configured repos
 - **Main Pane** (right): Split log view
   - **Live Server Logs**: Daemon orchestration logs (HTTP access, job lifecycle)
@@ -148,7 +148,7 @@ When making changes to the TUI (files in `internal/tui/`), verify the following 
   - Test with various terminal sizes (minimum: 80x24, recommended: 120x30+)
   - Both columns (left sidebar and right logs) must have the **same total height**
   - Resize the terminal to confirm no content is pushed above the visible area
-- [ ] **Layout balance**: Left sidebar height (jobs + errors + integrations) equals right column height (server logs + job logs)
+- [ ] **Layout balance**: Left sidebar height (jobs + ticket information + integrations) equals right column height (server logs + job logs)
 - [ ] **Headless mode**: `--no-tui` flag still works correctly for non-interactive environments
 - [ ] **Navigation**: Independent scrolling in server logs and job logs panes still functions
 - [ ] **Job selection**: Changing selected job in jobs pane updates job logs pane correctly
