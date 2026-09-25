@@ -315,12 +315,15 @@ func (db *DB) GetJobByLinearIssueID(linearIssueID string) (*Job, error) {
 }
 
 // GetPreviousJob returns the most recent job for a Linear issue other than
-// excludeJobID, regardless of state (UTA-97 repeat-failure detection).
+// excludeJobID that reached a resting state (failed, stuck, done, blocked,
+// pr_open). Cancelled and in-flight jobs are skipped so a cancel between two
+// identical failures does not reset repeat detection (UTA-97/UTA-98).
 func (db *DB) GetPreviousJob(linearIssueID, excludeJobID string) (*Job, error) {
 	return db.queryJob(`
 		SELECT `+jobColumns+`
 		FROM jobs
 		WHERE linear_issue_id = ? AND id != ?
+			AND state IN ('failed', 'stuck', 'done', 'blocked', 'pr_open')
 		ORDER BY created_at DESC
 		LIMIT 1
 	`, linearIssueID, excludeJobID)
