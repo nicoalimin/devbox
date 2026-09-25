@@ -899,3 +899,31 @@ func TestFailureSignaturePersistsAndPreviousJobLookup(t *testing.T) {
 		t.Fatalf("expected no previous job, got %+v %v", none, err)
 	}
 }
+
+func TestGetPreviousJobSkipsCancelled(t *testing.T) {
+	database, err := Open(filepath.Join(t.TempDir(), "prev.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	base := time.Now().Add(-time.Hour)
+	for i, j := range []*Job{
+		{ID: "failed-1", State: StateFailed},
+		{ID: "cancelled", State: StateCancelled},
+		{ID: "current", State: StateCoding},
+	} {
+		j.LinearIssueID = "UTA-1"
+		j.CreatedAt = base.Add(time.Duration(i) * time.Minute)
+		j.UpdatedAt = j.CreatedAt
+		if err := database.CreateJob(j); err != nil {
+			t.Fatal(err)
+		}
+	}
+	prev, err := database.GetPreviousJob("UTA-1", "current")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if prev == nil || prev.ID != "failed-1" {
+		t.Fatalf("previous=%v want failed-1 (cancelled job must be skipped)", prev)
+	}
+}

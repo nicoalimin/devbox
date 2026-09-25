@@ -379,6 +379,15 @@ func (o *Orchestrator) prepareReuseWorktree(job *db.Job, gitMgr *git.Manager, id
 	if err := o.db.UpdateJob(job); err != nil {
 		return err
 	}
+
+	// UTA-98: every reuse path must start from the remote tip. A local branch
+	// left behind by an earlier job may be missing commits pushed from
+	// elsewhere (operator fixes, another machine).
+	result, err := gitMgr.SyncToRemote(worktreePath, plan.Ref)
+	if err != nil {
+		return fmt.Errorf("failed to sync reused worktree onto origin/%s before coding: %w", plan.Ref, err)
+	}
+	o.log(job.ID, "info", fmt.Sprintf("Synced reused worktree with origin/%s (%s)", plan.Ref, result))
 	return nil
 }
 
@@ -824,6 +833,11 @@ func (o *Orchestrator) pushWithRetry(job *db.Job, manager *git.Manager) error {
 	opts := o.continueOptions(job)
 	var err error
 	for attempt := 1; attempt <= 3; attempt++ {
+		// UTA-98: integrate the remote tip before every push attempt so a
+		// commit that landed mid-job is preserved instead of rejected.
+		if syncErr := o.syncBeforePush(job, manager, opts); syncErr != nil {
+			return syncErr
+		}
 		if opts.Active() {
 			err = manager.PushBranchAlso(job.WorktreePath, job.BranchName, opts.PushRef)
 		} else {
@@ -835,12 +849,35 @@ func (o *Orchestrator) pushWithRetry(job *db.Job, manager *git.Manager) error {
 			}
 			return nil
 		}
+		if git.IsNonFastForward(err) {
+			o.log(job.ID, "warn", fmt.Sprintf("Push attempt %d/3 rejected as non-fast-forward; fetching and rebasing before retry", attempt))
+			continue
+		}
 		o.log(job.ID, "warn", fmt.Sprintf("Push attempt %d/3 failed: %v", attempt, err))
 		if attempt < 3 {
 			time.Sleep(time.Duration(attempt) * time.Second)
 		}
 	}
 	return err
+}
+
+// syncBeforePush rebases local work onto origin/<branch> (and origin/<push_ref>
+// for continues) so the push is a fast-forward. Never force-pushes.
+func (o *Orchestrator) syncBeforePush(job *db.Job, manager *git.Manager, opts ContinuePROptions) error {
+	refs := []string{job.BranchName}
+	if opts.Active() && opts.PushRef != "" && opts.PushRef != job.BranchName {
+		refs = append(refs, opts.PushRef)
+	}
+	for _, ref := range refs {
+		result, err := manager.SyncToRemote(job.WorktreePath, ref)
+		if err != nil {
+			return fmt.Errorf("failed to integrate origin/%s before push: %w", ref, err)
+		}
+		if result == git.SyncRebased || result == git.SyncFastForwarded {
+			o.log(job.ID, "info", fmt.Sprintf("Integrated origin/%s before push (%s)", ref, result))
+		}
+	}
+	return nil
 }
 
 // validationCommands returns the per-repository override. A nil slice enables
@@ -1014,7 +1051,10 @@ func (o *Orchestrator) failJob(job *db.Job, reason string) {
 	// This is explicitly an incomplete checkpoint, never successful delivery.
 	if job.WorktreePath != "" {
 		published, err := o.checkpointFailedWork(job)
-		if err != nil {
+		var fb *fallbackCheckpointError
+		if errors.As(err, &fb) {
+			reason += fmt.Sprintf("; push to %s failed (%v); incomplete work preserved on fallback ref %s", job.BranchName, fb.cause, fb.ref)
+		} else if err != nil {
 			reason += fmt.Sprintf("; recovery incomplete (worktree preserved at %s): %v", job.WorktreePath, err)
 		} else if published {
 			reason += "; incomplete work committed and pushed to " + job.BranchName
@@ -1179,7 +1219,12 @@ func (o *Orchestrator) checkpointFailedWork(job *db.Job) (published bool, err er
 	}
 
 	if err := o.pushWithRetry(job, manager); err != nil {
-		return false, err
+		// UTA-98: never leave work local-only. Publish HEAD to a fallback ref.
+		fallback, fbErr := o.publishFallbackCheckpoint(job, manager, err)
+		if fbErr != nil {
+			return false, fmt.Errorf("%v; fallback checkpoint also failed: %v", err, fbErr)
+		}
+		return false, &fallbackCheckpointError{ref: fallback, cause: err}
 	}
 	o.log(job.ID, "warn", "Incomplete work checkpoint committed and verified on remote; job remains failed")
 	o.maybeRemoveWorktreeAfterTerminal(job, manager, "checkpoint published")
@@ -2279,4 +2324,49 @@ func (o *Orchestrator) cleanupWorktreeBestEffort(j *db.Job) {
 	if err := gitMgr.RemoveWorktree(j.WorktreePath); err != nil {
 		o.log(j.ID, "warn", fmt.Sprintf("Failed to remove worktree: %v", err))
 	}
+}
+
+// fallbackCheckpointError means the assigned branch could not be updated, but
+// the incomplete work was published and verified on a separate fallback ref.
+type fallbackCheckpointError struct {
+	ref   string
+	cause error
+}
+
+func (e *fallbackCheckpointError) Error() string {
+	return fmt.Sprintf("push failed (%v); work preserved on fallback ref %s", e.cause, e.ref)
+}
+
+// fallbackCheckpointRef names the rescue ref for a job: devbox/<issue>-checkpoint-<jobid8>.
+func fallbackCheckpointRef(job *db.Job) string {
+	short := job.ID
+	if len(short) > 8 {
+		short = short[:8]
+	}
+	return fmt.Sprintf("devbox/%s-checkpoint-%s", strings.ToLower(job.LinearIssueID), short)
+}
+
+// publishFallbackCheckpoint pushes HEAD to the fallback ref, verifies it on the
+// remote, and posts a Linear comment naming the ref (and conflicting files).
+func (o *Orchestrator) publishFallbackCheckpoint(job *db.Job, manager *git.Manager, pushErr error) (string, error) {
+	ref := fallbackCheckpointRef(job)
+	if err := manager.PushHeadToRef(job.WorktreePath, ref); err != nil {
+		return "", err
+	}
+	o.log(job.ID, "warn", fmt.Sprintf("Push to %s failed; incomplete work published to fallback ref %s", job.BranchName, ref))
+
+	detail := ""
+	if ce, ok := git.IsConflict(pushErr); ok && len(ce.Files) > 0 {
+		detail = "\n\nConflicting files vs `origin/" + ce.Branch + "`:\n- `" + strings.Join(ce.Files, "`\n- `") + "`"
+	}
+	issue, err := o.linear.GetIssue(job.LinearIssueID)
+	if err != nil || issue == nil {
+		o.log(job.ID, "warn", fmt.Sprintf("Failed to fetch Linear issue for fallback checkpoint comment: %v", err))
+		return ref, nil
+	}
+	comment := fmt.Sprintf("⚠️ Devbox could not update `%s`\n\nJob %s failed and its incomplete work could not be pushed to the assigned branch, so it was preserved on `%s`.%s\n\nIntegrate that ref manually (merge or rebase) before the next continue. Nothing was force-pushed.\n\n*Automated by devboxd*", job.BranchName, job.ID, ref, detail)
+	if err := o.linear.AddComment(issue.ID, comment); err != nil {
+		o.log(job.ID, "warn", fmt.Sprintf("Failed to add Linear fallback checkpoint comment: %v", err))
+	}
+	return ref, nil
 }
