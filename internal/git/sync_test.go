@@ -183,3 +183,74 @@ func TestIsNonFastForward(t *testing.T) {
 		t.Error("nil should not be non-fast-forward")
 	}
 }
+
+// A dirty reused worktree whose uncommitted edit conflicts with a remote commit
+// must fail with the file named and leave HEAD + the uncommitted edit exactly as
+// before: no conflict markers, no leftover stash entry.
+func TestSyncToRemote_DirtyWorktreeConflictRestoresPreSyncState(t *testing.T) {
+	mgr, repo, wt := publishedBranch(t)
+	other := cloneRemote(t, repo)
+	runGit(t, other, "checkout", wt.BranchName)
+	commitFile(t, other, "feature.txt", "operator\n", "operator edit")
+	runGit(t, other, "push", "origin", wt.BranchName)
+
+	pre := strings.TrimSpace(runGit(t, wt.Path, "rev-parse", "HEAD"))
+	if err := os.WriteFile(filepath.Join(wt.Path, "feature.txt"), []byte("agent\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(wt.Path, "new.txt"), []byte("untracked\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	_, err := mgr.SyncToRemote(wt.Path, wt.BranchName)
+	ce, ok := IsConflict(err)
+	if !ok {
+		t.Fatalf("want ConflictError, got %v", err)
+	}
+	if len(ce.Files) == 0 || ce.Files[0] != "feature.txt" {
+		t.Fatalf("files=%v", ce.Files)
+	}
+	if got := strings.TrimSpace(runGit(t, wt.Path, "rev-parse", "HEAD")); got != pre {
+		t.Fatalf("HEAD=%s want pre-sync %s", got, pre)
+	}
+	b, _ := os.ReadFile(filepath.Join(wt.Path, "feature.txt"))
+	if string(b) != "agent\n" {
+		t.Fatalf("uncommitted edit not restored: %q", b)
+	}
+	if b, _ := os.ReadFile(filepath.Join(wt.Path, "new.txt")); string(b) != "untracked\n" {
+		t.Fatalf("untracked file not restored: %q", b)
+	}
+	st := runGit(t, wt.Path, "status", "--porcelain")
+	if strings.Contains(st, "UU") || strings.Contains(st, "AA") {
+		t.Fatalf("unmerged paths left: %q", st)
+	}
+	if s := strings.TrimSpace(runGit(t, wt.Path, "stash", "list")); s != "" {
+		t.Fatalf("stash entry left behind: %q", s)
+	}
+}
+
+// A dirty worktree whose uncommitted edit does not overlap the remote commit is
+// synced and keeps the edit uncommitted.
+func TestSyncToRemote_DirtyWorktreeCarriesUncommittedWork(t *testing.T) {
+	mgr, repo, wt := publishedBranch(t)
+	other := cloneRemote(t, repo)
+	runGit(t, other, "checkout", wt.BranchName)
+	remoteTip := commitFile(t, other, "operator.txt", "fix\n", "operator fix")
+	runGit(t, other, "push", "origin", wt.BranchName)
+
+	if err := os.WriteFile(filepath.Join(wt.Path, "feature.txt"), []byte("agent\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	res, err := mgr.SyncToRemote(wt.Path, wt.BranchName)
+	if err != nil || res != SyncFastForwarded {
+		t.Fatalf("res=%s err=%v", res, err)
+	}
+	if got := strings.TrimSpace(runGit(t, wt.Path, "rev-parse", "HEAD")); got != remoteTip {
+		t.Fatalf("HEAD=%s want %s", got, remoteTip)
+	}
+	if b, _ := os.ReadFile(filepath.Join(wt.Path, "feature.txt")); string(b) != "agent\n" {
+		t.Fatalf("uncommitted edit lost: %q", b)
+	}
+	if s := strings.TrimSpace(runGit(t, wt.Path, "stash", "list")); s != "" {
+		t.Fatalf("stash entry left behind: %q", s)
+	}
+}

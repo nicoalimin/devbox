@@ -148,3 +148,31 @@ func TestConflictingRemoteCommitPublishesFallbackRef(t *testing.T) {
 		t.Fatalf("linear comments: %q", issues.comments)
 	}
 }
+
+// Reuse of a preserved worktree with a conflicting uncommitted edit fails the
+// prepare with the file named instead of coding on top of conflict markers.
+func TestReuseDirtyWorktreeConflictFailsPrepare(t *testing.T) {
+	orch, job, remote := deliveryFixture(t)
+	publishJobBranch(t, job)
+	other := operatorClone(t, remote, job.BranchName)
+	syncCommit(t, other, "shared.txt", "operator\n", "operator edit")
+	deliveryGit(t, other, "push", "origin", job.BranchName)
+	if err := os.WriteFile(filepath.Join(job.WorktreePath, "shared.txt"), []byte("agent\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	next := &db.Job{ID: "job-2", LinearIssueID: "TEST-1", State: db.StatePreparing, CreatedAt: time.Now(), UpdatedAt: time.Now()}
+	if err := orch.db.CreateJob(next); err != nil {
+		t.Fatal(err)
+	}
+	mgr := gitmanager.NewManager(job.RepoPath, "main")
+	plan := ReusePlan{Reuse: true, Ref: job.BranchName, PreferWorktreePath: job.WorktreePath}
+	err := orch.prepareReuseWorktree(next, mgr, "TEST-1", job.RepoPath, plan)
+	if err == nil || !strings.Contains(err.Error(), "shared.txt") {
+		t.Fatalf("want conflict naming shared.txt, got %v", err)
+	}
+	b, _ := os.ReadFile(filepath.Join(job.WorktreePath, "shared.txt"))
+	if string(b) != "agent\n" {
+		t.Fatalf("worktree file corrupted: %q", b)
+	}
+}

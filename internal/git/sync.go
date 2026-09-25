@@ -86,8 +86,10 @@ func (m *Manager) FetchBranch(worktreePath, branch string) (exists bool, err err
 //   - local is behind with no unpublished commits: fast-forward
 //   - local has unpublished commits: rebase them onto origin/<branch>
 //
-// Uncommitted changes are carried across with --autostash. On conflict the
-// rebase is aborted (worktree restored) and a *ConflictError names the files.
+// Uncommitted changes are stashed explicitly (never --autostash, whose failed
+// re-apply exits 0 and leaves conflict markers in the tree), rebased across,
+// and re-applied. On any conflict the pre-sync state is restored (HEAD and
+// uncommitted work) and a *ConflictError names the files.
 func (m *Manager) SyncToRemote(worktreePath, branch string) (SyncResult, error) {
 	exists, err := m.FetchBranch(worktreePath, branch)
 	if err != nil {
@@ -104,13 +106,83 @@ func (m *Manager) SyncToRemote(worktreePath, branch string) (SyncResult, error) 
 	if runGitOK(worktreePath, "merge-base", "--is-ancestor", "HEAD", remoteRef) {
 		result = SyncFastForwarded
 	}
-	out, err := runDeliveryGit(worktreePath, "-c", "rebase.autoSquash=false", "rebase", "--autostash", remoteRef)
+	if files := conflictedFiles(worktreePath); len(files) > 0 {
+		return "", &ConflictError{Branch: branch, Files: files, Output: "worktree already has unmerged paths; refusing to sync"}
+	}
+	preHead, err := runDeliveryGit(worktreePath, "rev-parse", "HEAD")
+	if err != nil {
+		return "", fmt.Errorf("failed to read HEAD before sync: %w", err)
+	}
+	pre := strings.TrimSpace(string(preHead))
+
+	status, err := runDeliveryGit(worktreePath, "status", "--porcelain")
+	if err != nil {
+		return "", fmt.Errorf("git status failed: %w\nOutput: %s", err, status)
+	}
+	stashed := false
+	if strings.TrimSpace(string(status)) != "" {
+		if out, err := runDeliveryGit(worktreePath, "stash", "push", "--include-untracked", "-m", "devbox-sync "+branch); err != nil {
+			return "", fmt.Errorf("failed to stash uncommitted work before sync: %w\nOutput: %s", err, out)
+		}
+		stashed = true
+	}
+
+	out, err := runDeliveryGit(worktreePath, "-c", "rebase.autoSquash=false", "rebase", remoteRef)
 	if err != nil {
 		files := conflictedFiles(worktreePath)
 		_, _ = runDeliveryGit(worktreePath, "rebase", "--abort")
+		if stashed {
+			if popOut, popErr := runDeliveryGit(worktreePath, "stash", "pop"); popErr != nil {
+				return "", fmt.Errorf("rebase onto %s conflicted (%v) and restoring uncommitted work failed; it is kept in stash@{0}: %w\nOutput: %s", remoteRef, files, popErr, popOut)
+			}
+		}
 		return "", &ConflictError{Branch: branch, Files: files, Output: string(out)}
 	}
-	return result, nil
+	if !stashed {
+		return result, nil
+	}
+
+	popOut, popErr := runDeliveryGit(worktreePath, "stash", "pop")
+	files := conflictedFiles(worktreePath)
+	if popErr == nil && len(files) == 0 {
+		return result, nil
+	}
+	// Re-applying the uncommitted work conflicts with the remote commits.
+	// git keeps the stash entry when pop fails; restore the exact pre-sync
+	// state (HEAD and uncommitted work) so nothing commits conflict markers.
+	if len(files) == 0 {
+		files = stashFiles(worktreePath)
+	}
+	if out, err := runDeliveryGit(worktreePath, "reset", "--hard", pre); err != nil {
+		return "", fmt.Errorf("uncommitted work conflicts with origin/%s in %v; reset to pre-sync %s failed, work kept in stash@{0}: %w\nOutput: %s", branch, files, pre, err, out)
+	}
+	_, _ = runDeliveryGit(worktreePath, "clean", "-fd")
+	if out, err := runDeliveryGit(worktreePath, "stash", "pop"); err != nil {
+		return "", fmt.Errorf("uncommitted work conflicts with origin/%s in %v; restoring it at pre-sync %s failed, work kept in stash@{0}: %w\nOutput: %s", branch, files, pre, err, out)
+	}
+	return "", &ConflictError{Branch: branch, Files: files, Output: "uncommitted changes conflict with remote commits; pre-sync state restored\n" + string(popOut)}
+}
+
+// stashFiles lists paths touched by stash@{0}, including untracked files.
+func stashFiles(worktreePath string) []string {
+	seen := map[string]bool{}
+	var files []string
+	for _, args := range [][]string{
+		{"stash", "show", "--name-only", "stash@{0}"},
+		{"show", "--name-only", "--format=", "stash@{0}^3"},
+	} {
+		out, err := runDeliveryGit(worktreePath, args...)
+		if err != nil {
+			continue
+		}
+		for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+			if line = strings.TrimSpace(line); line != "" && !seen[line] {
+				seen[line] = true
+				files = append(files, line)
+			}
+		}
+	}
+	return files
 }
 
 // PushHeadToRef publishes HEAD to refs/heads/<ref> (never forced) and verifies
