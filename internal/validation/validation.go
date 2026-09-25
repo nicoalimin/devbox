@@ -75,7 +75,13 @@ func runCommands(worktreePath string, commands []Command, logFunc func(string)) 
 				}
 				continue
 			}
-			return fmt.Errorf("local validation failed: %s: %w\nOutput:\n%s", display, runErr, tail(output, 16*1024))
+			failure := NewFailure(display, runErr, output, worktreePath)
+			if logFunc != nil {
+				if path := saveRawOutput(failure); path != "" {
+					logFunc(fmt.Sprintf("Full validation output (%d bytes) saved to %s", len(output), path))
+				}
+			}
+			return failure
 		}
 		if isPrimaryPackageDir(command.Dir) {
 			primaryPassed = true
@@ -405,9 +411,16 @@ func fileExists(path string) bool {
 	return err == nil && !info.IsDir()
 }
 
-func tail(output []byte, limit int) string {
-	if len(output) <= limit {
-		return string(output)
+// saveRawOutput keeps the untruncated validator output outside the worktree
+// (so it is never committed) for operators debugging a failure.
+func saveRawOutput(failure *Failure) string {
+	dir := filepath.Join(os.TempDir(), "devbox-validation")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return ""
 	}
-	return "... output truncated ...\n" + string(output[len(output)-limit:])
+	path := filepath.Join(dir, failure.Signature+".log")
+	if err := os.WriteFile(path, failure.Output, 0o644); err != nil {
+		return ""
+	}
+	return path
 }

@@ -59,3 +59,11 @@ Fresh assigns (no continue markers and no prior PR/worktree) still create a new 
 ## Review after finished job
 
 `devbox review <job_id|LINEAR_ISSUE_ID>` accepts a Linear id after the prior job is `done`/`failed`, as long as `pr_url` / `branch_name` remain. Missing worktrees are recreated from the branch (or reattached when preserved).
+
+## Validation failures, repeat detection, and `stuck` (UTA-97)
+
+- Validation failures report deduplicated TypeScript errors (first 30 distinct, with total/distinct counts and example locations) instead of a 16KB byte tail. Non-TypeScript output keeps the head plus a short tail. The full raw output is saved under `$TMPDIR/devbox-validation/<signature>.log`, and the job log records that path.
+- Each validation failure stores a `failure_signature`: a hash of the sorted, deduped error code + file + message entries, with line numbers, timestamps, and absolute worktree/temp paths removed. The deduped report is stored in `failure_summary`.
+- If a job fails with the same signature as the previous job on the same Linear issue (or as its own last failure, for a `review` re-run), it ends in the terminal state **`stuck`** instead of `failed`, and devboxd posts a Linear comment with the deduped errors. `devbox jobs`, `devbox job <id>`, and the TUI show the `stuck` state.
+- On `assign --continue` (or a reuse continue) after a failed/stuck job, and on `review` of a job whose last run failed validation, the prompt starts with `Step 1 (mandatory): fix these errors …`, followed by the prior deduped errors.
+- Formatter output goes into the agent-work commit (`[ISSUE] <title>`). There are no standalone `chore: format` commits, and a format-only diff is neither committed nor pushed (including by failure checkpoints).

@@ -958,3 +958,38 @@ func TestCreateWorktreeOnRef_RefusesBaseBranch(t *testing.T) {
 		t.Fatal("expected refuse base branch")
 	}
 }
+
+func TestWorktreeTreeSnapshotsWithoutTouchingIndex(t *testing.T) {
+	repo := setupTestRepo(t)
+	defer os.RemoveAll(repo)
+	mgr := NewManager(repo, "main")
+	worktree, err := mgr.CreateWorktree("TEST-TREE")
+	if err != nil {
+		t.Fatal(err)
+	}
+	head, err := mgr.HeadTree(worktree.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	clean, err := mgr.WorktreeTree(worktree.Path)
+	if err != nil || clean != head {
+		t.Fatalf("clean snapshot %q != HEAD tree %q (err %v)", clean, head, err)
+	}
+	if err := os.WriteFile(filepath.Join(worktree.Path, "new.txt"), []byte("x"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	dirty, err := mgr.WorktreeTree(worktree.Path)
+	if err != nil || dirty == head {
+		t.Fatalf("untracked file not captured: %q (err %v)", dirty, err)
+	}
+	status, _ := exec.Command("git", "-C", worktree.Path, "status", "--porcelain").Output()
+	if strings.TrimSpace(string(status)) != "?? new.txt" {
+		t.Fatalf("snapshot modified the real index: %q", status)
+	}
+	if err := mgr.DiscardUncommittedChanges(worktree.Path); err != nil {
+		t.Fatal(err)
+	}
+	if after, _ := mgr.WorktreeTree(worktree.Path); after != head {
+		t.Fatal("discard did not restore HEAD")
+	}
+}

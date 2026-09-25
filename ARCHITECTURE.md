@@ -167,7 +167,7 @@ repos:
       path: "/home/dev/my-backend"
       base_branch: "main"
       # Omit to auto-detect write-mode Node format scripts. The host runs these
-      # before validation and commits a dirty worktree as "chore: format".
+      # before validation and fold their output into the agent-work commit.
       # Set [] to disable host formatting for this repository.
       # format_commands:
       #   - "cd web && pnpm exec prettier --write ."
@@ -199,9 +199,10 @@ reconciler:
 
 The first-push and review-feedback paths share the same host-owned delivery
 gate. Before any push, Devbox runs configured or auto-detected write-mode
-formatters and commits all remaining tracked and non-ignored untracked changes
-as `chore: format` when the worktree is dirty. It then runs the configured or
-auto-detected validation checks. OpenCode is not responsible for this format
+formatters and folds their output into a single `[ISSUE] <title>` commit with
+the agent's tracked and non-ignored untracked changes (UTA-97). When the agent
+changed nothing and the only diff is formatting, nothing is committed or
+pushed. It then runs the configured or auto-detected validation checks. OpenCode is not responsible for this format
 and commit step, so a model timeout cannot leave formatter output only in the
 local worktree. A failed formatter, commit, or post-format check remains a job
 failure; failure recovery publishes an explicitly incomplete checkpoint when

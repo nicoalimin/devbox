@@ -36,6 +36,10 @@ type Orchestrator struct {
 	admissionMu     sync.Mutex // Serialize job/review admission before persisting busy state.
 	maintenance     bool
 	prStatusFn      func(prURL string) (prStatus, int, error) // Override for getPRStatus (tests)
+	// validationFailures holds the latest deduped validation failure per job
+	// until failJob records its signature (UTA-97).
+	validationFailures map[string]*validation.Failure
+	failureMu          sync.Mutex
 }
 
 type issueClient interface {
@@ -86,6 +90,7 @@ func (o *Orchestrator) handlePipelineErr(job *db.Job, phase string, err error) b
 		return false
 	}
 	if errors.Is(err, errJobCancelled) {
+		o.takeValidationFailure(job.ID)
 		o.log(job.ID, "info", fmt.Sprintf("Job cancelled; aborting %s", phase))
 		return true
 	}
@@ -411,7 +416,11 @@ func (o *Orchestrator) executeCoding(job *db.Job) error {
 	}
 
 	// Build prompt with context
-	prompt := o.buildCodingPrompt(issue, currentJob.OperatorContext)
+	priorErrors := o.priorFailureSummary(currentJob)
+	if priorErrors != "" {
+		o.log(job.ID, "info", "Previous attempt failed validation; injecting its deduped errors as mandatory step 1")
+	}
+	prompt := o.buildCodingPrompt(issue, currentJob.OperatorContext, priorErrors)
 
 	// Send task to OpenCode
 	if err := o.opencode.SendMessage(session.ID, prompt, job.WorktreePath); err != nil {
@@ -588,6 +597,11 @@ func (o *Orchestrator) pushBranch(job *db.Job) error {
 		return fmt.Errorf("no file changes or commits found on branch %s compared to base branch; there is nothing to push or open as a pull request", job.BranchName)
 	}
 
+	if o.alreadyPublished(job, gitMgr) {
+		o.log(job.ID, "info", "Nothing new to push: remote branch already at HEAD; skipping push")
+		return nil
+	}
+
 	o.log(job.ID, "info", "Commits verified, pushing branch to remote")
 
 	if err := o.pushWithRetry(job, gitMgr); err != nil {
@@ -600,7 +614,14 @@ func (o *Orchestrator) pushBranch(job *db.Job) error {
 
 // validateWithOpenCodeRepair formats locally and retries the full gate after
 // each bounded repair, including interrupted repairs that may have succeeded.
+//
+// UTA-97: formatter output is folded into the agent-work commit
+// ("[ISSUE] <title>"), never a standalone "chore: format" commit. When the
+// agent changed nothing and the only diff is the formatter's, nothing is
+// committed and the formatter output is discarded after validation so no
+// format-only change is committed or pushed (including by checkpoints).
 func (o *Orchestrator) validateWithOpenCodeRepair(job *db.Job, gitMgr *git.Manager) error {
+	commitMessage := ""
 	runValidation := func() error {
 		// A repair agent can run arbitrary Git commands. Reassert the assigned
 		// branch before every host-owned format/commit pass.
@@ -610,6 +631,15 @@ func (o *Orchestrator) validateWithOpenCodeRepair(job *db.Job, gitMgr *git.Manag
 		if err := gitMgr.AssertBranch(job.WorktreePath, job.BranchName); err != nil {
 			return err
 		}
+		headTree, err := gitMgr.HeadTree(job.WorktreePath)
+		if err != nil {
+			return err
+		}
+		agentTree, err := gitMgr.WorktreeTree(job.WorktreePath)
+		if err != nil {
+			return fmt.Errorf("failed to snapshot agent worktree: %w", err)
+		}
+
 		o.log(job.ID, "info", "Running deterministic host formatting before validation")
 		if err := validation.Format(job.WorktreePath, o.formatCommands(job), func(msg string) {
 			o.log(job.ID, "info", msg)
@@ -617,22 +647,40 @@ func (o *Orchestrator) validateWithOpenCodeRepair(job *db.Job, gitMgr *git.Manag
 			return fmt.Errorf("host formatting failed: %w", err)
 		}
 
-		hasChanges, err := gitMgr.HasUncommittedChanges(job.WorktreePath)
+		formattedTree, err := gitMgr.WorktreeTree(job.WorktreePath)
 		if err != nil {
 			return fmt.Errorf("failed to inspect formatted worktree: %w", err)
 		}
-		if hasChanges {
-			o.log(job.ID, "info", "Host formatting or agent output changed the worktree; creating chore: format commit")
-			if err := gitMgr.CommitAll(job.WorktreePath, "chore: format"); err != nil {
+		formatOnly := false
+		switch {
+		case formattedTree == headTree:
+			// Nothing to commit.
+		case agentTree == headTree && !o.hasUnpublishedCommits(job, gitMgr):
+			formatOnly = true
+			o.log(job.ID, "info", "Agent made no changes; host formatting diff is format-only and will not be committed or pushed")
+		default:
+			// Agent edits (or agent-made commits not yet published) plus the
+			// formatter's output go into one meaningful commit.
+			if commitMessage == "" {
+				commitMessage = o.workCommitMessage(job)
+			}
+			o.log(job.ID, "info", fmt.Sprintf("Committing agent work with host formatting folded in: %q", commitMessage))
+			if err := gitMgr.CommitAll(job.WorktreePath, commitMessage); err != nil {
 				return fmt.Errorf("failed to commit host-formatted worktree: %w", err)
 			}
-			o.log(job.ID, "info", "Created chore: format commit")
 		}
 
 		o.log(job.ID, "info", "Running local CI-equivalent validation before push")
-		return validation.Run(job.WorktreePath, o.validationCommands(job), func(msg string) {
+		validationErr := validation.Run(job.WorktreePath, o.validationCommands(job), func(msg string) {
 			o.log(job.ID, "info", msg)
 		})
+		if formatOnly {
+			if err := gitMgr.DiscardUncommittedChanges(job.WorktreePath); err != nil {
+				return errors.Join(validationErr, fmt.Errorf("failed to discard format-only changes: %w", err))
+			}
+			o.log(job.ID, "info", "Discarded format-only host formatter output")
+		}
+		return validationErr
 	}
 
 	for attempt := 0; ; attempt++ {
@@ -640,6 +688,7 @@ func (o *Orchestrator) validateWithOpenCodeRepair(job *db.Job, gitMgr *git.Manag
 			return err
 		}
 		validationErr := runValidation()
+		o.recordValidationFailure(job.ID, validationErr)
 		if validationErr == nil {
 			return nil
 		}
@@ -647,6 +696,14 @@ func (o *Orchestrator) validateWithOpenCodeRepair(job *db.Job, gitMgr *git.Manag
 			return fmt.Errorf("local validation failed after %d repair attempts: %w", attempt, validationErr)
 		}
 		o.log(job.ID, "warn", fmt.Sprintf("Repair attempt %d/%d: %v", attempt+1, maxRepairAttempts, validationErr))
+		before, _ := gitMgr.WorktreeTree(job.WorktreePath)
+
+		// Keep the OpenCode event stream running so a silent repair timeout is
+		// visible in the job log.
+		o.stopEventStream(job.ID)
+		if err := o.startEventStream(job, job.OpenCodeSessionID); err != nil {
+			o.log(job.ID, "warn", fmt.Sprintf("Failed to start event stream for repair: %v", err))
+		}
 		err := o.opencode.SendMessage(job.OpenCodeSessionID, buildValidationRepairPrompt(validationErr), job.WorktreePath)
 		if err == nil {
 			wait := commitRecoveryWait
@@ -655,19 +712,89 @@ func (o *Orchestrator) validateWithOpenCodeRepair(job *db.Job, gitMgr *git.Manag
 			}
 			err = o.opencode.WaitForSessionIdle(job.OpenCodeSessionID, wait, job.WorktreePath, func(msg string) { o.log(job.ID, "info", msg) })
 		}
+		o.stopEventStream(job.ID)
 		if err != nil {
 			o.log(job.ID, "warn", fmt.Sprintf("Repair did not finish cleanly; stopping session and rechecking actual files: %v", err))
 			if stopErr := o.opencode.StopSession(job.OpenCodeSessionID, job.WorktreePath); stopErr != nil {
 				return fmt.Errorf("repair failed (%v); cannot safely take over worktree: %w", err, stopErr)
 			}
 		}
+		if after, afterErr := gitMgr.WorktreeTree(job.WorktreePath); before != "" && afterErr == nil && after == before {
+			o.log(job.ID, "warn", fmt.Sprintf("Repair attempt %d/%d made no changes to the worktree", attempt+1, maxRepairAttempts))
+		}
 	}
+}
+
+// workCommitMessage is the subject for the agent-work commit, e.g.
+// "[UTA-97] Validation-repair loop".
+func (o *Orchestrator) workCommitMessage(job *db.Job) string {
+	identifier, title := job.LinearIssueID, ""
+	if issue, err := o.linear.GetIssue(job.LinearIssueID); err == nil && issue != nil {
+		if issue.Identifier != "" {
+			identifier = issue.Identifier
+		}
+		title = strings.TrimSpace(issue.Title)
+	}
+	if title == "" {
+		title = "Automated implementation changes"
+	}
+	return fmt.Sprintf("[%s] %s", identifier, title)
+}
+
+// recordValidationFailure remembers the latest deduped validation failure so
+// failJob can persist its signature; any other outcome clears it.
+func (o *Orchestrator) recordValidationFailure(jobID string, err error) {
+	o.failureMu.Lock()
+	defer o.failureMu.Unlock()
+	var failure *validation.Failure
+	if err != nil && errors.As(err, &failure) {
+		if o.validationFailures == nil {
+			o.validationFailures = make(map[string]*validation.Failure)
+		}
+		o.validationFailures[jobID] = failure
+		return
+	}
+	delete(o.validationFailures, jobID)
+}
+
+func (o *Orchestrator) takeValidationFailure(jobID string) *validation.Failure {
+	o.failureMu.Lock()
+	defer o.failureMu.Unlock()
+	failure := o.validationFailures[jobID]
+	delete(o.validationFailures, jobID)
+	return failure
+}
+
+// alreadyPublished reports whether every ref delivery would push already
+// points at HEAD on the remote, i.e. a push would publish nothing new.
+func (o *Orchestrator) alreadyPublished(job *db.Job, manager *git.Manager) bool {
+	refs := []string{job.BranchName}
+	if opts := o.continueOptions(job); opts.Active() && opts.PushRef != job.BranchName {
+		refs = append(refs, opts.PushRef)
+	}
+	for _, ref := range refs {
+		ok, err := manager.RemoteBranchAtHead(job.WorktreePath, ref)
+		if err != nil || !ok {
+			return false
+		}
+	}
+	return true
+}
+
+// hasUnpublishedCommits reports whether HEAD carries commits that delivery
+// would still publish (ahead of base and not yet on the remote branch).
+func (o *Orchestrator) hasUnpublishedCommits(job *db.Job, manager *git.Manager) bool {
+	ahead, err := manager.HasCommitsAheadOfBase(job.WorktreePath)
+	if err != nil || !ahead {
+		return false
+	}
+	return !o.alreadyPublished(job, manager)
 }
 
 func buildValidationRepairPrompt(validationErr error) string {
 	return fmt.Sprintf(`Devbox's local pre-push validation failed. Resolve the failure completely in the current worktree.
 
-Validation output:
+Validation errors (deduplicated; fix every distinct error listed, starting with the first):
 ---
 %s
 ---
@@ -806,6 +933,7 @@ func (o *Orchestrator) completeJob(job *db.Job) {
 	}
 	now := time.Now()
 	job.State = db.StateDone
+	job.FailureSignature, job.FailureSummary = "", ""
 	job.CompletedAt = &now
 	if err := o.db.UpdateJob(job); err != nil {
 		o.log(job.ID, "error", fmt.Sprintf("Failed to mark job complete: %v", err))
@@ -880,6 +1008,8 @@ func (o *Orchestrator) failJob(job *db.Job, reason string) {
 		return
 	}
 
+	failure := o.takeValidationFailure(job.ID)
+
 	// Preserve output on the remote even when quality checks or the model fail.
 	// This is explicitly an incomplete checkpoint, never successful delivery.
 	if job.WorktreePath != "" {
@@ -905,14 +1035,106 @@ func (o *Orchestrator) failJob(job *db.Job, reason string) {
 
 	now := time.Now()
 	job.State = db.StateFailed
+	previousSignature := o.previousFailureSignature(job)
+	job.FailureSignature, job.FailureSummary = "", ""
+	if failure != nil {
+		job.FailureSignature = failure.Signature
+		job.FailureSummary = formatFailureSummary(failure)
+		if previousSignature == failure.Signature {
+			job.State = db.StateStuck
+			reason = fmt.Sprintf("Stuck: same validation failure (signature %s) as the previous attempt on this issue; rerunning without new guidance will not help. %s", failure.Signature, reason)
+		}
+	}
 	job.BlockerReason = reason
 	job.CompletedAt = &now
 	if err := o.db.UpdateJob(job); err != nil {
-		o.log(job.ID, "error", fmt.Sprintf("Failed to mark job failed: %v", err))
+		o.log(job.ID, "error", fmt.Sprintf("Failed to mark job %s: %v", job.State, err))
 		return
 	}
 
+	if job.State == db.StateStuck {
+		o.log(job.ID, "error", fmt.Sprintf("Job stuck: %s", reason))
+		o.commentStuck(job)
+		return
+	}
 	o.log(job.ID, "error", fmt.Sprintf("Job failed: %s", reason))
+}
+
+// previousFailureSignature returns the validation failure signature of the
+// previous attempt on the same Linear issue: this job's own last failure (a
+// review re-run of the same job) or, otherwise, the most recent other job.
+func (o *Orchestrator) previousFailureSignature(job *db.Job) string {
+	if job.FailureSignature != "" {
+		return job.FailureSignature
+	}
+	prev, err := o.db.GetPreviousJob(job.LinearIssueID, job.ID)
+	if err != nil {
+		o.log(job.ID, "warn", fmt.Sprintf("Failed to look up previous job for repeat-failure detection: %v", err))
+		return ""
+	}
+	if prev == nil || !prev.State.IsFailure() {
+		return ""
+	}
+	return prev.FailureSignature
+}
+
+// priorFailureSummary returns the deduped validation errors from the previous
+// failed attempt that a continue should fix first (UTA-97), or "".
+func (o *Orchestrator) priorFailureSummary(job *db.Job) string {
+	opts := o.continueOptions(job)
+	if !opts.Active() && !opts.ContinuePR {
+		return ""
+	}
+	prev, err := o.db.GetPreviousJob(job.LinearIssueID, job.ID)
+	if err != nil {
+		o.log(job.ID, "warn", fmt.Sprintf("Failed to look up previous job errors: %v", err))
+		return ""
+	}
+	if prev == nil || !prev.State.IsFailure() {
+		return ""
+	}
+	return prev.FailureSummary
+}
+
+// mandatoryFixStep renders prior validation errors as the first step of a
+// continue/review prompt.
+func mandatoryFixStep(summary string) string {
+	if strings.TrimSpace(summary) == "" {
+		return ""
+	}
+	return fmt.Sprintf(`Step 1 (mandatory): fix these errors from the previous attempt before doing anything else. The previous devbox job failed local validation with exactly these (deduplicated) errors; fix every one of them and rerun format + typecheck + unit tests until they pass:
+---
+%s
+---
+
+`, strings.TrimSpace(summary))
+}
+
+const maxFailureSummaryBytes = 16 * 1024
+
+func formatFailureSummary(failure *validation.Failure) string {
+	summary := fmt.Sprintf("%s: %v\n%s", failure.Command, failure.Err, failure.Summary())
+	if len(summary) > maxFailureSummaryBytes {
+		summary = summary[:maxFailureSummaryBytes] + "\n... summary truncated ..."
+	}
+	return summary
+}
+
+// commentStuck posts the deduped repeat failure to the Linear issue.
+func (o *Orchestrator) commentStuck(job *db.Job) {
+	issue, err := o.linear.GetIssue(job.LinearIssueID)
+	if err != nil || issue == nil {
+		o.log(job.ID, "warn", fmt.Sprintf("Failed to fetch Linear issue for stuck comment: %v", err))
+		return
+	}
+	summary := job.FailureSummary
+	if len(summary) > 6000 {
+		summary = summary[:6000] + "\n... truncated ..."
+	}
+	comment := fmt.Sprintf("⚠️ Devbox job stuck\n\nJob %s failed local validation with the same errors as the previous attempt (signature `%s`). Another `devbox assign --continue` will likely repeat this failure without new guidance.\n\n```\n%s\n```\n\n*Automated by devboxd*", job.ID, job.FailureSignature, summary)
+	if err := o.linear.AddComment(issue.ID, comment); err != nil {
+		o.log(job.ID, "warn", fmt.Sprintf("Failed to add Linear stuck comment: %v", err))
+	}
 }
 
 // checkpointFailedWork stops the agent, commits any local changes, and pushes
@@ -950,6 +1172,12 @@ func (o *Orchestrator) checkpointFailedWork(job *db.Job) (published bool, err er
 		return false, nil
 	}
 
+	if o.alreadyPublished(job, manager) {
+		o.log(job.ID, "info", "No new work to checkpoint (remote branch already at HEAD); skipping push")
+		o.maybeRemoveWorktreeAfterTerminal(job, manager, "empty checkpoint")
+		return false, nil
+	}
+
 	if err := o.pushWithRetry(job, manager); err != nil {
 		return false, err
 	}
@@ -968,10 +1196,13 @@ func (o *Orchestrator) maybeRemoveWorktreeAfterTerminal(job *db.Job, manager *gi
 	}
 }
 
-// buildCodingPrompt builds the prompt for OpenCode with optional operator context
-func (o *Orchestrator) buildCodingPrompt(issue *linear.Issue, operatorContext string) string {
+// buildCodingPrompt builds the prompt for OpenCode with optional operator
+// context. priorErrors (deduped validation errors from the previous failed
+// attempt on a continue) become mandatory step 1.
+func (o *Orchestrator) buildCodingPrompt(issue *linear.Issue, operatorContext, priorErrors string) string {
 	var sb strings.Builder
 
+	sb.WriteString(mandatoryFixStep(priorErrors))
 	sb.WriteString(fmt.Sprintf("Build the following Linear issue:\n\n"))
 	sb.WriteString(fmt.Sprintf("Identifier: %s\n", issue.Identifier))
 	sb.WriteString(fmt.Sprintf("Title: %s\n", issue.Title))
@@ -1008,11 +1239,23 @@ func (o *Orchestrator) buildCodingPrompt(issue *linear.Issue, operatorContext st
 	}
 
 	sb.WriteString("Instructions:\n")
-	sb.WriteString("1. Review the .opencode instructions in this repository\n")
-	sb.WriteString("2. Search Notion for related PRDs, specs, or context using the issue title and team\n")
-	sb.WriteString("3. Implement the required changes\n")
-	sb.WriteString("4. Run the repository's CI-equivalent checks and resolve every failure\n")
-	sb.WriteString("5. Leave all completed changes in the assigned worktree for the host delivery gate\n")
+	steps := []string{
+		"Review the .opencode instructions in this repository",
+		"Search Notion for related PRDs, specs, or context using the issue title and team",
+		"Plan first: write an acceptance-criteria checklist (numbered) from the issue's acceptance criteria, or derive one from the description if none are listed, before editing code",
+		"Implement in small steps, one checklist item at a time. After each step, run the repository's formatter, typecheck, and unit tests, and fix every failure before starting the next step",
+		"Self-review before finishing: re-read your full diff against every acceptance-criteria checklist item, mark each item done or not done, and keep working until all are done and format + typecheck + unit tests pass",
+		"Run the repository's CI-equivalent checks and resolve every failure (the host pre-push validation gate reruns them before delivery)",
+		"Leave all completed changes in the assigned worktree for the host delivery gate",
+	}
+	first := 1
+	if strings.TrimSpace(priorErrors) != "" {
+		sb.WriteString("1. Complete Step 1 (mandatory) above: fix the previous attempt's errors first\n")
+		first = 2
+	}
+	for i, step := range steps {
+		sb.WriteString(fmt.Sprintf("%d. %s\n", first+i, step))
+	}
 	sb.WriteString(agentQualityInstructions)
 
 	return sb.String()
@@ -1169,6 +1412,7 @@ func (o *Orchestrator) resumeJobFromState(job *db.Job) {
 		}
 		job.State = db.StatePROpen
 		job.BlockerReason = ""
+		job.FailureSignature, job.FailureSummary = "", ""
 		job.CompletedAt = nil
 		if err := o.db.UpdateJob(job); err != nil {
 			o.failJob(job, fmt.Sprintf("Failed to finish review: %v", err))
@@ -1450,8 +1694,9 @@ func (o *Orchestrator) runReview(job *db.Job) (resultErr error) {
 
 	o.log(job.ID, "info", "Received review feedback")
 
-	// Build review prompt
-	reviewPrompt := fmt.Sprintf(`Review feedback on your pull request:
+	// Build review prompt. If this job previously failed validation, its
+	// deduped errors come first as a mandatory step (UTA-97).
+	reviewPrompt := mandatoryFixStep(job.FailureSummary) + fmt.Sprintf(`Review feedback on your pull request:
 
 %s
 
@@ -1525,6 +1770,7 @@ After making changes, report the checks you ran.
 	// Update job state back to pr_open (still has active PR)
 	job.State = db.StatePROpen
 	job.BlockerReason = ""
+	job.FailureSignature, job.FailureSummary = "", ""
 	job.CompletedAt = nil
 	if err := o.db.UpdateJob(job); err != nil {
 		return fmt.Errorf("failed to update job state: %w", err)
@@ -1704,7 +1950,7 @@ func (o *Orchestrator) healSession(job *db.Job, phase string) (string, error) {
 		if err != nil {
 			return "", fmt.Errorf("failed to get job: %w", err)
 		}
-		prompt = o.buildCodingPrompt(issue, currentJob.OperatorContext)
+		prompt = o.buildCodingPrompt(issue, currentJob.OperatorContext, o.priorFailureSummary(currentJob))
 	} else if phase == "reviewing" {
 		prompt = `Please review the changes you just made:
 1. Check for code quality issues

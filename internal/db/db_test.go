@@ -76,6 +76,7 @@ func TestJobStateMethods(t *testing.T) {
 		{StateBlocked, false, false},
 		{StateFailed, true, false},
 		{StateCancelled, true, false},
+		{StateStuck, true, false},
 	}
 
 	for _, tt := range tests {
@@ -863,5 +864,38 @@ func TestGetPriorReusableJob(t *testing.T) {
 	got, err = database.GetPriorReusableJob("OTHER", "current")
 	if err != nil || got != nil {
 		t.Fatalf("expected nil for other issue, got %+v err=%v", got, err)
+	}
+}
+
+func TestFailureSignaturePersistsAndPreviousJobLookup(t *testing.T) {
+	database, err := Open(filepath.Join(t.TempDir(), "jobs.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	now := time.Now()
+	older := &Job{ID: "older", LinearIssueID: "UTA-94", State: StateStuck, CreatedAt: now.Add(-2 * time.Hour), UpdatedAt: now,
+		FailureSignature: "abc123", FailureSummary: "TypeScript errors: 45 total, 2 distinct"}
+	newer := &Job{ID: "newer", LinearIssueID: "UTA-94", State: StateCoding, CreatedAt: now, UpdatedAt: now}
+	other := &Job{ID: "other", LinearIssueID: "UTA-1", State: StateFailed, CreatedAt: now.Add(time.Hour), UpdatedAt: now, FailureSignature: "zzz"}
+	for _, j := range []*Job{older, newer, other} {
+		if err := database.CreateJob(j); err != nil {
+			t.Fatal(err)
+		}
+	}
+	prev, err := database.GetPreviousJob("UTA-94", "newer")
+	if err != nil || prev == nil || prev.ID != "older" || prev.FailureSignature != "abc123" || prev.FailureSummary == "" || !prev.State.IsFailure() {
+		t.Fatalf("prev=%+v err=%v", prev, err)
+	}
+	newer.FailureSignature, newer.FailureSummary = "def456", "summary"
+	if err := database.UpdateJob(newer); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := database.GetJob("newer")
+	if got.FailureSignature != "def456" || got.FailureSummary != "summary" {
+		t.Fatalf("update not persisted: %+v", got)
+	}
+	if none, err := database.GetPreviousJob("UTA-1", "other"); err != nil || none != nil {
+		t.Fatalf("expected no previous job, got %+v %v", none, err)
 	}
 }
