@@ -582,6 +582,26 @@ func (m *Manager) HasCommitsAheadOfBase(worktreePath string) (bool, error) {
 	return true, nil
 }
 
+// ChangedFilesVsBase returns paths changed between origin/<base> and HEAD
+// (three-dot name-only), suitable for allowlist push gates.
+func (m *Manager) ChangedFilesVsBase(worktreePath string) ([]string, error) {
+	rangeSpec := fmt.Sprintf("origin/%s...HEAD", m.baseBranch)
+	cmd := exec.Command("git", "diff", "--name-only", rangeSpec)
+	cmd.Dir = worktreePath
+	output, err := cmd.Output()
+	if err != nil {
+		return nil, fmt.Errorf("failed to list changed files vs base: %w", err)
+	}
+	var files []string
+	for _, line := range strings.Split(string(output), "\n") {
+		line = strings.TrimSpace(line)
+		if line != "" {
+			files = append(files, line)
+		}
+	}
+	return files, nil
+}
+
 // FindWorktreeForBranch returns the path of an existing worktree checked out on
 // branchName, or "" when none is registered. Uses `git worktree list --porcelain`.
 func (m *Manager) FindWorktreeForBranch(branchName string) (string, error) {

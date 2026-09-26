@@ -628,6 +628,10 @@ func (o *Orchestrator) pushBranch(job *db.Job) error {
 		return fmt.Errorf("no file changes or commits found on branch %s compared to base branch; there is nothing to push or open as a pull request", job.BranchName)
 	}
 
+	if err := o.enforceAllowlistPushGate(job, gitMgr); err != nil {
+		return err
+	}
+
 	if o.alreadyPublished(job, gitMgr) {
 		o.log(job.ID, "info", "Nothing new to push: remote branch already at HEAD; skipping push")
 		return nil
@@ -641,6 +645,33 @@ func (o *Orchestrator) pushBranch(job *db.Job) error {
 
 	o.log(job.ID, "info", "Branch pushed successfully")
 	return nil
+}
+
+
+// enforceAllowlistPushGate fails the job before push when OperatorContext and/or
+// Linear description declare an ALLOWLIST: block and the branch diff escapes it
+// (UTA-103). Absent allowlist → no-op (backward compatible).
+func (o *Orchestrator) enforceAllowlistPushGate(job *db.Job, gitMgr *git.Manager) error {
+	linearDesc := ""
+	if issue, err := o.linear.GetIssue(job.LinearIssueID); err == nil && issue != nil {
+		linearDesc = issue.Description
+	}
+	allow := ParseAllowlist(job.OperatorContext, linearDesc)
+	if len(allow) == 0 {
+		return nil
+	}
+	changed, err := gitMgr.ChangedFilesVsBase(job.WorktreePath)
+	if err != nil {
+		return fmt.Errorf("allowlist push gate: %w", err)
+	}
+	violations := AllowlistViolations(allow, changed)
+	if len(violations) == 0 {
+		o.log(job.ID, "info", fmt.Sprintf("Allowlist push gate OK (%d path(s) within %v)", len(changed), allow))
+		return nil
+	}
+	msg := FormatAllowlistFailure(allow, violations)
+	o.log(job.ID, "error", msg)
+	return fmt.Errorf("%s", msg)
 }
 
 // validateWithOpenCodeRepair formats locally and retries the full gate after
