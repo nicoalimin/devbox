@@ -665,8 +665,22 @@ func (o *Orchestrator) enforceAllowlistPushGate(job *db.Job, gitMgr *git.Manager
 	if err != nil {
 		return fmt.Errorf("allowlist push gate: %w", err)
 	}
+	// UTA-105: truly empty tree with ALLOWLIST set is a hard fail.
+	// Previously "0 path(s) within" logged OK and only failed later at push.
+	// All-out-of-scope (non-empty) still goes through restore below.
+	if len(changed) == 0 {
+		msg := FormatAllowlistEmptyFailure(allow)
+		o.log(job.ID, "error", msg)
+		return fmt.Errorf("%s", msg)
+	}
 	violations := AllowlistViolations(allow, changed)
 	if len(violations) == 0 {
+		must := ParseMustWrite(job.OperatorContext, linearDesc)
+		if missing := MissingMustWrite(must, changed); len(missing) > 0 {
+			msg := fmt.Sprintf("allowlist push gate failed: MUST-WRITE path(s) missing from diff: %v", missing)
+			o.log(job.ID, "error", msg)
+			return fmt.Errorf("%s", msg)
+		}
 		o.log(job.ID, "info", fmt.Sprintf("Allowlist push gate OK (%d path(s) within %v)", len(changed), allow))
 		return nil
 	}
@@ -760,6 +774,11 @@ func (o *Orchestrator) validateWithOpenCodeRepair(job *db.Job, gitMgr *git.Manag
 				return errors.Join(validationErr, fmt.Errorf("failed to discard format-only changes: %w", err))
 			}
 			o.log(job.ID, "info", "Discarded format-only host formatter output")
+			// UTA-105: format-only success must not continue to push as if work landed.
+			// Validation failures still return so the repair loop can run.
+			if validationErr == nil {
+				return fmt.Errorf("agent produced no file changes (format-only host formatter output only); nothing to push")
+			}
 		}
 		return validationErr
 	}
@@ -772,6 +791,10 @@ func (o *Orchestrator) validateWithOpenCodeRepair(job *db.Job, gitMgr *git.Manag
 		o.recordValidationFailure(job.ID, validationErr)
 		if validationErr == nil {
 			return nil
+		}
+		// UTA-105: empty agent work is terminal — do not burn repair attempts.
+		if isEmptyAgentWorkError(validationErr) {
+			return validationErr
 		}
 		if attempt == maxRepairAttempts {
 			return fmt.Errorf("local validation failed after %d repair attempts: %w", attempt, validationErr)

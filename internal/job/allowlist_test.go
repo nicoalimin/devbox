@@ -78,3 +78,68 @@ func TestParseAllowlistMergeSources(t *testing.T) {
 		t.Fatalf("expected 2, got %v", got)
 	}
 }
+
+func TestFormatAllowlistEmptyFailure(t *testing.T) {
+	msg := FormatAllowlistEmptyFailure([]string{"packages/database/src/repositories/"})
+	if !strings.Contains(msg, "empty diff") || !strings.Contains(msg, "packages/database/src/repositories/") {
+		t.Fatalf("unexpected msg: %s", msg)
+	}
+}
+
+func TestInScopeCountEmpty(t *testing.T) {
+	allow := []string{"packages/database/src/repositories/", "packages/database/src/__tests__/"}
+	if n := InScopeCount(allow, nil); n != 0 {
+		t.Fatalf("expected 0, got %d", n)
+	}
+	if n := InScopeCount(allow, []string{}); n != 0 {
+		t.Fatalf("expected 0, got %d", n)
+	}
+}
+
+func TestInScopeCountMixed(t *testing.T) {
+	allow := []string{"packages/database/src/repositories/"}
+	changed := []string{
+		"packages/database/src/repositories/drizzle-catalog-repository.ts",
+		"infra/drizzle/meta/0013_snapshot.json",
+	}
+	if n := InScopeCount(allow, changed); n != 1 {
+		t.Fatalf("expected 1, got %d", n)
+	}
+}
+
+func TestParseMustWrite(t *testing.T) {
+	text := `MUST-WRITE (job fails if either missing from git diff vs origin/main):
+1) packages/database/src/repositories/drizzle-catalog-repository.ts
+2) packages/database/src/__tests__/transfers-drizzle-header.test.ts
+
+CRITICAL — something else
+`
+	got := ParseMustWrite(text)
+	if len(got) != 2 {
+		t.Fatalf("expected 2, got %v", got)
+	}
+	if got[0] != "packages/database/src/repositories/drizzle-catalog-repository.ts" {
+		t.Errorf("got[0]=%q", got[0])
+	}
+	if got[1] != "packages/database/src/__tests__/transfers-drizzle-header.test.ts" {
+		t.Errorf("got[1]=%q", got[1])
+	}
+}
+
+func TestMissingMustWrite(t *testing.T) {
+	must := []string{
+		"packages/database/src/repositories/drizzle-catalog-repository.ts",
+		"packages/database/src/__tests__/transfers-drizzle-header.test.ts",
+	}
+	changed := []string{"packages/database/src/repositories/drizzle-catalog-repository.ts"}
+	missing := MissingMustWrite(must, changed)
+	if len(missing) != 1 || missing[0] != must[1] {
+		t.Fatalf("expected missing second path, got %v", missing)
+	}
+	if MissingMustWrite(must, must) != nil {
+		t.Fatalf("expected nil when all present")
+	}
+	if MissingMustWrite(nil, changed) != nil {
+		t.Fatalf("expected nil when must-write inactive")
+	}
+}

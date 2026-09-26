@@ -329,12 +329,17 @@ func jobLogText(t *testing.T, orch *Orchestrator, jobID string) string {
 	return b.String()
 }
 
-// UTA-97: a format-only diff (agent changed nothing) makes no commit and no push.
+// UTA-97 + UTA-105: a format-only diff (agent changed nothing) makes no commit,
+// does not push, and fails fast (no silent skip / no full validation thrash).
 func TestFormatOnlyDiffMakesNoCommitAndNoPush(t *testing.T) {
 	orch, job, remote, head := publishedFixture(t)
 	orch.cfg.Repos[0].Repo.ValidationCommands = []string{"true"}
-	if err := orch.pushBranch(job); err != nil {
-		t.Fatal(err)
+	err := orch.pushBranch(job)
+	if err == nil {
+		t.Fatal("expected empty-agent failure")
+	}
+	if !strings.Contains(err.Error(), "agent produced no file changes") {
+		t.Fatalf("unexpected err: %v", err)
 	}
 	if got := deliveryGit(t, job.WorktreePath, "rev-parse", "HEAD"); got != head {
 		t.Fatalf("format-only diff created a commit: %s != %s", got, head)
@@ -346,8 +351,8 @@ func TestFormatOnlyDiffMakesNoCommitAndNoPush(t *testing.T) {
 		t.Fatalf("format-only output left in worktree: %s", got)
 	}
 	logs := jobLogText(t, orch, job.ID)
-	if !strings.Contains(logs, "format-only") || !strings.Contains(logs, "skipping push") || strings.Contains(logs, "pushing branch to remote") {
-		t.Fatalf("expected format-only no-push path, logs:\n%s", logs)
+	if !strings.Contains(logs, "format-only") || strings.Contains(logs, "pushing branch to remote") {
+		t.Fatalf("expected format-only empty-agent failure path, logs:\n%s", logs)
 	}
 }
 
