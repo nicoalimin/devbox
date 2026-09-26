@@ -351,6 +351,45 @@ func TestFormatOnlyDiffMakesNoCommitAndNoPush(t *testing.T) {
 	}
 }
 
+// UTA-104: failure checkpoint must not publish paths outside ALLOWLIST.
+func TestOutOfScopeCheckpointDoesNotPublishUnderAllowlist(t *testing.T) {
+	orch, job, remote, head := publishedFixture(t)
+	orch.cfg.Repos[0].Repo.ValidationCommands = []string{"exit 3"}
+	job.OpenCodeSessionID = "" // no repair attempts
+	job.OperatorContext = "ALLOWLIST:\npackages/database/src/repositories/\npackages/database/src/__tests__/\n"
+	if err := orch.db.UpdateJob(job); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(job.WorktreePath, "infra", "drizzle", "meta"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(job.WorktreePath, "infra", "drizzle", "meta", "0013_snapshot.json"), []byte("{}\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(job.WorktreePath, "junk.md"), []byte("nope\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	err := orch.pushBranch(job)
+	if err == nil {
+		t.Fatal("expected validation failure")
+	}
+	orch.failJob(job, fmt.Sprintf("Failed to push branch: %v", err))
+	stored, _ := orch.db.GetJob(job.ID)
+	if stored.State != db.StateFailed {
+		t.Fatalf("job state: %s %q", stored.State, stored.BlockerReason)
+	}
+	if strings.Contains(stored.BlockerReason, "committed and pushed") {
+		t.Fatalf("checkpoint published out-of-scope junk: %q", stored.BlockerReason)
+	}
+	if got := deliveryGit(t, remote, "rev-parse", "refs/heads/"+job.BranchName); got != head {
+		t.Fatalf("remote moved despite allowlist: %s (want %s)", got, head)
+	}
+	logs := jobLogText(t, orch, job.ID)
+	if !strings.Contains(logs, "Skipping failure checkpoint publish") && !strings.Contains(logs, "allowlist") {
+		t.Fatalf("expected allowlist checkpoint skip in logs:\n%s", logs)
+	}
+}
+
 // UTA-97: the failure checkpoint must not commit or push a format-only diff.
 func TestFormatOnlyDiffCheckpointDoesNotCommitOrPush(t *testing.T) {
 	orch, job, remote, head := publishedFixture(t)

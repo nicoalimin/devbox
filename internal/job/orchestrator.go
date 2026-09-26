@@ -1306,6 +1306,15 @@ func (o *Orchestrator) checkpointFailedWork(job *db.Job) (published bool, err er
 		}
 	}
 
+	// UTA-104: failure checkpoints must honor the same ALLOWLIST gate as the
+	// success push path. Otherwise out-of-scope junk (wrong paths, meta format)
+	// is published to the assigned branch when validation fails first.
+	if err := o.enforceAllowlistPushGate(job, manager); err != nil {
+		o.log(job.ID, "warn", fmt.Sprintf("Skipping failure checkpoint publish: %v", err))
+		o.maybeRemoveWorktreeAfterTerminal(job, manager, "allowlist blocked checkpoint")
+		return false, nil
+	}
+
 	hasCommits, err := manager.HasCommitsAheadOfBase(job.WorktreePath)
 	if err != nil {
 		return false, err

@@ -22,11 +22,13 @@ func runCodexExec(worktreePath, prompt string, timeout time.Duration) ([]byte, e
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
+	// --sandbox and --approve-for-me are mutually exclusive on current Codex CLI
+	// (UTA-104). workspace-write already permits worktree edits without the
+	// conflicting auto-approve flag.
 	cmd := exec.CommandContext(ctx, "codex", "exec",
 		"--ephemeral",
 		"--color", "never",
 		"--sandbox", "workspace-write",
-		"--approve-for-me",
 		"--cd", worktreePath,
 		"-",
 	)
