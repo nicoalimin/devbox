@@ -257,6 +257,22 @@ func FindPRURLByHead(worktreePath, headBranch string) (string, error) {
 	return url, nil
 }
 
+// PRState returns the GitHub state of prURL ("OPEN", "CLOSED", "MERGED").
+func PRState(dir, prURL string) (string, error) {
+	if strings.TrimSpace(prURL) == "" {
+		return "", nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "gh", "pr", "view", prURL, "--json", "state", "--jq", ".state")
+	cmd.Dir = dir
+	output, err := cmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("failed to read state of PR %s: %w", prURL, err)
+	}
+	return strings.ToUpper(strings.TrimSpace(string(output))), nil
+}
+
 // Bound credential helpers, hooks and transport processes as well as Git
 // itself so host recovery cannot hang indefinitely after a model timeout.
 func runDeliveryGit(worktreePath string, args ...string) ([]byte, error) {

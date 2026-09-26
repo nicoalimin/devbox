@@ -84,21 +84,21 @@ func TestResolveReusePlan_FreshVsReuse(t *testing.T) {
 	}
 
 	t.Run("fresh assign no prior", func(t *testing.T) {
-		plan := ResolveReusePlan(ContinuePROptions{}, nil)
+		plan := ResolveReusePlan(ContinuePROptions{}, nil, PRStatusUnknown)
 		if plan.Reuse {
 			t.Fatal("expected fresh assign")
 		}
 	})
 
 	t.Run("push_ref alone triggers reuse", func(t *testing.T) {
-		plan := ResolveReusePlan(ContinuePROptions{PushRef: "devbox/uta-94-5"}, nil)
+		plan := ResolveReusePlan(ContinuePROptions{PushRef: "devbox/uta-94-5"}, nil, PRStatusUnknown)
 		if !plan.Reuse || plan.Ref != "devbox/uta-94-5" {
 			t.Fatalf("plan=%+v", plan)
 		}
 	})
 
 	t.Run("continue_pr with prior branch reuses prior", func(t *testing.T) {
-		plan := ResolveReusePlan(ContinuePROptions{ContinuePR: true}, prior)
+		plan := ResolveReusePlan(ContinuePROptions{ContinuePR: true}, prior, PRStatusOpen)
 		if !plan.Reuse || plan.Ref != "devbox/uta-94-5" {
 			t.Fatalf("plan=%+v", plan)
 		}
@@ -108,14 +108,14 @@ func TestResolveReusePlan_FreshVsReuse(t *testing.T) {
 	})
 
 	t.Run("prior open PR auto-reuses without markers", func(t *testing.T) {
-		plan := ResolveReusePlan(ContinuePROptions{}, prior)
+		plan := ResolveReusePlan(ContinuePROptions{}, prior, PRStatusOpen)
 		if !plan.Reuse || plan.Ref != "devbox/uta-94-5" {
 			t.Fatalf("expected auto-reuse from prior PR, got %+v", plan)
 		}
 	})
 
 	t.Run("push_ref wins over prior branch", func(t *testing.T) {
-		plan := ResolveReusePlan(ContinuePROptions{PushRef: "devbox/uta-94-3"}, prior)
+		plan := ResolveReusePlan(ContinuePROptions{PushRef: "devbox/uta-94-3"}, prior, PRStatusOpen)
 		if !plan.Reuse || plan.Ref != "devbox/uta-94-3" {
 			t.Fatalf("plan=%+v", plan)
 		}
@@ -127,9 +127,41 @@ func TestResolveReusePlan_FreshVsReuse(t *testing.T) {
 
 	t.Run("prior without pr or worktree does not auto-reuse", func(t *testing.T) {
 		thin := &db.Job{ID: "thin", BranchName: "devbox/uta-1"}
-		plan := ResolveReusePlan(ContinuePROptions{}, thin)
+		plan := ResolveReusePlan(ContinuePROptions{}, thin, PRStatusUnknown)
 		if plan.Reuse {
 			t.Fatalf("unexpected reuse: %+v", plan)
+		}
+	})
+
+	t.Run("closed prior PR does not auto-reuse (UTA-101 regression)", func(t *testing.T) {
+		plan := ResolveReusePlan(ContinuePROptions{}, prior, PRStatusClosed)
+		if plan.Reuse {
+			t.Fatalf("closed PR must not be auto-reused: %+v", plan)
+		}
+	})
+
+	t.Run("unverified prior PR does not auto-reuse", func(t *testing.T) {
+		plan := ResolveReusePlan(ContinuePROptions{}, prior, PRStatusUnknown)
+		if plan.Reuse {
+			t.Fatalf("unverified PR must not be auto-reused: %+v", plan)
+		}
+	})
+
+	t.Run("leftover worktree without PR does not auto-reuse", func(t *testing.T) {
+		wtOnly := &db.Job{ID: "wt", BranchName: "devbox/uta-2", WorktreePath: "/tmp/wt"}
+		plan := ResolveReusePlan(ContinuePROptions{}, wtOnly, PRStatusUnknown)
+		if plan.Reuse {
+			t.Fatalf("worktree alone must not trigger reuse: %+v", plan)
+		}
+	})
+
+	t.Run("explicit continue on closed PR reuses branch but drops PR URL", func(t *testing.T) {
+		plan := ResolveReusePlan(ContinuePROptions{ContinuePR: true}, prior, PRStatusClosed)
+		if !plan.Reuse || plan.Ref != prior.BranchName {
+			t.Fatalf("plan=%+v", plan)
+		}
+		if plan.PRURL != "" {
+			t.Fatalf("closed PR URL must not be inherited: %+v", plan)
 		}
 	})
 }
