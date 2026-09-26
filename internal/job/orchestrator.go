@@ -40,6 +40,7 @@ type Orchestrator struct {
 	// until failJob records its signature (UTA-97).
 	validationFailures map[string]*validation.Failure
 	failureMu          sync.Mutex
+	codexExecFn        codexExecFunc // Overridden by tests; defaults to the local `codex exec` CLI.
 }
 
 type issueClient interface {
@@ -48,10 +49,12 @@ type issueClient interface {
 }
 
 const (
-	maxHealingAttempts = 2 // Max number of session recreate attempts per phase
-	maxReviewWait      = 15 * time.Minute
-	commitRecoveryWait = 10 * time.Minute
-	maxRepairAttempts  = 3
+	maxHealingAttempts        = 2 // Max number of session recreate attempts per phase
+	maxReviewWait             = 15 * time.Minute
+	commitRecoveryWait        = 10 * time.Minute
+	maxOpenCodeRepairAttempts = 3
+	maxCodexRepairAttempts    = 3
+	maxRepairAttempts         = maxOpenCodeRepairAttempts + maxCodexRepairAttempts
 )
 
 const agentQualityInstructions = `
@@ -116,6 +119,7 @@ func NewOrchestrator(cfg *config.Config, database *db.DB) *Orchestrator {
 		activeJobs:      make(map[string]bool),
 		healingAttempts: make(map[string]int),
 		streamStopFuncs: make(map[string]func()),
+		codexExecFn:     runCodexExec,
 	}
 }
 
@@ -701,35 +705,58 @@ func (o *Orchestrator) validateWithOpenCodeRepair(job *db.Job, gitMgr *git.Manag
 		if validationErr == nil {
 			return nil
 		}
-		if attempt == maxRepairAttempts || job.OpenCodeSessionID == "" {
+		if attempt == maxRepairAttempts {
 			return fmt.Errorf("local validation failed after %d repair attempts: %w", attempt, validationErr)
 		}
-		o.log(job.ID, "warn", fmt.Sprintf("Repair attempt %d/%d: %v", attempt+1, maxRepairAttempts, validationErr))
+		repairAttempt := attempt + 1
+		if repairAttempt <= maxOpenCodeRepairAttempts && job.OpenCodeSessionID == "" {
+			return fmt.Errorf("local validation failed after %d repair attempts: %w", attempt, validationErr)
+		}
+		repairer := "OpenCode"
+		if repairAttempt > maxOpenCodeRepairAttempts {
+			repairer = "Codex"
+		}
+		o.log(job.ID, "warn", fmt.Sprintf("%s repair attempt %d/%d: %v", repairer, repairAttempt, maxRepairAttempts, validationErr))
 		before, _ := gitMgr.WorktreeTree(job.WorktreePath)
 
-		// Keep the OpenCode event stream running so a silent repair timeout is
-		// visible in the job log.
-		o.stopEventStream(job.ID)
-		if err := o.startEventStream(job, job.OpenCodeSessionID); err != nil {
-			o.log(job.ID, "warn", fmt.Sprintf("Failed to start event stream for repair: %v", err))
-		}
-		err := o.opencode.SendMessage(job.OpenCodeSessionID, buildValidationRepairPrompt(validationErr), job.WorktreePath)
-		if err == nil {
+		prompt := buildValidationRepairPrompt(validationErr)
+		if repairAttempt <= maxOpenCodeRepairAttempts {
+			// Keep the OpenCode event stream running so a silent repair timeout is
+			// visible in the job log.
+			o.stopEventStream(job.ID)
+			if err := o.startEventStream(job, job.OpenCodeSessionID); err != nil {
+				o.log(job.ID, "warn", fmt.Sprintf("Failed to start event stream for repair: %v", err))
+			}
+			err := o.opencode.SendMessage(job.OpenCodeSessionID, prompt, job.WorktreePath)
+			if err == nil {
+				wait := commitRecoveryWait
+				if o.cfg.OpenCode.Timeout > 0 && o.cfg.OpenCode.Timeout < wait {
+					wait = o.cfg.OpenCode.Timeout
+				}
+				err = o.opencode.WaitForSessionIdle(job.OpenCodeSessionID, wait, job.WorktreePath, func(msg string) { o.log(job.ID, "info", msg) })
+			}
+			o.stopEventStream(job.ID)
+			if err != nil {
+				o.log(job.ID, "warn", fmt.Sprintf("OpenCode repair did not finish cleanly; stopping session and rechecking actual files: %v", err))
+				if stopErr := o.opencode.StopSession(job.OpenCodeSessionID, job.WorktreePath); stopErr != nil {
+					return fmt.Errorf("repair failed (%v); cannot safely take over worktree: %w", err, stopErr)
+				}
+			}
+		} else {
 			wait := commitRecoveryWait
 			if o.cfg.OpenCode.Timeout > 0 && o.cfg.OpenCode.Timeout < wait {
 				wait = o.cfg.OpenCode.Timeout
 			}
-			err = o.opencode.WaitForSessionIdle(job.OpenCodeSessionID, wait, job.WorktreePath, func(msg string) { o.log(job.ID, "info", msg) })
-		}
-		o.stopEventStream(job.ID)
-		if err != nil {
-			o.log(job.ID, "warn", fmt.Sprintf("Repair did not finish cleanly; stopping session and rechecking actual files: %v", err))
-			if stopErr := o.opencode.StopSession(job.OpenCodeSessionID, job.WorktreePath); stopErr != nil {
-				return fmt.Errorf("repair failed (%v); cannot safely take over worktree: %w", err, stopErr)
+			output, err := o.codexExecFn(job.WorktreePath, prompt, wait)
+			if summary := summarizeCodexOutput(output); summary != "" {
+				o.log(job.ID, "info", "Codex repair output:\n"+summary)
+			}
+			if err != nil {
+				o.log(job.ID, "warn", fmt.Sprintf("Codex repair did not finish cleanly; rechecking actual files: %v", err))
 			}
 		}
 		if after, afterErr := gitMgr.WorktreeTree(job.WorktreePath); before != "" && afterErr == nil && after == before {
-			o.log(job.ID, "warn", fmt.Sprintf("Repair attempt %d/%d made no changes to the worktree", attempt+1, maxRepairAttempts))
+			o.log(job.ID, "warn", fmt.Sprintf("%s repair attempt %d/%d made no changes to the worktree", repairer, repairAttempt, maxRepairAttempts))
 		}
 	}
 }

@@ -2,6 +2,7 @@ package job
 
 import (
 	"errors"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -223,5 +224,57 @@ func TestRepairPromptContainsEveryDistinctError(t *testing.T) {
 	}
 	if failure.TS.Distinct() != 3 || strings.Contains(prompt, "output truncated") {
 		t.Fatalf("unexpected summary (%d distinct):\n%s", failure.TS.Distinct(), prompt)
+	}
+}
+
+func TestValidationRepairFallsBackToCodexAfterThreeOpenCodeAttempts(t *testing.T) {
+	orch, job, _ := deliveryFixture(t)
+	prompts := recordingDeliveryAgent(t, orch, job, false, nil)
+	var codexCalls int
+	orch.codexExecFn = func(worktreePath, prompt string, timeout time.Duration) ([]byte, error) {
+		codexCalls++
+		if !strings.Contains(prompt, "local pre-push validation failed") {
+			t.Fatalf("Codex prompt missing validation failure: %q", prompt)
+		}
+		if err := os.WriteFile(filepath.Join(worktreePath, "output.txt"), []byte("fixed by codex\n"), 0644); err != nil {
+			t.Fatal(err)
+		}
+		return []byte("repair complete"), nil
+	}
+
+	if err := orch.pushBranch(job); err != nil {
+		t.Fatal(err)
+	}
+	if got := len(prompts()); got != maxOpenCodeRepairAttempts {
+		t.Fatalf("OpenCode repair calls = %d, want %d", got, maxOpenCodeRepairAttempts)
+	}
+	if codexCalls != 1 {
+		t.Fatalf("Codex repair calls = %d, want 1", codexCalls)
+	}
+	logs := jobLogText(t, orch, job.ID)
+	if !strings.Contains(logs, "Codex repair attempt 4/6") || !strings.Contains(logs, "Codex repair output") {
+		t.Fatalf("missing Codex fallback logs:\n%s", logs)
+	}
+}
+
+func TestValidationRepairStopsAfterSixAttempts(t *testing.T) {
+	orch, job, _ := deliveryFixture(t)
+	prompts := recordingDeliveryAgent(t, orch, job, false, nil)
+	var codexCalls int
+	orch.codexExecFn = func(string, string, time.Duration) ([]byte, error) {
+		codexCalls++
+		return []byte("no fix"), nil
+	}
+	orch.cfg.Repos[0].Repo.ValidationCommands = []string{"exit 9"}
+
+	err := orch.pushBranch(job)
+	if err == nil || !strings.Contains(err.Error(), "failed after 6 repair attempts") {
+		t.Fatalf("expected six-attempt failure, got %v", err)
+	}
+	if got := len(prompts()); got != maxOpenCodeRepairAttempts {
+		t.Fatalf("OpenCode repair calls = %d, want %d", got, maxOpenCodeRepairAttempts)
+	}
+	if codexCalls != maxCodexRepairAttempts {
+		t.Fatalf("Codex repair calls = %d, want %d", codexCalls, maxCodexRepairAttempts)
 	}
 }

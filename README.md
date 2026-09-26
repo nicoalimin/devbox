@@ -45,6 +45,7 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for detailed technical design.
 - Git with configured credentials
 - [GitHub CLI (`gh`)](https://cli.github.com/) authenticated
 - [OpenCode](https://github.com/nicoalimin/opencode) running locally
+- Codex CLI installed and authenticated for fourth-through-sixth validation repairs
 - Linear API key
 
 **On the Grok Bot host** (or wherever you want to invoke commands):
@@ -288,8 +289,10 @@ Devbox itself runs write-mode formatting and, when the worktree is dirty,
 commits all tracked and non-ignored untracked changes as `chore: format` before
 running the hard checks. This deterministic step does not depend on OpenCode
 remembering to format or commit. OpenCode may repair other validation failures
-up to three times; after each repair Devbox repeats its own format, commit, and
-check sequence, including when a repair times out after the session is stopped.
+up to three times. If the gate is still failing, Devbox runs fresh `codex exec`
+repairs for attempts four through six as needed. After every repair Devbox
+repeats its own format, commit, and check sequence, including when an agent
+times out or exits with an error.
 Devbox then pushes the assigned branch without force and verifies that the
 actual remote SHA matches local HEAD and the worktree is clean. Pushes are
 retried up to three times. The configured repository base branch is used.

@@ -63,6 +63,9 @@ func deliveryFixture(t *testing.T) (*Orchestrator, *db.Job, string) {
 		Repos:    []config.RepoConfig{{Repo: config.RepoInfo{Path: repo, BaseBranch: "main", ValidationCommands: []string{"test -f output.txt"}, FormatCommands: []string{}}}}}
 	orch := NewOrchestrator(cfg, database)
 	orch.linear = deliveryIssues{}
+	// Tests that exhaust OpenCode repairs must never invoke the developer's
+	// real local Codex installation.
+	orch.codexExecFn = func(string, string, time.Duration) ([]byte, error) { return nil, nil }
 	return orch, job, remote
 }
 
@@ -193,7 +196,7 @@ func TestFailedReviewPublishesCheckpointAndReportsFailure(t *testing.T) {
 		t.Fatal("broken validation reported success")
 	}
 	stored, err := orch.db.GetJob(job.ID)
-	if err != nil || stored.State != db.StateFailed || !strings.Contains(stored.BlockerReason, "3 repair attempts") || !strings.Contains(stored.BlockerReason, "committed and pushed") {
+	if err != nil || stored.State != db.StateFailed || !strings.Contains(stored.BlockerReason, "6 repair attempts") || !strings.Contains(stored.BlockerReason, "committed and pushed") {
 		t.Fatalf("job: %+v, err: %v", stored, err)
 	}
 	if got := deliveryGit(t, remote, "show", "refs/heads/"+job.BranchName+":output.txt"); got != "partial" {
