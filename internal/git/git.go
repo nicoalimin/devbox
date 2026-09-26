@@ -582,6 +582,45 @@ func (m *Manager) HasCommitsAheadOfBase(worktreePath string) (bool, error) {
 	return true, nil
 }
 
+// ChangedFilesVsBase returns paths changed between origin/<base> and HEAD
+// (three-dot name-only), suitable for allowlist push gates.
+func (m *Manager) ChangedFilesVsBase(worktreePath string) ([]string, error) {
+	rangeSpec := fmt.Sprintf("origin/%s...HEAD", m.baseBranch)
+	cmd := exec.Command("git", "diff", "--name-only", rangeSpec)
+	cmd.Dir = worktreePath
+	output, err := cmd.Output()
+	if err != nil {
+		return nil, fmt.Errorf("failed to list changed files vs base: %w", err)
+	}
+	var files []string
+	for _, line := range strings.Split(string(output), "\n") {
+		line = strings.TrimSpace(line)
+		if line != "" {
+			files = append(files, line)
+		}
+	}
+	return files, nil
+}
+
+// RestorePathsToBase resets each path to its origin/<base> content (deleting
+// paths that do not exist on base) and commits the result. Used by the
+// allowlist gate to drop out-of-scope edits instead of failing the job.
+func (m *Manager) RestorePathsToBase(worktreePath string, paths []string, message string) error {
+	base := fmt.Sprintf("origin/%s", m.baseBranch)
+	for _, p := range paths {
+		if _, err := runDeliveryGit(worktreePath, "cat-file", "-e", base+":"+p); err == nil {
+			if out, err := runDeliveryGit(worktreePath, "checkout", base, "--", p); err != nil {
+				return fmt.Errorf("failed to restore %s from %s: %w\nOutput: %s", p, base, err, string(out))
+			}
+			continue
+		}
+		if out, err := runDeliveryGit(worktreePath, "rm", "-rf", "--ignore-unmatch", "--", p); err != nil {
+			return fmt.Errorf("failed to remove %s: %w\nOutput: %s", p, err, string(out))
+		}
+	}
+	return m.CommitAll(worktreePath, message)
+}
+
 // FindWorktreeForBranch returns the path of an existing worktree checked out on
 // branchName, or "" when none is registered. Uses `git worktree list --porcelain`.
 func (m *Manager) FindWorktreeForBranch(branchName string) (string, error) {

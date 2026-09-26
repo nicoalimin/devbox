@@ -628,6 +628,10 @@ func (o *Orchestrator) pushBranch(job *db.Job) error {
 		return fmt.Errorf("no file changes or commits found on branch %s compared to base branch; there is nothing to push or open as a pull request", job.BranchName)
 	}
 
+	if err := o.enforceAllowlistPushGate(job, gitMgr); err != nil {
+		return err
+	}
+
 	if o.alreadyPublished(job, gitMgr) {
 		o.log(job.ID, "info", "Nothing new to push: remote branch already at HEAD; skipping push")
 		return nil
@@ -640,6 +644,52 @@ func (o *Orchestrator) pushBranch(job *db.Job) error {
 	}
 
 	o.log(job.ID, "info", "Branch pushed successfully")
+	return nil
+}
+
+// enforceAllowlistPushGate enforces an ALLOWLIST: block from OperatorContext
+// and/or the Linear description before push (UTA-103). Out-of-scope paths
+// (for example formatter churn or invented files) are restored to base and
+// committed away; the job fails only when nothing in scope remains. Absent
+// allowlist is a no-op (backward compatible).
+func (o *Orchestrator) enforceAllowlistPushGate(job *db.Job, gitMgr *git.Manager) error {
+	linearDesc := ""
+	if issue, err := o.linear.GetIssue(job.LinearIssueID); err == nil && issue != nil {
+		linearDesc = issue.Description
+	}
+	allow := ParseAllowlist(job.OperatorContext, linearDesc)
+	if len(allow) == 0 {
+		return nil
+	}
+	changed, err := gitMgr.ChangedFilesVsBase(job.WorktreePath)
+	if err != nil {
+		return fmt.Errorf("allowlist push gate: %w", err)
+	}
+	violations := AllowlistViolations(allow, changed)
+	if len(violations) == 0 {
+		o.log(job.ID, "info", fmt.Sprintf("Allowlist push gate OK (%d path(s) within %v)", len(changed), allow))
+		return nil
+	}
+	o.log(job.ID, "warn", fmt.Sprintf("Allowlist push gate: restoring %d out-of-scope path(s) to base: %v", len(violations), violations))
+	message := fmt.Sprintf("[%s] Revert changes outside ALLOWLIST", job.LinearIssueID)
+	if err := gitMgr.RestorePathsToBase(job.WorktreePath, violations, message); err != nil {
+		return fmt.Errorf("allowlist push gate: %w", err)
+	}
+	remaining, err := gitMgr.ChangedFilesVsBase(job.WorktreePath)
+	if err != nil {
+		return fmt.Errorf("allowlist push gate: %w", err)
+	}
+	if bad := AllowlistViolations(allow, remaining); len(bad) > 0 {
+		msg := FormatAllowlistFailure(allow, bad)
+		o.log(job.ID, "error", msg)
+		return fmt.Errorf("%s", msg)
+	}
+	if len(remaining) == 0 {
+		msg := fmt.Sprintf("allowlist push gate failed: no changes within ALLOWLIST %v (only out-of-scope edits %v were produced)", allow, violations)
+		o.log(job.ID, "error", msg)
+		return fmt.Errorf("%s", msg)
+	}
+	o.log(job.ID, "info", fmt.Sprintf("Allowlist push gate OK after restore (%d in-scope path(s))", len(remaining)))
 	return nil
 }
 
