@@ -303,7 +303,7 @@ func (o *Orchestrator) prepareWorktree(job *db.Job) error {
 	if priorErr != nil {
 		o.log(job.ID, "warn", fmt.Sprintf("Failed to look up prior job for reuse: %v", priorErr))
 	}
-	plan := ResolveReusePlan(opts, prior)
+	plan := ResolveReusePlan(opts, prior, o.priorPRStatus(job, repo.Path, prior))
 	if plan.Reuse {
 		return o.prepareReuseWorktree(job, gitMgr, issue.Identifier, repo.Path, plan)
 	}
@@ -323,6 +323,24 @@ func (o *Orchestrator) prepareWorktree(job *db.Job) error {
 
 	o.log(job.ID, "info", fmt.Sprintf("Created worktree at %s (branch: %s)", worktree.Path, worktree.BranchName))
 	return nil
+}
+
+// priorPRStatus checks whether the prior job's PR is still open so a closed or
+// merged PR is never auto-reused.
+func (o *Orchestrator) priorPRStatus(job *db.Job, dir string, prior *db.Job) PRStatus {
+	if prior == nil || prior.PRURL == "" {
+		return PRStatusUnknown
+	}
+	state, err := git.PRState(dir, prior.PRURL)
+	if err != nil {
+		o.log(job.ID, "warn", fmt.Sprintf("Could not check prior PR %s: %v", prior.PRURL, err))
+		return PRStatusUnknown
+	}
+	if state == "OPEN" {
+		return PRStatusOpen
+	}
+	o.log(job.ID, "info", fmt.Sprintf("Prior PR %s is %s; starting a fresh branch from main unless continue was requested", prior.PRURL, state))
+	return PRStatusClosed
 }
 
 // prepareReuseWorktree reattaches an existing worktree or creates one checked
@@ -943,10 +961,19 @@ func (o *Orchestrator) createPullRequest(job *db.Job) error {
 	baseBranch := o.baseBranch(job)
 
 	var prURL string
-	// Prefer PR already inherited from a prior continue/reuse job.
+	// Prefer PR already inherited from a prior continue/reuse job, but only
+	// while it is still open. Never deliver onto a closed/merged PR.
 	if job.PRURL != "" {
-		prURL = job.PRURL
-		o.log(job.ID, "info", fmt.Sprintf("Reuse: keeping existing PR %s", prURL))
+		state, stateErr := git.PRState(job.WorktreePath, job.PRURL)
+		switch {
+		case stateErr != nil:
+			o.log(job.ID, "warn", fmt.Sprintf("Reuse: could not verify PR %s is open (%v); looking up open PR by head instead", job.PRURL, stateErr))
+		case state == "OPEN":
+			prURL = job.PRURL
+			o.log(job.ID, "info", fmt.Sprintf("Reuse: keeping existing PR %s", prURL))
+		default:
+			o.log(job.ID, "warn", fmt.Sprintf("Reuse: inherited PR %s is %s; not reusing it", job.PRURL, state))
+		}
 	}
 	if prURL == "" {
 		head := job.BranchName

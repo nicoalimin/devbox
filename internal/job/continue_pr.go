@@ -59,20 +59,40 @@ type ReusePlan struct {
 	RepoPath           string
 }
 
+// PRStatus describes what the host knows about the prior job's PR.
+type PRStatus int
+
+const (
+	// PRStatusUnknown means the lookup failed or there is no PR URL.
+	PRStatusUnknown PRStatus = iota
+	// PRStatusOpen means the prior PR is still open and can be iterated on.
+	PRStatusOpen
+	// PRStatusClosed means the prior PR was closed or merged; never reuse it.
+	PRStatusClosed
+)
+
 // ResolveReusePlan decides whether to reuse an existing worktree/branch/PR.
 // Reuse when:
 //   - operator_context has push_ref, or
 //   - operator_context has continue_pr and a prior job supplies a branch, or
-//   - a prior job for the same issue already has an open PR (or branch+worktree).
-func ResolveReusePlan(opts ContinuePROptions, prior *db.Job) ReusePlan {
+//   - a prior job for the same issue has a PR that is confirmed OPEN.
+//
+// A closed/merged prior PR is never auto-reused, and its URL is never
+// inherited (even on explicit continue) so delivery opens a fresh PR instead
+// of pushing onto a dead one. A leftover worktree without an open PR does not
+// trigger auto-reuse either: a plain `devbox assign` starts from main.
+func ResolveReusePlan(opts ContinuePROptions, prior *db.Job, priorPR PRStatus) ReusePlan {
 	ref := strings.TrimSpace(opts.PushRef)
 	var preferPath, prURL, repoPath string
 	if prior != nil {
 		preferPath = prior.WorktreePath
-		prURL = prior.PRURL
+		if priorPR != PRStatusClosed {
+			prURL = prior.PRURL
+		}
 		repoPath = prior.RepoPath
 		if ref == "" && prior.BranchName != "" {
-			if opts.ContinuePR || prior.PRURL != "" || prior.WorktreePath != "" {
+			autoReuse := prior.PRURL != "" && priorPR == PRStatusOpen
+			if opts.ContinuePR || autoReuse {
 				ref = prior.BranchName
 			}
 		}
